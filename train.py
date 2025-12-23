@@ -1,0 +1,1065 @@
+"""
+MEDAL-Lite Training Script
+Implements the complete 3-stage training pipeline
+"""
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import numpy as np
+import argparse
+from datetime import datetime
+
+from MoudleCode.utils.config import config
+from MoudleCode.utils.helpers import (
+    set_seed, setup_logger, inject_label_noise,
+    calculate_metrics, print_metrics, save_checkpoint, find_optimal_threshold
+)
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, f1_score, silhouette_score
+from MoudleCode.utils.visualization import (
+    plot_feature_space, plot_noise_correction_comparison, plot_training_history
+)
+from MoudleCode.preprocessing.pcap_parser import load_dataset
+from MoudleCode.feature_extraction.backbone import (
+    MicroBiMambaBackbone, SimMTMLoss
+)
+
+# 导入预处理模块
+try:
+    from preprocess import check_preprocessed_exists, load_preprocessed, preprocess_train
+    PREPROCESS_AVAILABLE = True
+except ImportError:
+    PREPROCESS_AVAILABLE = False
+from MoudleCode.label_correction.hybrid_court import HybridCourt
+from MoudleCode.data_augmentation.tabddpm import TabDDPM
+from MoudleCode.classification.dual_stream import MEDAL_Classifier, DualStreamLoss
+
+import logging
+
+
+def stage1_pretrain_backbone(backbone, train_loader, config, logger):
+    """
+    Stage 1: Pre-train backbone with SimMTM only (unsupervised)
+    
+    Args:
+        backbone: MicroBiMambaBackbone model
+        train_loader: DataLoader with X only (no labels needed for SimMTM)
+        config: configuration object
+        logger: logger
+        
+    Returns:
+        backbone: pre-trained backbone
+    """
+    logger.info("="*70)
+    logger.info("STAGE 1: Pre-training Backbone (SimMTM only)")
+    logger.info("="*70)
+    logger.info(f"目标: 训练Micro-Bi-Mamba骨干网络，学习流量特征表示")
+    logger.info(f"训练轮数: {config.PRETRAIN_EPOCHS} epochs")
+    logger.info(f"批次大小: {config.PRETRAIN_BATCH_SIZE}")
+    logger.info(f"学习率: {config.PRETRAIN_LR}")
+    logger.info(f"优化目标: SimMTM (掩码重构)")
+    logger.info("")
+    logger.info("📥 输入数据路径:")
+    logger.info(f"  ✓ 训练数据: {config.BENIGN_TRAIN} (正常), {config.MALICIOUS_TRAIN} (恶意)")
+    logger.info("")
+    
+    backbone.train()
+    backbone.to(config.DEVICE)
+    
+    # Loss function
+    simmtm_loss_fn = SimMTMLoss(mask_rate=config.SIMMTM_MASK_RATE)
+    logger.info(f"✓ 损失函数初始化完成 (SimMTM掩码率: {config.SIMMTM_MASK_RATE})")
+    
+    # Optimizer
+    optimizer = optim.AdamW(
+        backbone.parameters(),
+        lr=config.PRETRAIN_LR,
+        weight_decay=config.PRETRAIN_WEIGHT_DECAY
+    )
+    
+    # Scheduler
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.PRETRAIN_EPOCHS
+    )
+    logger.info(f"✓ 优化器和学习率调度器初始化完成")
+    logger.info("")
+    logger.info("开始训练...")
+    logger.info("-"*70)
+    
+    # Training loop
+    history = {'loss': [], 'simmtm': []}
+    
+    for epoch in range(config.PRETRAIN_EPOCHS):
+        epoch_loss = 0.0
+        epoch_simmtm = 0.0
+        
+        for batch_idx, batch_data in enumerate(train_loader):
+            # TensorDataset with single tensor returns the tensor directly
+            # TensorDataset with multiple tensors returns a tuple
+            if isinstance(batch_data, (list, tuple)):
+                X_batch = batch_data[0]  # Get first element (X)
+            else:
+                X_batch = batch_data  # Already a single tensor
+            X_batch = X_batch.to(config.DEVICE)
+            
+            optimizer.zero_grad()
+            
+            # SimMTM loss (unsupervised, only needs X)
+            loss_simmtm = simmtm_loss_fn(backbone, X_batch)
+            
+            # Total loss (only SimMTM)
+            loss = loss_simmtm
+            
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            epoch_simmtm += loss_simmtm.item()
+        
+        scheduler.step()
+        
+        # Average losses
+        n_batches = len(train_loader)
+        epoch_loss /= n_batches
+        epoch_simmtm /= n_batches
+        
+        history['loss'].append(epoch_loss)
+        history['simmtm'].append(epoch_simmtm)
+        
+        # 每个epoch都输出日志（便于监控）
+        progress = (epoch + 1) / config.PRETRAIN_EPOCHS * 100
+        logger.info(f"[Stage 1] Epoch [{epoch+1}/{config.PRETRAIN_EPOCHS}] ({progress:.1f}%) | "
+                   f"Loss: {epoch_loss:.4f} | "
+                   f"SimMTM: {epoch_simmtm:.4f} | "
+                   f"LR: {scheduler.get_last_lr()[0]:.6f}")
+    
+    logger.info("-"*70)
+    logger.info("✓ Stage 1 完成: 骨干网络预训练完成")
+    logger.info(f"  最终损失: {history['loss'][-1]:.4f}")
+    logger.info(f"  训练了 {config.PRETRAIN_EPOCHS} 个epoch")
+    logger.info("")
+    logger.info("📁 输出文件路径:")
+    # Save backbone to feature_extraction module directory
+    backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    torch.save(backbone.state_dict(), backbone_path)
+    logger.info(f"  ✓ 骨干网络模型: {backbone_path}")
+    
+    return backbone, history
+
+
+def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y_train_clean, config, logger, stage2_mode='standard'):
+    """
+    Stage 2: Label correction and data augmentation
+    
+    Args:
+        backbone: Pre-trained frozen backbone
+        X_train: (N, L, 5) training sequences
+        y_train_noisy: (N,) noisy labels
+        y_train_clean: (N,) clean labels (for evaluation only)
+        config: configuration object
+        logger: logger
+        
+    Returns:
+        X_augmented: augmented dataset
+        y_augmented: augmented labels
+        correction_stats: statistics about correction
+    """
+    logger.info("")
+    logger.info("="*70)
+    logger.info("STAGE 2: Label Correction & Data Augmentation")
+    logger.info("="*70)
+    logger.info(f"目标: 矫正标签噪声并生成增强样本")
+    logger.info(f"步骤: 1) 特征提取 2) Hybrid Court标签矫正 3) TabDDPM数据增强")
+    logger.info("")
+    logger.info("📥 输入数据路径:")
+    logger.info(f"  ✓ 训练数据: {config.BENIGN_TRAIN} (正常), {config.MALICIOUS_TRAIN} (恶意)")
+    backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    logger.info(f"  ✓ 骨干网络模型: {backbone_path}")
+    logger.info("")
+    
+    # Freeze backbone and extract features
+    backbone.to(config.DEVICE)  # 确保 backbone 在正确的设备上
+    backbone.freeze()
+    backbone.eval()
+    logger.info("✓ 骨干网络已冻结，开始特征提取...")
+    
+    logger.info(f"正在从 {len(X_train)} 个训练样本中提取特征...")
+    with torch.no_grad():
+        X_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
+        
+        # Extract features in batches
+        features_list = []
+        batch_size = 64
+        total_batches = (len(X_tensor) + batch_size - 1) // batch_size
+        
+        for i in range(0, len(X_tensor), batch_size):
+            batch_idx = i // batch_size + 1
+            X_batch = X_tensor[i:i+batch_size]
+            z_batch = backbone(X_batch, return_sequence=False)
+            features_list.append(z_batch.cpu().numpy())
+            
+            if batch_idx % 10 == 0 or batch_idx == total_batches:
+                progress = batch_idx / total_batches * 100
+                logger.info(f"  特征提取进度: {batch_idx}/{total_batches} batches ({progress:.1f}%)")
+        
+        features = np.concatenate(features_list, axis=0)
+    
+    logger.info(f"✓ 特征提取完成: {features.shape} (样本数×特征维度)")
+    logger.info("")
+
+    logger.info("="*70)
+    logger.info("📏 特征可分性评估 (Feature Separability)")
+    logger.info("="*70)
+    try:
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            features, y_train_clean,
+            test_size=0.2,
+            stratify=y_train_clean,
+            random_state=config.SEED
+        )
+        sep_clf = LogisticRegression(max_iter=1000, class_weight='balanced')
+        sep_clf.fit(X_tr, y_tr)
+        te_proba = sep_clf.predict_proba(X_te)[:, 1]
+        te_auc = roc_auc_score(y_te, te_proba)
+        te_pred = (te_proba >= 0.5).astype(int)
+        te_f1 = f1_score(y_te, te_pred, pos_label=1, zero_division=0)
+        sil = silhouette_score(features, y_train_clean) if len(np.unique(y_train_clean)) > 1 else np.nan
+        logger.info(f"  LogisticRegression ROC-AUC: {te_auc:.4f}")
+        logger.info(f"  LogisticRegression F1@0.5:  {te_f1:.4f}")
+        logger.info(f"  Silhouette Score:          {sil:.4f}")
+    except Exception as e:
+        logger.warning(f"⚠ 特征可分性评估失败: {e}")
+    logger.info("")
+    logger.info("📁 输出文件路径:")
+    # Save extracted features
+    features_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "train_features.npy")
+    np.save(features_path, features)
+    logger.info(f"  ✓ 提取的特征: {features_path}")
+    
+    # Visualize feature space before correction
+    save_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "figures", "feature_space_before_correction.png")
+    plot_feature_space(features, y_train_clean, save_path, 
+                      title="Feature Space (Ground Truth Labels)", method='tsne')
+    logger.info(f"  ✓ 特征空间可视化: {save_path}")
+    
+    # Label correction with Hybrid Court
+    logger.info("")
+    logger.info("步骤 2.1: Hybrid Court 标签噪声矫正")
+    logger.info(f"  输入: {len(y_train_noisy)} 个样本，噪声率: {config.LABEL_NOISE_RATE*100:.0f}%")
+    logger.info("  方法: CL (置信学习) + MADE (密度估计) + KNN (语义投票)")
+    logger.info("  开始矫正...")
+    
+    hybrid_court = HybridCourt(config)
+
+    if stage2_mode == 'clean_augment_only':
+        suspected_noise, pred_labels, pred_probs = hybrid_court.cl.fit_predict(features, y_train_clean)
+        hybrid_court.made.fit(features, device=config.DEVICE)
+        is_dense, density_scores = hybrid_court.made.predict_density(features, device=config.DEVICE)
+        hybrid_court.knn.fit(features)
+        neighbor_labels, neighbor_consistency = hybrid_court.knn.predict_semantic_label(features, y_train_clean)
+        y_corrected = y_train_clean.copy()
+        action_mask = np.zeros(len(y_train_clean), dtype=int)
+        confidence = pred_probs.max(axis=1)
+        correction_weight = np.ones(len(y_train_clean), dtype=np.float32)
+        cl_confidence = pred_probs.max(axis=1)
+    else:
+        y_corrected, action_mask, confidence, correction_weight, density_scores, neighbor_consistency, pred_probs = hybrid_court.correct_labels(
+            features, y_train_noisy, device=config.DEVICE
+        )
+        cl_confidence = pred_probs.max(axis=1)
+    
+    logger.info("✓ 标签矫正完成")
+    
+    # Save correction results
+    correction_results_path = os.path.join(config.LABEL_CORRECTION_DIR, "models", "correction_results.npz")
+    np.savez(correction_results_path,
+             y_noisy=y_train_noisy if stage2_mode != 'clean_augment_only' else y_train_clean,
+             y_corrected=y_corrected,
+             action_mask=action_mask,
+             confidence=confidence,
+             correction_weight=correction_weight,
+             density_scores=density_scores,
+             neighbor_consistency=neighbor_consistency,
+             pred_probs=pred_probs)
+    logger.info("")
+    logger.info("📁 输出文件路径:")
+    logger.info(f"  ✓ 标签矫正结果: {correction_results_path}")
+    
+    # Visualize correction results
+    save_path = os.path.join(config.LABEL_CORRECTION_DIR, "figures", "noise_correction_comparison.png")
+    plot_noise_correction_comparison(y_train_clean, y_train_noisy, y_corrected, action_mask, save_path)
+    logger.info(f"  ✓ 标签矫正对比图: {save_path}")
+    
+    # Calculate correction accuracy
+    keep_mask = action_mask != 2  # Exclude dropped samples
+    correction_accuracy = (y_corrected[keep_mask] == y_train_clean[keep_mask]).mean()
+    logger.info(f"\nLabel Correction Accuracy: {correction_accuracy*100:.2f}%")
+    
+    correction_stats = {
+        'accuracy': correction_accuracy,
+        'n_keep': (action_mask == 0).sum(),
+        'n_flip': (action_mask == 1).sum(),
+        'n_drop': (action_mask == 2).sum(),
+        'n_reweight': (action_mask == 3).sum()
+    }
+    
+    # 使用全部干净样本进行训练与增强（取消验证集）
+    X_clean = X_train[keep_mask]
+    y_clean = y_corrected[keep_mask]
+    weights_clean = correction_weight[keep_mask]
+    action_clean = action_mask[keep_mask]
+    density_clean = density_scores[keep_mask]
+    cl_conf_clean = cl_confidence[keep_mask]
+    knn_conf_clean = neighbor_consistency[keep_mask]
+    
+    # Data augmentation with TabDDPM
+    logger.info("")
+    logger.info("步骤 2.2: TabDDPM 数据增强模型训练")
+    logger.info(f"  目标: 学习流量特征分布，生成符合协议逻辑的合成样本")
+    logger.info(f"  训练轮数: 100 epochs")
+    logger.info(f"  引导策略: 恶意样本(w={config.GUIDANCE_MALICIOUS}), 良性样本(w={config.GUIDANCE_BENIGN})")
+    logger.info("  开始训练...")
+    
+    tabddpm = TabDDPM(config).to(config.DEVICE)
+
+    # Fit scaler on packet-level features (exclude zero-padding packets)
+    X_packets_all = X_clean.reshape(-1, X_clean.shape[-1])
+    packet_mask = np.any(X_packets_all != 0.0, axis=1)
+    X_packets_valid = X_packets_all[packet_mask]
+    if X_packets_valid.shape[0] == 0:
+        X_packets_valid = X_packets_all
+        packet_mask = None
+    tabddpm.fit_scaler(X_packets_valid)
+    
+    # Train TabDDPM
+    optimizer_ddpm = optim.AdamW(tabddpm.parameters(), lr=1e-4)
+    n_epochs_ddpm = 100
+    
+    # 使用 packet-level 数据训练 TabDDPM（避免只看第一个包导致分布偏移）
+    # 同时过滤掉 padding=0 的无效包，避免模型学到大量“全零包”导致 Length/IAT/Window 分布漂移
+    X_packets = X_packets_valid  # (n_valid, 5)
+    y_packets_all = np.repeat(y_clean, X_clean.shape[1])    # (N*L,)
+    y_packets = y_packets_all[packet_mask] if packet_mask is not None else y_packets_all
+    dataset_ddpm = TensorDataset(
+        torch.FloatTensor(X_packets),
+        torch.LongTensor(y_packets)
+    )
+    loader_ddpm = DataLoader(dataset_ddpm, batch_size=2048, shuffle=True)
+    
+    tabddpm.train()
+    for epoch in range(n_epochs_ddpm):
+        epoch_loss = 0.0
+        for X_batch, y_batch in loader_ddpm:
+            x_0 = X_batch.to(config.DEVICE)  # (B, 5)
+            y_batch = y_batch.to(config.DEVICE)
+            
+            optimizer_ddpm.zero_grad()
+            loss = tabddpm.compute_loss(
+                x_0, y_batch,
+                mask_prob=config.MASK_PROBABILITY,
+                mask_lambda=config.MASK_LAMBDA,
+                p_uncond=0.2  # Classifier-free guidance training
+            )
+            loss.backward()
+            optimizer_ddpm.step()
+            
+            epoch_loss += loss.item()
+        
+        # 每个epoch输出
+        avg_loss = epoch_loss / len(loader_ddpm)
+        progress = (epoch + 1) / n_epochs_ddpm * 100
+        logger.info(f"[TabDDPM] Epoch [{epoch+1}/{n_epochs_ddpm}] ({progress:.1f}%) | Loss: {avg_loss:.4f}")
+    
+    # Generate augmented samples (增强全部干净样本)
+    logger.info("-"*70)
+    logger.info("✓ TabDDPM 训练完成")
+    logger.info("")
+    logger.info("步骤 2.3: 生成增强样本")
+    logger.info(f"  训练集样本数: {len(X_clean)}")
+    multipliers = np.ceil(weights_clean.astype(np.float32) * 10.0).astype(int)
+    multipliers = np.maximum(multipliers, 2)
+    expected_synthetic = int(multipliers.sum())
+    logger.info("  增强策略: per-sample 倍数 = max(2, ceil(sample_weight*10))")
+    logger.info(f"  倍数统计: min={multipliers.min()}, max={multipliers.max()}, mean={multipliers.mean():.2f}")
+    logger.info(f"  预期生成: ~{expected_synthetic} 个合成样本")
+    logger.info("  开始生成...")
+    
+    X_augmented, y_augmented, sample_weights = tabddpm.augment_dataset(
+        X_clean, y_clean, action_clean, weights_clean,
+        density_clean, cl_conf_clean, knn_conf_clean,
+        augmentation_ratio=config.AUGMENTATION_RATIO_MIN
+    )
+    
+    n_train_original = len(X_clean)
+    n_synthetic = len(X_augmented) - n_train_original
+    
+    logger.info(f"✓ 数据增强完成: 从 {n_train_original} 个训练样本增强到 {len(X_augmented)} 个样本")
+    logger.info(f"  原始训练数据: {n_train_original} 个样本")
+    logger.info(f"  合成数据: {n_synthetic} 个样本")
+    logger.info("")
+    
+    # ========================
+    # 步骤 2.4: 生成质量诊断
+    # ========================
+    logger.info("步骤 2.4: 生成质量诊断 (Generation Quality Assessment)")
+    logger.info("-"*70)
+    logger.info("评估维度: 1) Fidelity (真实性) 2) Protocol Validity (协议有效性)")
+    logger.info("")
+    
+    # 分离原始数据和合成数据
+    X_train_original = X_augmented[:n_train_original]
+    X_train_synthetic = X_augmented[n_train_original:]
+    y_train_original = y_augmented[:n_train_original]
+    y_train_synthetic = y_augmented[n_train_original:]
+    
+    # 1. Fidelity: 特征分布对比（均值/方差）
+    logger.info("1️⃣  Fidelity 检查: 特征分布对比")
+    feature_names = ['Length', 'IAT', 'Direction', 'Flags', 'Window']
+    logger.info(f"{'特征':<12} | {'真实均值':<12} | {'合成均值':<12} | {'差异%':<10} | {'真实标准差':<12} | {'合成标准差':<12}")
+    logger.info("-"*85)
+
+    pad_mask_real = np.any(X_train_original != 0.0, axis=-1)
+    pad_mask_syn = np.any(X_train_synthetic != 0.0, axis=-1)
+
+    diff_pcts = []
+    for i, name in enumerate(feature_names):
+        real_data = X_train_original[:, :, i][pad_mask_real]
+        syn_data = X_train_synthetic[:, :, i][pad_mask_syn]
+        
+        real_mean = real_data.mean() if real_data.size > 0 else np.nan
+        syn_mean = syn_data.mean() if syn_data.size > 0 else np.nan
+        real_std = real_data.std() if real_data.size > 0 else np.nan
+        syn_std = syn_data.std() if syn_data.size > 0 else np.nan
+        
+        # 计算相对差异百分比
+        if np.isfinite(real_mean) and np.isfinite(syn_mean) and np.isfinite(real_std):
+            denom = max(abs(real_mean), float(real_std), 1e-8)
+            diff_pct = abs(real_mean - syn_mean) / denom * 100
+        else:
+            diff_pct = np.nan
+        diff_pcts.append(float(diff_pct))
+        
+        # 判断质量（差异<10%为优秀，<20%为良好，>20%为需关注）
+        quality_marker = "✓" if diff_pct < 10 else ("⚠" if diff_pct < 20 else "❌")
+        
+        logger.info(f"{name:<12} | {real_mean:>11.4f} | {syn_mean:>11.4f} | {diff_pct:>8.2f}% {quality_marker} | "
+                   f"{real_std:>11.4f} | {syn_std:>11.4f}")
+    
+    logger.info("")
+
+
+    # 1.1 Quantiles: P50/P90/P99 (helps diagnose tail drift, esp. for skewed features like Window)
+    logger.info("1️⃣ 1️⃣  Quantile 检查: P50/P90/P99 (真实 vs 合成)")
+    logger.info(f"{'特征':<12} | {'真实P50':<10} | {'合成P50':<10} | {'真实P90':<10} | {'合成P90':<10} | {'真实P99':<10} | {'合成P99':<10}")
+    logger.info("-"*92)
+    for i, name in enumerate(feature_names):
+        real_data = X_train_original[:, :, i][pad_mask_real]
+        syn_data = X_train_synthetic[:, :, i][pad_mask_syn]
+
+        if real_data.size > 0:
+            real_p50, real_p90, real_p99 = np.percentile(real_data, [50, 90, 99])
+        else:
+            real_p50, real_p90, real_p99 = np.nan, np.nan, np.nan
+
+        if syn_data.size > 0:
+            syn_p50, syn_p90, syn_p99 = np.percentile(syn_data, [50, 90, 99])
+        else:
+            syn_p50, syn_p90, syn_p99 = np.nan, np.nan, np.nan
+
+        logger.info(
+            f"{name:<12} | {real_p50:>9.4f} | {syn_p50:>9.4f} | {real_p90:>9.4f} | {syn_p90:>9.4f} | {real_p99:>9.4f} | {syn_p99:>9.4f}"
+        )
+
+    logger.info("")
+
+    max_diff_pct = float(np.nanmax(diff_pcts)) if len(diff_pcts) > 0 else float('nan')
+    if np.isnan(max_diff_pct):
+        fidelity_level = '未知'
+    elif max_diff_pct < 10:
+        fidelity_level = '优秀'
+    elif max_diff_pct < 20:
+        fidelity_level = '良好'
+    else:
+        fidelity_level = '需关注'
+    
+    # 2. Protocol Validity: 协议约束检查
+    logger.info("2️⃣  Protocol Validity 检查: 物理约束验证")
+    logger.info("检查项: 负数包长、负数窗口、异常IAT、异常方向/标志")
+    logger.info("")
+    
+    # 检查各种违规情况
+    invalid_length = (X_train_synthetic[:, :, 0] < 0).sum()
+    invalid_window = (X_train_synthetic[:, :, 4] < 0).sum()
+    invalid_iat = (np.isnan(X_train_synthetic[:, :, 1]) | np.isinf(X_train_synthetic[:, :, 1])).sum()
+    invalid_direction = ((X_train_synthetic[:, :, 2] < -1) | (X_train_synthetic[:, :, 2] > 1)).sum()
+    invalid_flags = ((X_train_synthetic[:, :, 3] < 0) | (X_train_synthetic[:, :, 3] > 1)).sum()
+    
+    total_synthetic_values = X_train_synthetic.size
+    invalid_total = invalid_length + invalid_window + invalid_iat + invalid_direction + invalid_flags
+    validity_rate = (1 - invalid_total / total_synthetic_values) * 100
+    
+    logger.info(f"  ❌ 负数包长 (Length < 0):     {invalid_length:>6} 个值")
+    logger.info(f"  ❌ 负数窗口 (Window < 0):     {invalid_window:>6} 个值")
+    logger.info(f"  ❌ 异常IAT (NaN/Inf):         {invalid_iat:>6} 个值")
+    logger.info(f"  ❌ 异常方向 (Direction ∉[-1,1]): {invalid_direction:>6} 个值")
+    logger.info(f"  ❌ 异常标志 (Flags ∉[0,1]):    {invalid_flags:>6} 个值")
+    logger.info(f"  ✓ 总有效率: {validity_rate:.2f}% ({total_synthetic_values - invalid_total}/{total_synthetic_values})")
+    logger.info("")
+    
+    # 3. Class-wise 分布检查
+    logger.info("3️⃣  Class-wise 分布检查: 类别平衡性")
+    logger.info(f"  原始数据 - 正常: {(y_train_original==0).sum()}, 恶意: {(y_train_original==1).sum()}")
+    logger.info(f"  合成数据 - 正常: {(y_train_synthetic==0).sum()}, 恶意: {(y_train_synthetic==1).sum()}")
+    logger.info(f"  增强后   - 正常: {(y_augmented==0).sum()}, 恶意: {(y_augmented==1).sum()}")
+    logger.info("")
+    
+    # 4. 结构感知检查：依赖特征的协方差
+    logger.info("4️⃣  Structure-Aware 检查: 依赖特征协方差")
+    logger.info("检查 Length-IAT-Window 之间的相关性是否保持")
+    
+    # 提取依赖特征（索引 0, 1, 4）
+    dep_indices = [0, 1, 4]  # Length, IAT, Window
+    real_dep = X_train_original[:, :, dep_indices][pad_mask_real].reshape(-1, 3)
+    syn_dep = X_train_synthetic[:, :, dep_indices][pad_mask_syn].reshape(-1, 3)
+    
+    # 计算相关系数矩阵
+    real_corr = np.corrcoef(real_dep.T) if real_dep.shape[0] > 1 else np.full((3, 3), np.nan)
+    syn_corr = np.corrcoef(syn_dep.T) if syn_dep.shape[0] > 1 else np.full((3, 3), np.nan)
+    
+    logger.info("  真实数据相关系数矩阵:")
+    logger.info(f"    Length-IAT:    {real_corr[0, 1]:>7.4f}")
+    logger.info(f"    Length-Window: {real_corr[0, 2]:>7.4f}")
+    logger.info(f"    IAT-Window:    {real_corr[1, 2]:>7.4f}")
+    logger.info("  合成数据相关系数矩阵:")
+    logger.info(f"    Length-IAT:    {syn_corr[0, 1]:>7.4f}")
+    logger.info(f"    Length-Window: {syn_corr[0, 2]:>7.4f}")
+    logger.info(f"    IAT-Window:    {syn_corr[1, 2]:>7.4f}")
+    
+    # 计算相关性差异
+    corr_diff = np.nanmean(np.abs(real_corr - syn_corr))
+    logger.info(f"  平均相关性差异: {corr_diff:.4f} {'✓' if corr_diff < 0.1 else '⚠'}")
+    logger.info("")
+    
+    logger.info("-"*70)
+    logger.info("✓ 生成质量诊断完成")
+    logger.info(f"  总体评估: Fidelity={fidelity_level}, "
+               f"Validity={validity_rate:.1f}%, "
+               f"Structure={'保持' if corr_diff < 0.1 else '部分保持'}")
+    logger.info("")
+    
+    # 5. 可视化: Real vs Synthetic 对比图 (t-SNE)
+    logger.info("5️⃣  可视化: Real vs Synthetic 特征空间对比 (t-SNE)")
+    from MoudleCode.utils.visualization import plot_real_vs_synthetic_comparison
+    
+    comparison_save_path = os.path.join(config.DATA_AUGMENTATION_DIR, "figures", "real_vs_synthetic_tsne.png")
+    plot_real_vs_synthetic_comparison(
+        X_train_original, X_train_synthetic,
+        y_train_original, y_train_synthetic,
+        comparison_save_path,
+        title='TabDDPM Generation Quality: Real vs Synthetic',
+        method='tsne'
+    )
+    logger.info(f"  ✓ t-SNE对比图: {comparison_save_path}")
+    logger.info("    (蓝色=真实良性, 红色=真实恶意, 浅色=合成样本)")
+    logger.info("    理想结果: 合成样本应覆盖在真实样本之上")
+    logger.info("")
+    logger.info("📁 输出文件路径:")
+    # Save TabDDPM model
+    tabddpm_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "tabddpm.pth")
+    torch.save(tabddpm.state_dict(), tabddpm_path)
+    logger.info(f"  ✓ TabDDPM模型: {tabddpm_path}")
+    
+    # Save augmented data with metadata
+    augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_data.npz")
+    # Create mask to identify original vs synthetic samples
+    is_original_mask = np.zeros(len(X_augmented), dtype=bool)
+    is_original_mask[:n_train_original] = True
+    
+    np.savez(augmented_data_path,
+             X_augmented=X_augmented,
+             y_augmented=y_augmented,
+             is_original=is_original_mask,
+             n_original=n_train_original,
+             sample_weights=sample_weights)
+    logger.info(f"  ✓ 增强数据: {augmented_data_path}")
+    logger.info(f"    (包含原始/合成数据标记)")
+    
+    logger.info(f"Augmented dataset: {len(X_augmented)} samples (training)")
+    logger.info("Stage 2 complete: Labels corrected and data augmented")
+    
+    return X_augmented, y_augmented, sample_weights, correction_stats, tabddpm, n_train_original
+
+
+def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, config, logger, n_original=None):
+    """
+    Stage 3: Fine-tune dual-stream classifier
+    
+    Args:
+        backbone: Frozen pre-trained backbone
+        X_train: (N, L, 5) training sequences (augmented, includes original + synthetic)
+        y_train: (N,) training labels
+        sample_weights: (N,) lifecycle weights from Stage 2 (original + synthetic)
+        config: configuration object
+        logger: logger
+        n_original: int, number of original samples (first n_original in X_train)
+                    If None, assumes all samples are original
+        
+    Returns:
+        classifier: trained MEDAL classifier
+        history: training history
+        optimal_threshold: optimal decision threshold
+    """
+    logger.info("")
+    logger.info("="*70)
+    logger.info("STAGE 3: Fine-tuning Dual-Stream Classifier")
+    logger.info("="*70)
+    logger.info(f"目标: 训练双流MLP分类器进行最终威胁检测")
+    logger.info(f"训练轮数: {config.FINETUNE_EPOCHS} epochs")
+    logger.info(f"批次大小: {config.FINETUNE_BATCH_SIZE}")
+    logger.info(f"学习率: {config.FINETUNE_LR}")
+    logger.info(f"训练样本数: {len(X_train)} (包含增强样本)")
+    logger.info(f"损失组件: 加权监督 + 软正交约束 + 一致性损失")
+    logger.info("")
+    logger.info("📥 输入数据路径:")
+    augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_data.npz")
+    logger.info(f"  ✓ 增强数据: {augmented_data_path}")
+    backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    logger.info(f"  ✓ 骨干网络模型: {backbone_path}")
+    logger.info("")
+    
+    # Create classifier
+    classifier = MEDAL_Classifier(backbone, config).to(config.DEVICE)
+    logger.info("✓ 双流分类器创建完成 (MLP_A + MLP_B)")
+    
+    # Loss function
+    criterion = DualStreamLoss(config)
+    logger.info("✓ 损失函数初始化完成")
+    
+    # Optional backbone fine-tuning
+    finetune_backbone = bool(getattr(config, 'FINETUNE_BACKBONE', False))
+    finetune_scope = str(getattr(config, 'FINETUNE_BACKBONE_SCOPE', 'projection')).strip().lower()
+    backbone_lr = float(getattr(config, 'FINETUNE_BACKBONE_LR', config.FINETUNE_LR))
+
+    if finetune_backbone:
+        backbone.unfreeze()
+        if finetune_scope == 'projection':
+            # Train only the bidirectional projection head; freeze others
+            for name, param in backbone.named_parameters():
+                param.requires_grad = name.startswith('projection')
+        elif finetune_scope == 'all':
+            pass
+        else:
+            logger.warning(f"Unknown FINETUNE_BACKBONE_SCOPE={finetune_scope!r}, fallback to 'projection'")
+            for name, param in backbone.named_parameters():
+                param.requires_grad = name.startswith('projection')
+
+    backbone_trainable = [p for p in backbone.parameters() if p.requires_grad]
+    if finetune_backbone and len(backbone_trainable) > 0:
+        optimizer = optim.AdamW(
+            [
+                {'params': classifier.dual_mlp.parameters(), 'lr': config.FINETUNE_LR},
+                {'params': backbone_trainable, 'lr': backbone_lr},
+            ],
+            weight_decay=config.PRETRAIN_WEIGHT_DECAY
+        )
+        logger.info(
+            "✓ 优化器初始化完成 (分类器+骨干微调) | "
+            f"scope={finetune_scope} | lr_head={config.FINETUNE_LR} lr_backbone={backbone_lr}"
+        )
+    else:
+        optimizer = optim.AdamW(
+            classifier.dual_mlp.parameters(),
+            lr=config.FINETUNE_LR,
+            weight_decay=config.PRETRAIN_WEIGHT_DECAY
+        )
+        logger.info("✓ 优化器初始化完成 (仅优化分类器参数，骨干网络已冻结)")
+    
+    logger.info("="*70)
+    logger.info("📊 全量训练（不划分验证集）")
+    logger.info("="*70)
+    logger.info(f"  训练集: {len(X_train)} 个样本 (包含原始 + 合成)")
+    logger.info("")
+    
+    # 直接使用传入的训练集和验证集
+    X_train_split = X_train
+    y_train_split = y_train
+    sample_weights_split = sample_weights
+    
+    # DataLoader
+    train_dataset = TensorDataset(
+        torch.FloatTensor(X_train_split),
+        torch.LongTensor(y_train_split),
+        torch.FloatTensor(sample_weights_split)
+    )
+    train_loader = DataLoader(train_dataset, batch_size=config.FINETUNE_BATCH_SIZE, shuffle=True)
+    logger.info(f"✓ 数据加载器准备完成 ({len(train_loader)} 个批次)")
+    logger.info("")
+    logger.info("开始训练...")
+    logger.info("-"*70)
+    
+    # Training loop
+    history = {
+        'train_loss': [], 'supervision': [], 'soft_f1_loss': [], 'orthogonality': [],
+        'consistency': [], 'margin': [], 'lambda_orth': [],
+        'lambda_con': [], 'lambda_margin': [], 'train_f1': []
+    }
+    
+    classifier.train()
+    
+    for epoch in range(config.FINETUNE_EPOCHS):
+        epoch_loss = 0.0
+        epoch_losses = {
+            'supervision': 0.0, 'soft_f1': 0.0, 'orthogonality': 0.0, 
+            'consistency': 0.0, 'margin': 0.0
+        }
+        
+        # 收集训练集预测用于计算 F1
+        all_train_probs = []
+        all_train_labels = []
+        
+        for X_batch, y_batch, w_batch in train_loader:
+            X_batch = X_batch.to(config.DEVICE)
+            y_batch = y_batch.to(config.DEVICE)
+            w_batch = w_batch.to(config.DEVICE)
+            
+            optimizer.zero_grad()
+            
+            # Extract features
+            z = backbone(X_batch, return_sequence=False)
+            
+            # Compute loss (weight-aware)
+            loss, loss_dict = criterion(classifier.dual_mlp, z, y_batch, w_batch, epoch, config.FINETUNE_EPOCHS)
+            
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss_dict['total']
+            epoch_losses['supervision'] += loss_dict['supervision']
+            epoch_losses['soft_f1'] += loss_dict.get('soft_f1', 0.0)
+            epoch_losses['orthogonality'] += loss_dict['orthogonality']
+            epoch_losses['consistency'] += loss_dict['consistency']
+            if 'margin' in loss_dict:
+                epoch_losses['margin'] = epoch_losses.get('margin', 0.0) + loss_dict['margin']
+            
+            # 收集预测概率用于计算 F1
+            with torch.no_grad():
+                logits_a, logits_b = classifier.dual_mlp(z, return_separate=True)
+                logits_avg = (logits_a + logits_b) / 2.0
+                probs = torch.softmax(logits_avg, dim=1)
+                all_train_probs.append(probs.cpu().numpy())
+                all_train_labels.append(y_batch.cpu().numpy())
+        
+        n_batches = len(train_loader)
+        epoch_loss /= n_batches
+        for key in epoch_losses:
+            epoch_losses[key] /= n_batches
+        
+        # 计算训练集 Binary F1-Score
+        train_probs = np.concatenate(all_train_probs)
+        train_labels = np.concatenate(all_train_labels)
+        train_preds = (train_probs[:, 1] >= 0.5).astype(int)
+        from sklearn.metrics import f1_score
+        train_f1 = f1_score(train_labels, train_preds, pos_label=1, zero_division=0)
+        
+        classifier.eval()
+        classifier.train()
+        
+        # 保存历史
+        history['train_loss'].append(epoch_loss)
+        history['supervision'].append(epoch_losses['supervision'])
+        history['soft_f1_loss'].append(epoch_losses['soft_f1'])
+        history['orthogonality'].append(epoch_losses['orthogonality'])
+        history['consistency'].append(epoch_losses['consistency'])
+        history['margin'].append(epoch_losses.get('margin', 0.0))
+        history['lambda_orth'].append(loss_dict['lambda_orth'])
+        history['lambda_con'].append(loss_dict['lambda_con'])
+        history['lambda_margin'].append(loss_dict.get('lambda_margin', 0.0))
+        history['train_f1'].append(train_f1)
+        
+        # 每个epoch都输出详细日志
+        progress = (epoch + 1) / config.FINETUNE_EPOCHS * 100
+        soft_f1_str = f" | F1Loss: {epoch_losses['soft_f1']:.4f}" if epoch_losses['soft_f1'] > 0 else ""
+        logger.info(f"[Stage 3] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
+                  f"TrLoss: {epoch_loss:.4f} | "
+                  f"TrF1: {train_f1:.4f} | "
+                  f"Sup: {epoch_losses['supervision']:.4f}{soft_f1_str}")
+    
+    logger.info("-"*70)
+    logger.info("✓ Stage 3 完成: 分类器微调完成")
+    logger.info(f"  训练集 - 最终损失: {history['train_loss'][-1]:.4f}, 最终F1: {history['train_f1'][-1]:.4f}")
+    logger.info(f"  训练了 {config.FINETUNE_EPOCHS} 个epoch")
+    logger.info("")
+    
+    optimal_threshold = config.MALICIOUS_THRESHOLD
+    
+    logger.info("📁 输出文件路径:")
+    # Save final model
+    classifier_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_final.pth")
+    torch.save(classifier.state_dict(), classifier_path)
+    logger.info(f"  ✓ 最终模型: {classifier_path}")
+    
+    # Save training history
+    history_path = os.path.join(config.CLASSIFICATION_DIR, "models", "training_history.npz")
+    np.savez(history_path, **{k: np.array(v) for k, v in history.items()})
+    logger.info(f"  ✓ 训练历史: {history_path}")
+    
+    return classifier, history, optimal_threshold
+
+def main(args):
+    """Main training function"""
+    
+    # Setup
+    set_seed(config.SEED)
+    config.create_dirs()
+    logger = setup_logger(os.path.join(config.OUTPUT_ROOT, "logs"), name='train')
+    
+    logger.info("="*70)
+    logger.info("MEDAL-Lite Training Pipeline")
+    logger.info("="*70)
+    
+    # GPU信息
+    if torch.cuda.is_available():
+        logger.info(f"✓ GPU可用: {torch.cuda.get_device_name(0)}")
+        logger.info(f"  显存总量: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        logger.info(f"  CUDA版本: {torch.version.cuda}")
+        logger.info(f"  使用设备: {config.DEVICE}")
+    else:
+        logger.warning("⚠ GPU不可用，使用CPU训练（速度会较慢）")
+        logger.info(f"  使用设备: {config.DEVICE}")
+    
+    logger.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Get stage range first to determine what to run
+    start_stage = getattr(args, 'start_stage', 1)
+    end_stage = getattr(args, 'end_stage', 3)
+    
+    # Convert start_stage/end_stage to int if it's a string
+    if isinstance(start_stage, str):
+        try:
+            start_stage = int(start_stage)
+        except ValueError:
+            logger.error(f"❌ 无效的起始阶段: {start_stage}")
+            return
+
+    if isinstance(end_stage, str):
+        try:
+            end_stage = int(end_stage)
+        except ValueError:
+            logger.error(f"❌ 无效的结束阶段: {end_stage}")
+            return
+
+    if end_stage < start_stage:
+        logger.error(f"❌ 无效阶段范围: start_stage={start_stage} > end_stage={end_stage}")
+        return
+    
+    # ========================
+    # Load Dataset (only needed for Stage 1 and 2)
+    # ========================
+    X_train = None
+    y_train_clean = None
+    y_train_noisy = None
+    
+    if start_stage <= 2:
+        # Need to load raw dataset for Stage 1 or 2
+        logger.info("\n" + "="*70)
+        logger.info("📦 数据集加载 Dataset Loading")
+        logger.info("="*70)
+        logger.info(f"训练集配置:")
+        logger.info(f"  正常流量路径: {config.BENIGN_TRAIN}")
+        logger.info(f"  恶意流量路径: {config.MALICIOUS_TRAIN}")
+        logger.info(f"  序列长度: {config.SEQUENCE_LENGTH} 个数据包")
+        logger.info(f"  说明: 将读取上述路径下所有pcap文件，流数在处理时统计")
+        logger.info("")
+        
+        # 优先使用预处理好的数据
+        if PREPROCESS_AVAILABLE and check_preprocessed_exists('train'):
+            logger.info("✓ 发现预处理文件，直接加载...")
+            X_train, y_train_clean, train_files = load_preprocessed('train')
+            logger.info(f"  从预处理文件加载: {X_train.shape[0]} 个样本")
+        else:
+            # 从PCAP文件加载
+            logger.info("开始加载训练数据集（从PCAP文件）...")
+            logger.info("💡 提示: 运行 'python preprocess.py' 可预处理数据，加速后续训练")
+            X_train, y_train_clean, train_files = load_dataset(
+                benign_dir=config.BENIGN_TRAIN,
+                malicious_dir=config.MALICIOUS_TRAIN,
+                sequence_length=config.SEQUENCE_LENGTH
+            )
+        
+        if X_train is None:
+            logger.error("❌ 训练数据集加载失败!")
+            return
+        
+        logger.info("")
+        logger.info("✓ 训练数据集加载完成")
+        logger.info(f"  数据形状: {X_train.shape} (样本数×序列长度×特征维度)")
+        logger.info(f"  正常样本: {(y_train_clean==0).sum()} 个")
+        logger.info(f"  恶意样本: {(y_train_clean==1).sum()} 个")
+        logger.info("")
+        
+        # Inject label noise
+        logger.info(f"🔀 注入标签噪声 ({config.LABEL_NOISE_RATE*100:.0f}%)...")
+        y_train_noisy, noise_mask = inject_label_noise(y_train_clean, config.LABEL_NOISE_RATE)
+        logger.info(f"✓ 噪声标签创建完成: {noise_mask.sum()} 个标签被翻转")
+        logger.info(f"  原始标签分布: 正常={(y_train_clean==0).sum()}, 恶意={(y_train_clean==1).sum()}")
+        logger.info(f"  噪声标签分布: 正常={(y_train_noisy==0).sum()}, 恶意={(y_train_noisy==1).sum()}")
+    else:
+        # Starting from Stage 3, skip raw dataset loading
+        logger.info("\n" + "="*70)
+        logger.info("⏭️  跳过原始数据集加载 (从Stage 3开始，将直接加载增强数据)")
+        logger.info("="*70)
+        logger.info("")
+    
+    # ========================
+    # Stage 1: Pre-train Backbone (unsupervised, no labels needed)
+    # ========================
+    backbone = MicroBiMambaBackbone(config)
+    
+    if start_stage <= 1:
+        # SimMTM is unsupervised, so we only need X_train, not labels
+        dataset = TensorDataset(torch.FloatTensor(X_train))
+        train_loader = DataLoader(dataset, batch_size=config.PRETRAIN_BATCH_SIZE, shuffle=True)
+        
+        backbone, pretrain_history = stage1_pretrain_backbone(backbone, train_loader, config, logger)
+        # Backbone is already saved in stage1_pretrain_backbone function
+        if end_stage <= 1:
+            logger.info("\n" + "="*70)
+            logger.info("✅ 已完成到 Stage 1，按 end_stage 设置提前结束")
+            logger.info("="*70)
+            return backbone
+    else:
+        # Load pre-trained backbone (required for Stage 2 and 3)
+        backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+        retrain_backbone = bool(getattr(args, 'retrain_backbone', False))
+        if retrain_backbone:
+            logger.warning("⚠ --retrain_backbone 已指定：将使用随机初始化骨干网络（不加载预训练权重）")
+            backbone.freeze()
+        else:
+            if os.path.exists(backbone_path):
+                logger.info("📥 输入数据路径:")
+                logger.info(f"  ✓ 骨干网络模型: {backbone_path}")
+                logger.info("")
+                logger.info(f"✓ 加载已有骨干网络: {backbone_path}")
+                backbone.load_state_dict(torch.load(backbone_path, map_location=config.DEVICE))
+                backbone.freeze()
+            else:
+                logger.error(f"❌ 找不到预训练骨干网络: {backbone_path}")
+                logger.error("   请先运行 Stage 1 或从 Stage 1 开始训练")
+                return
+    
+    # ========================
+    # Stage 2: Label Correction & Augmentation
+    # ========================
+    if start_stage <= 2 and end_stage >= 2:
+        stage2_mode = getattr(args, 'stage2_mode', 'standard')
+        X_augmented, y_augmented, sample_weights, correction_stats, tabddpm, n_original = stage2_label_correction_and_augmentation(
+            backbone, X_train, y_train_noisy, y_train_clean, config, logger, stage2_mode=stage2_mode
+        )
+        # TabDDPM is already saved in stage2_label_correction_and_augmentation function
+        if end_stage <= 2:
+            logger.info("\n" + "="*70)
+            logger.info("✅ 已完成到 Stage 2，按 end_stage 设置提前结束")
+            logger.info("="*70)
+            return backbone
+    else:
+        # Load augmented data and validation set
+        augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_data.npz")
+        if os.path.exists(augmented_data_path):
+            logger.info("📥 输入数据路径:")
+            logger.info(f"  ✓ 增强数据: {augmented_data_path}")
+            backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+            logger.info(f"  ✓ 骨干网络模型: {backbone_path}")
+            logger.info("")
+            logger.info(f"✓ 加载已有增强数据: {augmented_data_path}")
+            data = np.load(augmented_data_path)
+            X_augmented = data['X_augmented']
+            y_augmented = data['y_augmented']
+            sample_weights = data['sample_weights'] if 'sample_weights' in data else np.ones(len(X_augmented))
+            # Get n_original from saved data
+            if 'n_original' in data:
+                n_original = int(data['n_original'])
+            else:
+                # Fallback: assume all data is original if metadata not found
+                n_original = len(X_augmented)
+                logger.warning("⚠️  未找到原始数据数量标记，假设所有数据均为原始数据")
+            
+        else:
+            logger.error(f"❌ 找不到增强数据: {augmented_data_path}")
+            logger.error("   请先运行 Stage 2 或从 Stage 2 开始训练")
+            return
+    
+    # ========================
+    # Stage 3: Fine-tune Classifier
+    # ========================
+    if end_stage >= 3 and start_stage <= 3:
+        classifier, finetune_history, optimal_threshold = stage3_finetune_classifier(
+            backbone, X_augmented, y_augmented, sample_weights, config, logger, n_original=n_original
+        )
+    else:
+        logger.info("\n" + "="*70)
+        logger.info("⏭️  跳过 Stage 3（按 end_stage 设置）")
+        logger.info("="*70)
+        return backbone
+    
+    # Plot training history
+    history_fig_path = os.path.join(config.CLASSIFICATION_DIR, "figures", "training_history.png")
+    plot_training_history(finetune_history, history_fig_path)
+    logger.info(f"  ✓ 训练历史图表: {history_fig_path}")
+    
+    logger.info("")
+    logger.info("="*70)
+    logger.info("🎉 训练完成! Training Complete!")
+    logger.info("="*70)
+    logger.info("")
+    logger.info("📊 训练总结:")
+    logger.info(f"  Stage 1: 骨干网络预训练 - {config.PRETRAIN_EPOCHS} epochs")
+    logger.info(f"  Stage 2: 标签矫正+数据增强 - 完成")
+    logger.info(f"  Stage 3: 分类器微调 - {config.FINETUNE_EPOCHS} epochs")
+    logger.info("")
+    logger.info("📥 输入数据路径:")
+    logger.info(f"  ✓ 训练数据: {config.BENIGN_TRAIN} (正常), {config.MALICIOUS_TRAIN} (恶意)")
+    logger.info("")
+    logger.info("📁 输出文件路径:")
+    logger.info(f"  ✓ 特征提取: {config.FEATURE_EXTRACTION_DIR}")
+    logger.info(f"    - 骨干网络: {os.path.join(config.FEATURE_EXTRACTION_DIR, 'models', 'backbone_pretrained.pth')}")
+    logger.info(f"    - 训练特征: {os.path.join(config.FEATURE_EXTRACTION_DIR, 'models', 'train_features.npy')}")
+    logger.info(f"  ✓ 标签矫正: {config.LABEL_CORRECTION_DIR}")
+    logger.info(f"    - 矫正结果: {os.path.join(config.LABEL_CORRECTION_DIR, 'models', 'correction_results.npz')}")
+    logger.info(f"  ✓ 数据增强: {config.DATA_AUGMENTATION_DIR}")
+    logger.info(f"    - TabDDPM模型: {os.path.join(config.DATA_AUGMENTATION_DIR, 'models', 'tabddpm.pth')}")
+    logger.info(f"    - 增强数据: {os.path.join(config.DATA_AUGMENTATION_DIR, 'models', 'augmented_data.npz')}")
+    logger.info(f"  ✓ 分类器:   {config.CLASSIFICATION_DIR}")
+    logger.info(f"    - 分类器模型: {os.path.join(config.CLASSIFICATION_DIR, 'models', 'classifier_final.pth')}")
+    logger.info(f"    - 训练历史: {os.path.join(config.CLASSIFICATION_DIR, 'models', 'training_history.npz')}")
+    logger.info("")
+    logger.info("💡 下一步: 运行 test.py 评估模型性能")
+    logger.info("="*70)
+    
+    return classifier
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train MEDAL-Lite model")
+    parser.add_argument("--noise_rate", type=float, default=0.30, help="Label noise rate")
+    parser.add_argument("--start_stage", type=int, default=1, choices=[1, 2, 3], 
+                       help="Start from which stage (1=backbone pretrain, 2=label correction, 3=classifier finetune)")
+    parser.add_argument("--end_stage", type=int, default=3, choices=[1, 2, 3],
+                       help="End at which stage (1/2/3). Use end_stage=2 for Stage2-only run")
+    parser.add_argument("--stage2_mode", type=str, default="standard", choices=["standard", "clean_augment_only"])
+    parser.add_argument("--retrain_backbone", action="store_true",
+                       help="Use randomly initialized backbone instead of loading pretrained weights")
+    
+    args = parser.parse_args()
+    
+    # Override config if arguments provided
+    if args.noise_rate is not None:
+        config.LABEL_NOISE_RATE = args.noise_rate
+    
+    main(args)
+

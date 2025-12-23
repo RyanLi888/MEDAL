@@ -1,0 +1,58 @@
+# 数据集文件
+Datasets/
+*.pcap
+*.pcapng
+
+# Python 缓存和编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 输出和日志文件
+output/
+*.log
+*.out
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# 模型和检查点
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pb
+models/
+checkpoints/
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.cache
+
+# 系统文件
+Thumbs.db
+.DS_Store
+
+# 其他
+*.md
+*.pyc
+

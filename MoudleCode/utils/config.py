@@ -140,6 +140,10 @@ class Config:
     CLASSIFIER_HIDDEN_DIM = 64
     CLASSIFIER_OUTPUT_DIM = 2  # Binary classification
     
+    # ==================== 温室训练+战场校准策略 ====================
+    # Stage 3训练策略：强制1:1平衡采样（温室训练）
+    USE_BALANCED_SAMPLING = True  # 启用WeightedRandomSampler强制1:1平衡
+    
     # Validation set splitting for threshold optimization
     # Mixed validation set: 20% original + 10% synthetic
     # Prioritize real data to ensure threshold optimization reliability

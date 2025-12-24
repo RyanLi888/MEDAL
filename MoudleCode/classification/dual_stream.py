@@ -15,6 +15,7 @@ class DualStreamMLP(nn.Module):
     Dual-Stream MLP with Soft-Orthogonal Constraints
     
     Two parallel MLP classifiers with dynamic loss weighting
+    Enhanced with BatchNorm for better feature scaling (对比学习特征幅度较小)
     """
     
     def __init__(self, config):
@@ -22,19 +23,24 @@ class DualStreamMLP(nn.Module):
         
         self.config = config
         
-        # MLP A
+        # 关键改进：对比学习特征需要BN层来拉伸幅度
+        self.bn_input = nn.BatchNorm1d(config.MODEL_DIM)
+        
+        # MLP A - 增强版（添加BN）
         self.mlp_a = nn.Sequential(
             nn.Linear(config.MODEL_DIM, config.CLASSIFIER_HIDDEN_DIM),
+            nn.BatchNorm1d(config.CLASSIFIER_HIDDEN_DIM),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),  # 从0.1增加到0.3，增强正则化
             nn.Linear(config.CLASSIFIER_HIDDEN_DIM, config.CLASSIFIER_OUTPUT_DIM)
         )
         
-        # MLP B
+        # MLP B - 增强版（添加BN）
         self.mlp_b = nn.Sequential(
             nn.Linear(config.MODEL_DIM, config.CLASSIFIER_HIDDEN_DIM),
+            nn.BatchNorm1d(config.CLASSIFIER_HIDDEN_DIM),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),  # 从0.1增加到0.3，增强正则化
             nn.Linear(config.CLASSIFIER_HIDDEN_DIM, config.CLASSIFIER_OUTPUT_DIM)
         )
         
@@ -72,6 +78,9 @@ class DualStreamMLP(nn.Module):
             Else:
                 logits_avg: (B, 2)
         """
+        # 关键改进：先对输入特征进行BatchNorm
+        z = self.bn_input(z)
+        
         logits_a = self.mlp_a(z)
         logits_b = self.mlp_b(z)
         
@@ -84,6 +93,7 @@ class DualStreamMLP(nn.Module):
     
     def get_first_layer_weights(self):
         """Get first layer weights for orthogonality computation"""
+        # 注意：现在第一层是Linear，第二层是BN
         w_a = self.mlp_a[0].weight  # (hidden_dim, input_dim)
         w_b = self.mlp_b[0].weight  # (hidden_dim, input_dim)
         return w_a, w_b

@@ -4,7 +4,9 @@ Implements the complete 3-stage training pipeline
 """
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# 添加项目根目录到路径
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.insert(0, project_root)
 
 import torch
 import torch.nn.functional as F
@@ -36,7 +38,7 @@ from MoudleCode.feature_extraction.instance_contrastive import (
 
 # 导入预处理模块
 try:
-    from preprocess import check_preprocessed_exists, load_preprocessed, preprocess_train
+    from scripts.utils.preprocess import check_preprocessed_exists, load_preprocessed, preprocess_train
     PREPROCESS_AVAILABLE = True
 except ImportError:
     PREPROCESS_AVAILABLE = False
@@ -1004,13 +1006,55 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     y_train_split = y_train
     sample_weights_split = sample_weights
     
-    # DataLoader
-    train_dataset = TensorDataset(
-        torch.FloatTensor(X_train_split),
-        torch.LongTensor(y_train_split),
-        torch.FloatTensor(sample_weights_split)
-    )
-    train_loader = DataLoader(train_dataset, batch_size=config.FINETUNE_BATCH_SIZE, shuffle=True)
+    # ==================== 温室训练策略：强制1:1平衡采样 ====================
+    use_balanced_sampling = getattr(config, 'USE_BALANCED_SAMPLING', True)
+    
+    if use_balanced_sampling:
+        logger.info("🌡️  温室训练策略：启用1:1平衡采样")
+        logger.info("  目标：让模型在最舒适的环境下学习决策边界")
+        logger.info("")
+        
+        # 计算类别权重，实现1:1平衡
+        from torch.utils.data import WeightedRandomSampler
+        
+        class_counts = np.bincount(y_train_split)
+        logger.info(f"  原始分布: 正常={class_counts[0]}, 恶意={class_counts[1]}")
+        logger.info(f"  原始比例: {class_counts[0]}:{class_counts[1]} ≈ {class_counts[0]/class_counts[1]:.1f}:1")
+        
+        # 为每个样本分配采样权重（少数类权重高）
+        class_weights = 1.0 / class_counts
+        sample_sampling_weights = class_weights[y_train_split]
+        
+        # 创建加权采样器
+        sampler = WeightedRandomSampler(
+            weights=sample_sampling_weights,
+            num_samples=len(sample_sampling_weights),
+            replacement=True
+        )
+        
+        # DataLoader with balanced sampler
+        train_dataset = TensorDataset(
+            torch.FloatTensor(X_train_split),
+            torch.LongTensor(y_train_split),
+            torch.FloatTensor(sample_weights_split)
+        )
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=config.FINETUNE_BATCH_SIZE, 
+            sampler=sampler  # 使用平衡采样器，不使用shuffle
+        )
+        logger.info(f"  ✓ 平衡采样器创建完成")
+        logger.info(f"  ✓ 每个batch期望比例: 1:1 (正常:恶意)")
+    else:
+        logger.info("⚠️  使用原始分布训练（未启用平衡采样）")
+        # DataLoader without balanced sampling
+        train_dataset = TensorDataset(
+            torch.FloatTensor(X_train_split),
+            torch.LongTensor(y_train_split),
+            torch.FloatTensor(sample_weights_split)
+        )
+        train_loader = DataLoader(train_dataset, batch_size=config.FINETUNE_BATCH_SIZE, shuffle=True)
+    
     logger.info(f"✓ 数据加载器准备完成 ({len(train_loader)} 个批次)")
     logger.info("")
     logger.info("开始训练...")

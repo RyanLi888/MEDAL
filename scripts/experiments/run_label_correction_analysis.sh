@@ -2,6 +2,12 @@
 # Run Label Correction Analysis Script
 # 支持单个噪声率或批量运行多个噪声率
 
+# 获取脚本所在目录（scripts/experiments/）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 切换到项目根目录（python/MEDAL）
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$PROJECT_ROOT"
+
 # Default values
 NOISE_RATES=""
 RETRAIN_BACKBONE=""
@@ -92,12 +98,80 @@ fi
 print_banner
 
 # Check if Python script exists
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_SCRIPT="$SCRIPT_DIR/MoudleCode/label_correction/analysis/label_correction_analysis.py"
+PYTHON_SCRIPT="$PROJECT_ROOT/MoudleCode/label_correction/analysis/label_correction_analysis.py"
 
 if [ ! -f "$PYTHON_SCRIPT" ]; then
     print_message "$RED" "Error: Python script not found at $PYTHON_SCRIPT"
     exit 1
+fi
+
+# Check for existing backbone models
+echo "检查已有的骨干网络模型..."
+BACKBONE_DIR="$PROJECT_ROOT/output/feature_extraction/models"
+USE_EXISTING_BACKBONE="false"
+BACKBONE_PATH=""
+
+if [ -d "$BACKBONE_DIR" ]; then
+    # 查找所有backbone文件
+    BACKBONE_FILES=($(ls -t "$BACKBONE_DIR"/backbone_*.pth 2>/dev/null))
+    
+    if [ ${#BACKBONE_FILES[@]} -gt 0 ]; then
+        print_message "$GREEN" "✓ 发现 ${#BACKBONE_FILES[@]} 个已训练的骨干网络"
+        echo ""
+        echo "是否使用已有的骨干网络? (y/n, 默认y)"
+        echo "  - 选择 y: 使用已有backbone进行特征提取"
+        echo "  - 选择 n: 使用随机初始化的backbone（不推荐）"
+        echo ""
+        echo -n "请输入选择: "
+        read -r use_existing_backbone
+        use_existing_backbone=${use_existing_backbone:-y}
+        
+        if [ "$use_existing_backbone" = "y" ] || [ "$use_existing_backbone" = "Y" ]; then
+            echo ""
+            echo "可用的骨干网络模型:"
+            echo "----------------------------------------"
+            for i in "${!BACKBONE_FILES[@]}"; do
+                filename=$(basename "${BACKBONE_FILES[$i]}")
+                filesize=$(du -h "${BACKBONE_FILES[$i]}" | cut -f1)
+                filetime=$(stat -c %y "${BACKBONE_FILES[$i]}" 2>/dev/null | cut -d'.' -f1 || stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "${BACKBONE_FILES[$i]}")
+                echo "  $((i+1))) $filename"
+                echo "      大小: $filesize | 时间: $filetime"
+            done
+            echo "----------------------------------------"
+            echo ""
+            echo -n "请选择要使用的模型 (1-${#BACKBONE_FILES[@]}, 默认1): "
+            read -r backbone_choice
+            backbone_choice=${backbone_choice:-1}
+            
+            # 验证输入
+            if ! [[ "$backbone_choice" =~ ^[0-9]+$ ]] || [ "$backbone_choice" -lt 1 ] || [ "$backbone_choice" -gt ${#BACKBONE_FILES[@]} ]; then
+                echo "无效选择，使用第一个模型"
+                backbone_choice=1
+            fi
+            
+            BACKBONE_PATH="${BACKBONE_FILES[$((backbone_choice-1))]}"
+            SELECTED_BACKBONE_NAME=$(basename "$BACKBONE_PATH")
+            USE_EXISTING_BACKBONE="true"
+            
+            print_message "$GREEN" "✓ 已选择: $SELECTED_BACKBONE_NAME"
+            echo ""
+        else
+            print_message "$YELLOW" "⚠ 将使用随机初始化的backbone（特征质量可能较差）"
+            RETRAIN_BACKBONE="--retrain_backbone"
+            echo ""
+        fi
+    else
+        print_message "$YELLOW" "⚠ 未找到已训练的骨干网络"
+        echo "将使用随机初始化的backbone（特征质量可能较差）"
+        echo "建议先运行: bash scripts/run_experiment.sh 选择模式1训练骨干网络"
+        RETRAIN_BACKBONE="--retrain_backbone"
+        echo ""
+    fi
+else
+    print_message "$YELLOW" "⚠ 骨干网络目录不存在"
+    echo "将使用随机初始化的backbone（特征质量可能较差）"
+    RETRAIN_BACKBONE="--retrain_backbone"
+    echo ""
 fi
 
 # Check if virtual environment exists and activate it
@@ -118,8 +192,13 @@ read -ra RATES_ARRAY <<< "$NOISE_RATES"
 print_message "$YELLOW" "配置信息:"
 echo "  噪声率:            ${RATES_ARRAY[*]}"
 echo "  批量模式:          $([ "$BATCH_MODE" = true ] && echo "是" || echo "否")"
-echo "  重训练Backbone:    $([ -n "$RETRAIN_BACKBONE" ] && echo "是" || echo "否")"
+if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
+    echo "  骨干网络:          $SELECTED_BACKBONE_NAME"
+else
+    echo "  骨干网络:          随机初始化"
+fi
 echo "  脚本路径:          $PYTHON_SCRIPT"
+echo "  工作目录:          $PROJECT_ROOT"
 echo ""
 
 # Confirm execution
@@ -131,7 +210,7 @@ if [[ ! $REPLY =~ ^[Yy]$ ]] && [[ ! -z $REPLY ]]; then
 fi
 
 # Create log directory
-LOG_DIR="$SCRIPT_DIR/output/logs"
+LOG_DIR="$PROJECT_ROOT/output/logs"
 mkdir -p "$LOG_DIR"
 
 # Track results
@@ -142,7 +221,8 @@ declare -a COMPLETED_RATES
 declare -a FAILED_RATES
 
 # Run analysis for each noise rate
-cd "$SCRIPT_DIR"
+# 确保在项目根目录运行
+cd "$PROJECT_ROOT"
 
 for NOISE_RATE in "${RATES_ARRAY[@]}"; do
     NOISE_PCT=$(printf "%.0f" $(echo "$NOISE_RATE * 100" | bc))
@@ -153,10 +233,18 @@ for NOISE_RATE in "${RATES_ARRAY[@]}"; do
     print_message "$CYAN" "======================================================================"
     echo ""
     
+    # 构建命令参数
+    CMD_ARGS="--noise_rate $NOISE_RATE"
+    
+    # 添加骨干网络参数
+    if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
+        CMD_ARGS="$CMD_ARGS --backbone_path $BACKBONE_PATH"
+    elif [ -n "$RETRAIN_BACKBONE" ]; then
+        CMD_ARGS="$CMD_ARGS $RETRAIN_BACKBONE"
+    fi
+    
     # Run Python script
-    python "$PYTHON_SCRIPT" \
-        --noise_rate $NOISE_RATE \
-        $RETRAIN_BACKBONE
+    python "$PYTHON_SCRIPT" $CMD_ARGS
     
     # Check exit status
     EXIT_CODE=$?

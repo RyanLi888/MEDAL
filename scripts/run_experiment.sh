@@ -2,8 +2,11 @@
 # MEDAL-Lite 统一运行脚本
 # 支持前台/后台运行、实时日志、GPU选择
 
+# 获取脚本所在目录（scripts/）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+# 切换到项目根目录（python/MEDAL）
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 # 颜色定义
 GREEN='\033[0;32m'
@@ -219,7 +222,7 @@ echo "请选择运行模式:"
 echo "1) 完整流程 (训练 + 测试)"
 echo "2) 仅训练"
 echo "3) 仅测试"
-echo "4) 仅Stage 2 (标签矫正 + 数据增强)"
+echo "4) 干净数据训练 (使用骨干网络提取干净训练集特征，训练分类器并测试)"
 echo "5) 特征提取分析 (生成特征分布图和分析报告)"
 echo "6) 从指定阶段开始 (训练/测试)"
 echo "7) 消融实验 (特征提取 / 数据增强 / 标签矫正)"
@@ -233,10 +236,10 @@ case $choice in
     1)
         # 完整流程：使用开始时选择的backbone配置
         if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
-            CMD="python all_train_test.py --start_stage $START_FROM_STAGE --backbone_path $BACKBONE_PATH"
+            CMD="python scripts/training/all_train_test.py --start_stage $START_FROM_STAGE --backbone_path $BACKBONE_PATH"
             MODE="完整流程 (使用已有backbone: $SELECTED_BACKBONE_NAME)"
         else
-            CMD="python all_train_test.py"
+            CMD="python scripts/training/all_train_test.py"
             MODE="完整流程 (训练新backbone)"
         fi
         LOG_PREFIX="all_train_test"
@@ -244,49 +247,45 @@ case $choice in
     2)
         # 仅训练：使用开始时选择的backbone配置
         if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
-            CMD="python train.py --start_stage $START_FROM_STAGE --backbone_path $BACKBONE_PATH"
+            CMD="python scripts/training/train.py --start_stage $START_FROM_STAGE --backbone_path $BACKBONE_PATH"
             MODE="仅训练 (使用已有backbone: $SELECTED_BACKBONE_NAME)"
         else
-            CMD="python train.py"
+            CMD="python scripts/training/train.py"
             MODE="仅训练 (训练新backbone)"
         fi
         LOG_PREFIX="train"
         ;;
     3)
         # 仅测试：不涉及backbone
-        CMD="python test.py"
+        CMD="python scripts/testing/test.py"
         MODE="仅测试"
         LOG_PREFIX="test"
         ;;
     4)
-        # 仅Stage 2：使用开始时选择的backbone配置
+        # 干净数据训练模式：使用骨干网络提取干净训练集特征，训练Stage 3并测试
         echo ""
-        echo "仅Stage 2 模式 (标签矫正 + 数据增强)"
+        echo "干净数据训练模式"
         echo ""
-        echo "说明: 将执行 train.py 的 Stage 2，并在完成后退出（不会训练分类器）"
-        echo "  - 输出: output/feature_extraction/, output/label_correction/, output/data_augmentation/"
+        echo "说明: 使用骨干网络提取干净训练集（无噪声）的特征，训练分类器并测试"
+        echo "  - 使用真实标签（无噪声注入）"
+        echo "  - 跳过标签矫正和数据增强"
+        echo "  - 直接训练 Stage 3 分类器"
+        echo "  - 使用相同骨干网络进行测试"
         echo ""
         
         if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
             echo "将使用已选择的骨干网络: $SELECTED_BACKBONE_NAME"
+            echo ""
+            CMD="python scripts/training/train_clean_only_then_test.py --use_ground_truth --backbone_path $BACKBONE_PATH"
+            MODE="干净数据训练+测试 (使用已有backbone: $SELECTED_BACKBONE_NAME)"
         else
-            echo "将先训练新的骨干网络（Stage 1），然后执行Stage 2"
+            echo "将先训练新的骨干网络（Stage 1），然后用干净数据训练分类器"
+            echo ""
+            # 先训练backbone，再用干净数据训练分类器并测试
+            CMD="python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 && python scripts/training/train_clean_only_then_test.py --use_ground_truth"
+            MODE="干净数据训练+测试 (训练新backbone)"
         fi
-        echo ""
-        
-        echo -n "噪声率 (0.0-1.0, 默认0.30): "
-        read -r noise_rate
-        noise_rate=${noise_rate:-0.30}
-
-        # 根据开始时的选择构建命令
-        if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
-            CMD="python train.py --noise_rate $noise_rate --start_stage 2 --end_stage 2 --backbone_path $BACKBONE_PATH"
-            MODE="仅Stage 2 (使用已有backbone: $SELECTED_BACKBONE_NAME)"
-        else
-            CMD="python train.py --noise_rate $noise_rate --start_stage 1 --end_stage 2"
-            MODE="仅Stage 2 (训练新backbone)"
-        fi
-        LOG_PREFIX="train_stage2"
+        LOG_PREFIX="clean_train_test"
         ;;
     5)
         # 特征提取分析模式
@@ -309,7 +308,7 @@ case $choice in
         echo ""
         
         # 创建特征分析脚本
-        FEATURE_ANALYSIS_SCRIPT="feature_analysis.py"
+        FEATURE_ANALYSIS_SCRIPT="scripts/analysis/feature_analysis.py"
         
         cat > "$FEATURE_ANALYSIS_SCRIPT" << 'EOF'
 """
@@ -707,7 +706,7 @@ EOF
         # 构建命令参数
         if [ "$start_stage" = "test" ] || [ "$start_stage" = "Test" ] || [ "$start_stage" = "TEST" ]; then
             # 仅测试模式
-            CMD="python test.py"
+            CMD="python scripts/testing/test.py"
             MODE="仅测试"
             LOG_PREFIX="test"
         else
@@ -725,7 +724,7 @@ EOF
             fi
             
             if [ "$include_test" = "y" ] || [ "$include_test" = "Y" ]; then
-                CMD="python all_train_test.py $STAGE_ARG $BACKBONE_ARG"
+                CMD="python scripts/training/all_train_test.py $STAGE_ARG $BACKBONE_ARG"
                 if [ "$USE_EXISTING_BACKBONE" = "true" ] && [ "$start_stage" != "1" ]; then
                     MODE="从Stage $start_stage开始 (含测试, 使用已有backbone: $SELECTED_BACKBONE_NAME)"
                 else
@@ -733,7 +732,7 @@ EOF
                 fi
                 LOG_PREFIX="all_train_test_stage${start_stage}"
             else
-                CMD="python train.py $STAGE_ARG $BACKBONE_ARG"
+                CMD="python scripts/training/train.py $STAGE_ARG $BACKBONE_ARG"
                 if [ "$USE_EXISTING_BACKBONE" = "true" ] && [ "$start_stage" != "1" ]; then
                     MODE="从Stage $start_stage开始 (仅训练, 使用已有backbone: $SELECTED_BACKBONE_NAME)"
                 else
@@ -774,7 +773,7 @@ EOF
                     echo ""
                 fi
                 
-                CMD="python train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 && python train_clean_only_then_test.py --use_ground_truth"
+                CMD="python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 && python scripts/training/train_clean_only_then_test.py --use_ground_truth"
                 MODE="消融-特征提取 (训练新backbone)"
                 LOG_PREFIX="ablation_feature_extraction"
                 ;;
@@ -790,11 +789,11 @@ EOF
                     echo "将使用已选择的骨干网络: $SELECTED_BACKBONE_NAME"
                     echo "跳过Stage 1，从Stage 2开始"
                     BACKBONE_ARG="--backbone_path $BACKBONE_PATH --start_stage 2"
-                    CMD="python train.py --noise_rate 0.0 --end_stage 3 --stage2_mode clean_augment_only $BACKBONE_ARG && python test.py"
+                    CMD="python scripts/training/train.py --noise_rate 0.0 --end_stage 3 --stage2_mode clean_augment_only $BACKBONE_ARG && python scripts/testing/test.py"
                     MODE="消融-数据增强 (使用已有backbone: $SELECTED_BACKBONE_NAME)"
                 else
                     echo "将训练新的骨干网络"
-                    CMD="python train.py --noise_rate 0.0 --start_stage 1 --end_stage 3 --stage2_mode clean_augment_only && python test.py"
+                    CMD="python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 3 --stage2_mode clean_augment_only && python scripts/testing/test.py"
                     MODE="消融-数据增强 (训练新backbone)"
                 fi
                 LOG_PREFIX="ablation_data_augmentation"
@@ -812,11 +811,11 @@ EOF
                 if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
                     echo "将使用已选择的骨干网络: $SELECTED_BACKBONE_NAME"
                     BACKBONE_ARG="--backbone_path $BACKBONE_PATH"
-                    CMD="python MoudleCode/label_correction/analysis/label_correction_analysis.py --noise_rate 0.30 $BACKBONE_ARG && python train_clean_only_then_test.py --correction_npz $CORR_NPZ $BACKBONE_ARG"
+                    CMD="python MoudleCode/label_correction/analysis/label_correction_analysis.py --noise_rate 0.30 $BACKBONE_ARG && python scripts/training/train_clean_only_then_test.py --correction_npz $CORR_NPZ $BACKBONE_ARG"
                     MODE="消融-标签矫正 (使用已有backbone: $SELECTED_BACKBONE_NAME)"
                 else
                     echo "将训练新的骨干网络"
-                    CMD="python MoudleCode/label_correction/analysis/label_correction_analysis.py --noise_rate 0.30 && python train_clean_only_then_test.py --correction_npz $CORR_NPZ"
+                    CMD="python MoudleCode/label_correction/analysis/label_correction_analysis.py --noise_rate 0.30 && python scripts/training/train_clean_only_then_test.py --correction_npz $CORR_NPZ"
                     MODE="消融-标签矫正 (训练新backbone)"
                 fi
                 LOG_PREFIX="ablation_label_correction"

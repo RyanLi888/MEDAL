@@ -1,5 +1,8 @@
 import os
 import sys
+# 添加项目根目录到路径
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.insert(0, project_root)
 import json
 import shutil
 import argparse
@@ -14,13 +17,13 @@ from MoudleCode.preprocessing.pcap_parser import load_dataset
 from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone
 
 try:
-    from preprocess import check_preprocessed_exists, load_preprocessed
+    from scripts.utils.preprocess import check_preprocessed_exists, load_preprocessed
     PREPROCESS_AVAILABLE = True
 except Exception:
     PREPROCESS_AVAILABLE = False
 
-from train import stage3_finetune_classifier
-from test import main as test_main
+from scripts.training.train import stage3_finetune_classifier
+from scripts.testing.test import main as test_main
 
 
 def _safe_makedirs(path: str) -> None:
@@ -101,12 +104,30 @@ def main():
     try:
 
         logger.info('=' * 70)
-        logger.info('CLEAN-ONLY TRAINING + TESTING (no augmentation)')
+        logger.info('🚀 干净数据训练+测试模式')
         logger.info('=' * 70)
-        logger.info(f'Run dir: {run_dir}')
-        logger.info(f'Use ground truth: {bool(args.use_ground_truth)}')
-        logger.info(f'Output classification dir (isolated): {config.CLASSIFICATION_DIR}')
-        logger.info(f'Output result dir (isolated): {config.RESULT_DIR}')
+        logger.info(f'运行目录: {run_dir}')
+        logger.info(f'时间戳: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+        logger.info('')
+        
+        # 显示训练模式
+        if args.use_ground_truth:
+            logger.info('📋 训练模式: 使用真实标签（无噪声）')
+            logger.info('  - 数据来源: 原始训练集')
+            logger.info('  - 标签: 真实标签（ground truth）')
+            logger.info('  - 标签矫正: 跳过')
+            logger.info('  - 数据增强: 跳过')
+        else:
+            logger.info('📋 训练模式: 使用标签矫正结果')
+            logger.info(f'  - 矫正文件: {correction_npz}')
+            logger.info('  - 标签: 矫正后的标签')
+            logger.info('  - 数据增强: 跳过')
+        
+        logger.info('')
+        logger.info('📁 输出目录（隔离）:')
+        logger.info(f'  - 分类器: {config.CLASSIFICATION_DIR}')
+        logger.info(f'  - 测试结果: {config.RESULT_DIR}')
+        logger.info('')
 
         X_train, y_train_true = _load_train_dataset()
         if X_train is None:
@@ -149,38 +170,66 @@ def main():
             'weight_summary': _summarize_array(w_clean),
         }
 
-        with open(os.path.join(run_dir, 'train_data_stats.json'), 'w', encoding='utf-8') as f:
-            json.dump(stats, f, ensure_ascii=False, indent=2)
-
-        logger.info('Data stats saved: train_data_stats.json')
-        logger.info(f"Training samples: {stats['n_train_used']} | benign={stats['label_dist_corrected']['benign']} malicious={stats['label_dist_corrected']['malicious']}")
-
+        logger.info('📊 数据统计:')
+        logger.info(f"  - 训练样本总数: {stats['n_train_used']}")
+        logger.info(f"  - 正常样本: {stats['label_dist_corrected']['benign']}")
+        logger.info(f"  - 恶意样本: {stats['label_dist_corrected']['malicious']}")
+        
+        if not args.use_ground_truth:
+            logger.info('')
+            logger.info('📝 标签矫正统计:')
+            logger.info(f"  - 保持不变: {stats['n_keep']}")
+            logger.info(f"  - 翻转标签: {stats['n_flip']}")
+            logger.info(f"  - 丢弃样本: {stats['n_drop']}")
+            logger.info(f"  - 重新加权: {stats['n_reweight']}")
+        
+        logger.info('')
+        logger.info('🔧 骨干网络:')
+        
         backbone = MicroBiMambaBackbone(config)
         
         # 确定backbone路径：优先使用命令行参数，否则使用默认路径
         if args.backbone_path:
             backbone_path = args.backbone_path
+            logger.info(f'  - 来源: 命令行指定')
         else:
             backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, 'models', 'backbone_pretrained.pth')
+            logger.info(f'  - 来源: 默认路径')
+        
+        logger.info(f'  - 路径: {backbone_path}')
         
         if os.path.exists(backbone_path) and not args.retrain_backbone:
-            logger.info(f'Loading backbone: {backbone_path}')
+            logger.info(f'  - 状态: ✓ 加载预训练模型')
             backbone.load_state_dict(torch.load(backbone_path, map_location=config.DEVICE))
             backbone.freeze()
         else:
             if args.retrain_backbone:
-                logger.warning('--retrain_backbone specified; using randomly initialized backbone')
+                logger.info('  - 状态: ⚠ 使用随机初始化（--retrain_backbone 指定）')
             else:
-                logger.warning(f'Backbone checkpoint not found: {backbone_path}; using randomly initialized backbone')
+                logger.info(f'  - 状态: ⚠ 模型文件不存在，使用随机初始化')
             backbone.freeze()
+        
+        logger.info('')
+
+        with open(os.path.join(run_dir, 'train_data_stats.json'), 'w', encoding='utf-8') as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
 
         X_tr = X_clean
         y_tr = y_clean
         w_tr = w_clean
 
         logger.info('=' * 70)
-        logger.info('Stage 3 (classifier fine-tune) on corrected clean data')
+        logger.info('🎯 Stage 3: 分类器训练')
         logger.info('=' * 70)
+        logger.info('📥 输入数据:')
+        logger.info(f'  - 训练样本: {len(X_tr)} 个')
+        logger.info(f'  - 特征来源: 骨干网络提取')
+        if args.use_ground_truth:
+            logger.info(f'  - 标签来源: 真实标签（无噪声）')
+        else:
+            logger.info(f'  - 标签来源: 标签矫正结果')
+        logger.info(f'  - 数据增强: 未使用')
+        logger.info('')
 
         stage3_finetune_classifier(
             backbone,
@@ -196,11 +245,18 @@ def main():
         classifier_best = os.path.join(config.CLASSIFICATION_DIR, 'models', 'classifier_best_f1.pth')
         history_npz = os.path.join(config.CLASSIFICATION_DIR, 'models', 'training_history.npz')
 
+        logger.info('')
         logger.info('=' * 70)
-        logger.info('Testing')
+        logger.info('🧪 测试评估')
         logger.info('=' * 70)
+        logger.info('📥 使用模型:')
+        logger.info(f'  - 骨干网络: {backbone_path}')
+        logger.info(f'  - 分类器: {classifier_best}')
+        logger.info('')
 
-        test_main(argparse.Namespace())
+        # 创建测试参数，传递骨干网络路径
+        test_args = argparse.Namespace(backbone_path=backbone_path)
+        test_main(test_args)
 
         result_models_dir = os.path.join(config.RESULT_DIR, 'models')
         result_figures_dir = os.path.join(config.RESULT_DIR, 'figures')
@@ -218,9 +274,16 @@ def main():
         with open(os.path.join(run_dir, 'run_summary.json'), 'w', encoding='utf-8') as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
 
+        logger.info('')
         logger.info('=' * 70)
-        logger.info('Done')
-        logger.info(f'Run dir: {run_dir}')
+        logger.info('✅ 完成！')
+        logger.info('=' * 70)
+        logger.info('📁 输出文件:')
+        logger.info(f'  - 运行目录: {run_dir}')
+        logger.info(f'  - 分类器: {classifier_best}')
+        logger.info(f'  - 测试结果: {result_models_dir}/')
+        logger.info(f'  - 可视化: {result_figures_dir}/')
+        logger.info(f'  - 运行摘要: {os.path.join(run_dir, "run_summary.json")}')
         logger.info('=' * 70)
     finally:
         # Restore config (best-effort) for safety if this script is imported elsewhere

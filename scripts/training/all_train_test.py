@@ -4,7 +4,9 @@ Runs complete training and testing pipeline
 """
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# 添加项目根目录到路径
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.insert(0, project_root)
 
 import argparse
 from datetime import datetime
@@ -13,12 +15,12 @@ from MoudleCode.utils.config import config
 from MoudleCode.utils.helpers import set_seed, setup_logger
 
 # Import train and test functions
-from train import main as train_main
-from test import main as test_main
+from scripts.training.train import main as train_main
+from scripts.testing.test import main as test_main
 
 # 导入预处理模块
 try:
-    from preprocess import check_preprocessed_exists, preprocess_train, preprocess_test
+    from scripts.utils.preprocess import check_preprocessed_exists, preprocess_train, preprocess_test
     PREPROCESS_AVAILABLE = True
 except ImportError:
     PREPROCESS_AVAILABLE = False

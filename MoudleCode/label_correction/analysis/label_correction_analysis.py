@@ -48,15 +48,28 @@ except ImportError:
     EXCEL_AVAILABLE = False
     print("警告: openpyxl未安装，将只生成CSV文件。安装命令: pip install openpyxl")
 
-# 导入预处理模块
-try:
-    # 从项目根目录导入预处理模块
-    import sys
-    sys.path.insert(0, str(PROJECT_ROOT))
-    from preprocess import check_preprocessed_exists, load_preprocessed
-    PREPROCESS_AVAILABLE = True
-except ImportError:
-    PREPROCESS_AVAILABLE = False
+# 简化的预处理文件检测和加载
+def check_preprocessed_exists(split='train'):
+    """检查预处理文件是否存在"""
+    preprocessed_dir = PROJECT_ROOT / 'output' / 'preprocessed'
+    if not preprocessed_dir.exists():
+        return False
+    
+    X_file = preprocessed_dir / f'{split}_X.npy'
+    y_file = preprocessed_dir / f'{split}_y.npy'
+    files_file = preprocessed_dir / f'{split}_files.npy'
+    
+    return X_file.exists() and y_file.exists() and files_file.exists()
+
+def load_preprocessed(split='train'):
+    """加载预处理文件"""
+    preprocessed_dir = PROJECT_ROOT / 'output' / 'preprocessed'
+    
+    X = np.load(preprocessed_dir / f'{split}_X.npy')
+    y = np.load(preprocessed_dir / f'{split}_y.npy')
+    files = np.load(preprocessed_dir / f'{split}_files.npy', allow_pickle=True)
+    
+    return X, y, files
 
 logger = None  # Will be initialized in main()
 
@@ -1462,14 +1475,14 @@ def main(args):
     logger.info("")
     
     # 优先使用预处理好的数据
-    if PREPROCESS_AVAILABLE and check_preprocessed_exists('train'):
+    if check_preprocessed_exists('train'):
         logger.info("✓ 发现预处理文件，直接加载...")
         X_train, y_train_clean, train_files = load_preprocessed('train')
         logger.info(f"  从预处理文件加载: {X_train.shape[0]} 个样本")
     else:
         # 从PCAP文件加载
         logger.info("开始加载训练数据集（从PCAP文件）...")
-        logger.info("💡 提示: 运行 'python preprocess.py --train_only' 可预处理训练集，加速后续分析")
+        logger.info("💡 提示: 运行 'python scripts/utils/preprocess.py --train_only' 可预处理训练集，加速后续分析")
         X_train, y_train_clean, train_files = load_dataset(
             benign_dir=config.BENIGN_TRAIN,
             malicious_dir=config.MALICIOUS_TRAIN,

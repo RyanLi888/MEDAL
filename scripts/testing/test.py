@@ -4,7 +4,9 @@ Evaluate trained model on test dataset
 """
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# 添加项目根目录到路径
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.insert(0, project_root)
 
 import torch
 from torch.utils.data import TensorDataset, DataLoader
@@ -27,7 +29,7 @@ from MoudleCode.classification.dual_stream import MEDAL_Classifier
 
 # 导入预处理模块
 try:
-    from preprocess import check_preprocessed_exists, load_preprocessed, preprocess_test
+    from scripts.utils.preprocess import check_preprocessed_exists, load_preprocessed, preprocess_test
     PREPROCESS_AVAILABLE = True
 except ImportError:
     PREPROCESS_AVAILABLE = False
@@ -303,15 +305,28 @@ def main(args):
     # Load backbone from feature_extraction directory
     backbone = MicroBiMambaBackbone(config)
     
-    # Determine backbone path: use metadata if available, otherwise use default
-    if backbone_path_from_metadata and os.path.exists(backbone_path_from_metadata):
+    # 确定骨干网络路径
+    # 优先级：1. 命令行参数 2. 元数据 3. 默认路径
+    backbone_path = None
+    
+    # 1. 检查命令行参数
+    if hasattr(args, 'backbone_path') and args.backbone_path:
+        backbone_path = args.backbone_path
+        logger.info(f"✓ 使用命令行指定的骨干网络:")
+        logger.info(f"  {backbone_path}")
+        logger.info("")
+    # 2. 尝试从元数据读取
+    elif backbone_path_from_metadata and os.path.exists(backbone_path_from_metadata):
         backbone_path = backbone_path_from_metadata
-        logger.info("使用训练时的骨干网络（从元数据）")
+        logger.info("✓ 使用训练时的骨干网络（从元数据）")
+    # 3. 使用默认路径
     else:
         backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
         if backbone_path_from_metadata:
             logger.warning(f"⚠ 元数据中的骨干网络不存在: {backbone_path_from_metadata}")
             logger.warning(f"  回退到默认路径: {backbone_path}")
+        else:
+            logger.info(f"使用默认骨干网络路径: {backbone_path}")
     
     if not os.path.exists(backbone_path):
         logger.error(f"❌ 骨干网络检查点未找到: {backbone_path}")

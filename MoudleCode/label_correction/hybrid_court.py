@@ -904,6 +904,7 @@ class HybridCourt:
                         'is_correct': is_correct,
                         'iter_cl': iter_cl_conf_current,
                         'anchor_cons': anchor_cons,
+                        'orig_knn': neighbor_consistency[i],  # 添加原始KNN一致性
                         'density': density,
                         'current_label': current_label,
                         'reason': keep_reason

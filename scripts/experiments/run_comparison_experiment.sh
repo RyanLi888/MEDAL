@@ -2,8 +2,11 @@
 # 对比实验脚本：SimMTM vs SimMTM+InfoNCE
 # 依次训练两个骨干网络并进行性能对比
 
+# 获取脚本所在目录（scripts/experiments/）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+# 切换到项目根目录（python/MEDAL）
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$PROJECT_ROOT"
 
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -59,7 +62,7 @@ echo "开始训练 SimMTM-only..."
 echo "日志: $COMPARISON_RUN_DIR/simmtm_train.log"
 echo ""
 
-python train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 > "$COMPARISON_RUN_DIR/simmtm_train.log" 2>&1
+python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 > "$COMPARISON_RUN_DIR/simmtm_train.log" 2>&1
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✓ SimMTM-only 训练完成${NC}"
@@ -94,7 +97,7 @@ echo "开始训练 SimMTM+InfoNCE..."
 echo "日志: $COMPARISON_RUN_DIR/simclr_train.log"
 echo ""
 
-python train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 > "$COMPARISON_RUN_DIR/simclr_train.log" 2>&1
+python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 > "$COMPARISON_RUN_DIR/simclr_train.log" 2>&1
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✓ SimMTM+InfoNCE 训练完成${NC}"
@@ -129,7 +132,7 @@ if [ -f "$SIMMTM_BACKBONE" ]; then
     echo "日志: $COMPARISON_RUN_DIR/simmtm_test.log"
     echo ""
     
-    python train_clean_only_then_test.py --use_ground_truth --backbone_path "$SIMMTM_BACKBONE" > "$COMPARISON_RUN_DIR/simmtm_test.log" 2>&1
+    python scripts/training/train_clean_only_then_test.py --use_ground_truth --backbone_path "$SIMMTM_BACKBONE" > "$COMPARISON_RUN_DIR/simmtm_test.log" 2>&1
     
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}✓ SimMTM-only 测试完成${NC}"
@@ -154,7 +157,7 @@ if [ -f "$SIMCLR_BACKBONE" ]; then
     echo "日志: $COMPARISON_RUN_DIR/simclr_test.log"
     echo ""
     
-    python train_clean_only_then_test.py --use_ground_truth --backbone_path "$SIMCLR_BACKBONE" > "$COMPARISON_RUN_DIR/simclr_test.log" 2>&1
+    python scripts/training/train_clean_only_then_test.py --use_ground_truth --backbone_path "$SIMCLR_BACKBONE" > "$COMPARISON_RUN_DIR/simclr_test.log" 2>&1
     
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}✓ SimMTM+InfoNCE 测试完成${NC}"

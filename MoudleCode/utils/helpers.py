@@ -318,7 +318,10 @@ def save_checkpoint(model, optimizer, epoch, metrics, filepath):
 
 def load_checkpoint(filepath, model, optimizer=None):
     """Load model checkpoint"""
-    checkpoint = torch.load(filepath, map_location='cpu')
+    try:
+        checkpoint = torch.load(filepath, map_location='cpu', weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(filepath, map_location='cpu')
     
     model.load_state_dict(checkpoint['model_state_dict'])
     

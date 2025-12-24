@@ -89,7 +89,7 @@ class ProjectionHead(nn.Module):
     - 训练完后，扔掉这个MLP，只保留Mamba
     """
     
-    def __init__(self, input_dim=64, hidden_dim=128, output_dim=64):
+    def __init__(self, input_dim=32, hidden_dim=128, output_dim=32):
         super().__init__()
         
         self.mlp = nn.Sequential(
@@ -132,10 +132,11 @@ class InstanceContrastiveLearning(nn.Module):
         self.config = config
         
         # 投影头
+        feature_dim = getattr(config, 'FEATURE_DIM', getattr(config, 'OUTPUT_DIM', config.MODEL_DIM))
         self.projection_head = ProjectionHead(
-            input_dim=config.MODEL_DIM,
+            input_dim=feature_dim,
             hidden_dim=128,
-            output_dim=config.MODEL_DIM
+            output_dim=feature_dim
         )
         
         # InfoNCE损失
@@ -155,12 +156,12 @@ class InstanceContrastiveLearning(nn.Module):
             z_j: (B, d) - 第二个视图的特征（用于下游任务）
         """
         # 通过共享的Mamba编码器
-        z_i = self.backbone(x_view1, return_sequence=False)  # (B, 64)
-        z_j = self.backbone(x_view2, return_sequence=False)  # (B, 64)
+        z_i = self.backbone(x_view1, return_sequence=False)  # (B, feature_dim)
+        z_j = self.backbone(x_view2, return_sequence=False)  # (B, feature_dim)
         
         # 通过投影头（用于对比学习）
-        h_i = self.projection_head(z_i)  # (B, 64)
-        h_j = self.projection_head(z_j)  # (B, 64)
+        h_i = self.projection_head(z_i)  # (B, feature_dim)
+        h_j = self.projection_head(z_j)  # (B, feature_dim)
         
         # 计算InfoNCE损失
         loss = self.infonce_loss(h_i, h_j)

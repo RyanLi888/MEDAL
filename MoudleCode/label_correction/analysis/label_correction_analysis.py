@@ -1534,7 +1534,16 @@ def main(args):
     # Try to load pre-trained backbone
     if os.path.exists(backbone_path) and not args.retrain_backbone:
         logger.info(f"加载预训练backbone: {backbone_path}")
-        backbone.load_state_dict(torch.load(backbone_path, map_location=config.DEVICE))
+        state = torch.load(backbone_path, map_location=config.DEVICE)
+        try:
+            backbone.load_state_dict(state)
+        except RuntimeError as e:
+            logger.warning(f"⚠ 骨干网络检查点与当前结构不完全匹配，将使用 strict=False 加载: {e}")
+            missing, unexpected = backbone.load_state_dict(state, strict=False)
+            if missing:
+                logger.warning(f"  missing_keys: {missing}")
+            if unexpected:
+                logger.warning(f"  unexpected_keys: {unexpected}")
         logger.info("✓ Backbone加载完成")
     else:
         if args.retrain_backbone:

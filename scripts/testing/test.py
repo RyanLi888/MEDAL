@@ -335,13 +335,32 @@ def main(args):
     
     logger.info("正在加载骨干网络...")
     logger.info(f"  📥 输入模型: {backbone_path}")
-    backbone.load_state_dict(torch.load(backbone_path, map_location=config.DEVICE))
+    try:
+        backbone_state = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)
+    except TypeError:
+        backbone_state = torch.load(backbone_path, map_location=config.DEVICE)
+    try:
+        backbone.load_state_dict(backbone_state)
+    except RuntimeError as e:
+        logger.warning(f"⚠ 骨干网络检查点与当前结构不完全匹配，将使用 strict=False 加载: {e}")
+        missing, unexpected = backbone.load_state_dict(backbone_state, strict=False)
+        if missing:
+            logger.warning(f"  missing_keys: {missing}")
+        if unexpected:
+            logger.warning(f"  unexpected_keys: {unexpected}")
     backbone.freeze()
     logger.info(f"✓ 骨干网络加载完成")
     
     # Load classifier from classification directory
     classifier = MEDAL_Classifier(backbone, config)
-    classifier_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_final.pth")
+    classifier_path = None
+
+    if hasattr(args, 'classifier_path') and args.classifier_path:
+        classifier_path = args.classifier_path
+    else:
+        best_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_best_f1.pth")
+        final_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_final.pth")
+        classifier_path = best_path if os.path.exists(best_path) else final_path
     
     if not os.path.exists(classifier_path):
         logger.error(f"❌ 分类器检查点未找到: {classifier_path}")
@@ -350,7 +369,11 @@ def main(args):
     
     logger.info("正在加载分类器...")
     logger.info(f"  📥 输入模型: {classifier_path}")
-    classifier.load_state_dict(torch.load(classifier_path, map_location=config.DEVICE))
+    try:
+        classifier_state = torch.load(classifier_path, map_location=config.DEVICE, weights_only=True)
+    except TypeError:
+        classifier_state = torch.load(classifier_path, map_location=config.DEVICE)
+    classifier.load_state_dict(classifier_state)
     logger.info(f"✓ 分类器加载完成")
     
     # Count parameters
@@ -384,6 +407,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test MEDAL-Lite model")
+    parser.add_argument('--backbone_path', type=str, default='', help='Path to backbone checkpoint (optional)')
+    parser.add_argument('--classifier_path', type=str, default='', help='Path to classifier checkpoint (optional)')
     
     args = parser.parse_args()
     

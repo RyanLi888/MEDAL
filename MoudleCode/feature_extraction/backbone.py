@@ -48,6 +48,7 @@ class MicroBiMambaBackbone(nn.Module):
         super().__init__()
         
         self.config = config
+        self.output_dim = getattr(config, 'OUTPUT_DIM', getattr(config, 'FEATURE_DIM', config.MODEL_DIM))
         
         # Embedding layer
         self.embedding = nn.Linear(config.INPUT_FEATURE_DIM, config.MODEL_DIM)
@@ -79,10 +80,11 @@ class MicroBiMambaBackbone(nn.Module):
         ])
         
         # Projection layer to combine bidirectional features
-        self.projection = nn.Linear(config.MODEL_DIM * 2, config.MODEL_DIM)
+        # Keep internal MODEL_DIM for sequence modeling, but output compressed features for downstream.
+        self.projection = nn.Linear(config.MODEL_DIM * 2, self.output_dim)
         
         # Decoder for SimMTM (pre-training only)
-        self.decoder = nn.Linear(config.MODEL_DIM, config.INPUT_FEATURE_DIM)
+        self.decoder = nn.Linear(self.output_dim, config.INPUT_FEATURE_DIM)
         
         self.frozen = False
     
@@ -95,7 +97,7 @@ class MicroBiMambaBackbone(nn.Module):
             return_sequence: If True, return sequence features; else return pooled features
             
         Returns:
-            z: (B, 64) if return_sequence=False, else (B, L, 64)
+            z: (B, output_dim) if return_sequence=False, else (B, L, output_dim)
         """
         # Embedding
         x = self.embedding(x)  # (B, L, d_model)

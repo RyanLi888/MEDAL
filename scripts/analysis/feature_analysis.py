@@ -114,7 +114,16 @@ def main():
     else:
         backbone_path = args.backbone_path
         logger.info(f"📥 加载骨干网络: {backbone_path}")
-        backbone.load_state_dict(torch.load(backbone_path, map_location=config.DEVICE))
+        state = torch.load(backbone_path, map_location=config.DEVICE)
+        try:
+            backbone.load_state_dict(state)
+        except RuntimeError as e:
+            logger.warning(f"⚠ 骨干网络检查点与当前结构不完全匹配，将使用 strict=False 加载: {e}")
+            missing, unexpected = backbone.load_state_dict(state, strict=False)
+            if missing:
+                logger.warning(f"  missing_keys: {missing}")
+            if unexpected:
+                logger.warning(f"  unexpected_keys: {unexpected}")
         logger.info("✓ 骨干网络加载完成")
         logger.info("")
     

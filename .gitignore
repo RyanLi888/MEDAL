@@ -12,7 +12,7 @@ __pycache__/
 
 # 输出和日志文件
 output/
-*.log
+.log
 *.out
 
 # 虚拟环境
@@ -41,6 +41,12 @@ ENV/
 *.pb
 models/
 checkpoints/
+
+# 放行 clean_only_runs 的输出（否则会被上面的 models/ 规则误伤）
+!output/label_correction/analysis/clean_only_runs/**/result/models/
+!output/label_correction/analysis/clean_only_runs/**/result/models/**
+!output/label_correction/analysis/clean_only_runs/**/classification/models/
+!output/label_correction/analysis/clean_only_runs/**/classification/models/**
 
 # 临时文件
 *.tmp

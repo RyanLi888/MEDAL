@@ -116,9 +116,9 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
             weight_decay=config.PRETRAIN_WEIGHT_DECAY
         )
     
-    # Scheduler
+    pretrain_min_lr = float(getattr(config, 'PRETRAIN_MIN_LR', 1e-5))
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.PRETRAIN_EPOCHS
+        optimizer, T_max=config.PRETRAIN_EPOCHS, eta_min=pretrain_min_lr
     )
     logger.info(f"✓ 优化器和学习率调度器初始化完成")
     logger.info("")
@@ -131,6 +131,16 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
     else:
         history = {'loss': [], 'simmtm': []}
     
+    use_early_stopping = bool(getattr(config, 'PRETRAIN_EARLY_STOPPING', True))
+    es_warmup_epochs = int(getattr(config, 'PRETRAIN_ES_WARMUP_EPOCHS', 50))
+    es_patience = int(getattr(config, 'PRETRAIN_ES_PATIENCE', 20))
+    es_min_delta = float(getattr(config, 'PRETRAIN_ES_MIN_DELTA', 0.01))
+
+    best_loss = float('inf')
+    best_epoch = -1
+    best_state = None
+    no_improve = 0
+
     for epoch in range(config.PRETRAIN_EPOCHS):
         epoch_loss = 0.0
         epoch_simmtm = 0.0
@@ -199,11 +209,34 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
                        f"Loss: {epoch_loss:.4f} | "
                        f"SimMTM: {epoch_simmtm:.4f} | "
                        f"LR: {scheduler.get_last_lr()[0]:.6f}")
+
+        improved = (best_loss - epoch_loss) > es_min_delta
+        if improved:
+            best_loss = float(epoch_loss)
+            best_epoch = int(epoch + 1)
+            best_state = {k: v.detach().cpu().clone() for k, v in backbone.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if use_early_stopping and (epoch + 1) >= es_warmup_epochs and no_improve >= es_patience:
+            logger.info(
+                f"[Stage 1] EarlyStopping triggered at epoch {epoch+1}: "
+                f"best_loss={best_loss:.4f} (epoch {best_epoch}), "
+                f"no_improve={no_improve}, min_delta={es_min_delta}"
+            )
+            break
+
+    if best_state is not None:
+        backbone.load_state_dict(best_state)
+        backbone.to(config.DEVICE)
     
     logger.info("-"*70)
     logger.info("✓ Stage 1 完成: 骨干网络预训练完成")
     logger.info(f"  最终损失: {history['loss'][-1]:.4f}")
-    logger.info(f"  训练了 {config.PRETRAIN_EPOCHS} 个epoch")
+    if best_epoch > 0:
+        logger.info(f"  最佳损失: {best_loss:.4f} (epoch {best_epoch})")
+    logger.info(f"  训练了 {len(history['loss'])} 个epoch")
     logger.info("")
     
     # 生成backbone文件名：backbone_{method}_{n_samples}.pth
@@ -934,6 +967,10 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     logger.info("📥 输入数据路径:")
     augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_data.npz")
     logger.info(f"  ✓ 增强数据: {augmented_data_path}")
+
+    if getattr(config, 'FINETUNE_BACKBONE', False):
+        logger.warning("⚠️  Stage 3 已强制冻结骨干网络：忽略 config.FINETUNE_BACKBONE=True")
+        setattr(config, 'FINETUNE_BACKBONE', False)
     
     # 使用传入的backbone_path参数，如果没有则使用默认路径
     if backbone_path is None:
@@ -951,44 +988,22 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     criterion = DualStreamLoss(config)
     logger.info("✓ 损失函数初始化完成")
     
-    # Optional backbone fine-tuning
-    finetune_backbone = bool(getattr(config, 'FINETUNE_BACKBONE', False))
-    finetune_scope = str(getattr(config, 'FINETUNE_BACKBONE_SCOPE', 'projection')).strip().lower()
-    backbone_lr = float(getattr(config, 'FINETUNE_BACKBONE_LR', config.FINETUNE_LR))
-
-    if finetune_backbone:
-        backbone.unfreeze()
-        if finetune_scope == 'projection':
-            # Train only the bidirectional projection head; freeze others
-            for name, param in backbone.named_parameters():
-                param.requires_grad = name.startswith('projection')
-        elif finetune_scope == 'all':
-            pass
-        else:
-            logger.warning(f"Unknown FINETUNE_BACKBONE_SCOPE={finetune_scope!r}, fallback to 'projection'")
-            for name, param in backbone.named_parameters():
-                param.requires_grad = name.startswith('projection')
+    backbone.freeze()
+    backbone.eval()
+    optimizer = optim.AdamW(
+        classifier.dual_mlp.parameters(),
+        lr=config.FINETUNE_LR,
+        weight_decay=config.PRETRAIN_WEIGHT_DECAY
+    )
+    logger.info("✓ 优化器初始化完成 (仅优化分类器参数，骨干网络已冻结)")
 
     backbone_trainable = [p for p in backbone.parameters() if p.requires_grad]
-    if finetune_backbone and len(backbone_trainable) > 0:
-        optimizer = optim.AdamW(
-            [
-                {'params': classifier.dual_mlp.parameters(), 'lr': config.FINETUNE_LR},
-                {'params': backbone_trainable, 'lr': backbone_lr},
-            ],
-            weight_decay=config.PRETRAIN_WEIGHT_DECAY
-        )
-        logger.info(
-            "✓ 优化器初始化完成 (分类器+骨干微调) | "
-            f"scope={finetune_scope} | lr_head={config.FINETUNE_LR} lr_backbone={backbone_lr}"
-        )
-    else:
-        optimizer = optim.AdamW(
-            classifier.dual_mlp.parameters(),
-            lr=config.FINETUNE_LR,
-            weight_decay=config.PRETRAIN_WEIGHT_DECAY
-        )
-        logger.info("✓ 优化器初始化完成 (仅优化分类器参数，骨干网络已冻结)")
+    if len(backbone_trainable) != 0:
+        raise RuntimeError(f"Stage 3 backbone must be frozen, but found {len(backbone_trainable)} trainable params")
+    opt_param_ids = {id(p) for group in optimizer.param_groups for p in group['params']}
+    backbone_param_ids = {id(p) for p in backbone.parameters()}
+    if len(opt_param_ids.intersection(backbone_param_ids)) != 0:
+        raise RuntimeError("Stage 3 optimizer unexpectedly contains backbone parameters")
     
     logger.info("")
     logger.info("💡 训练流程说明:")
@@ -996,15 +1011,36 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     logger.info("  骨干网络实时提取特征，但参数不更新")
     logger.info("")
     logger.info("="*70)
-    logger.info("📊 全量训练（不划分验证集）")
+    val_split = float(getattr(config, 'FINETUNE_VAL_SPLIT', 0.2))
+    if val_split > 0:
+        logger.info(f"📊 训练/验证划分 (val_split={val_split:.2f})")
+    else:
+        logger.info("📊 全量训练（不划分验证集）")
     logger.info("="*70)
-    logger.info(f"  训练集: {len(X_train)} 个样本 (包含原始 + 合成)")
+    logger.info(f"  样本总数: {len(X_train)} 个样本 (包含原始 + 合成)")
     logger.info("")
-    
-    # 直接使用传入的训练集和验证集
-    X_train_split = X_train
-    y_train_split = y_train
-    sample_weights_split = sample_weights
+
+    X_val_split = None
+    y_val_split = None
+    sample_weights_val_split = None
+
+    if val_split > 0:
+        from sklearn.model_selection import train_test_split
+        X_train_split, X_val_split, y_train_split, y_val_split, sample_weights_split, sample_weights_val_split = train_test_split(
+            X_train,
+            y_train,
+            sample_weights,
+            test_size=val_split,
+            random_state=int(getattr(config, 'SEED', 42)),
+            stratify=y_train
+        )
+        logger.info(f"  训练集: {len(X_train_split)}")
+        logger.info(f"  验证集: {len(X_val_split)}")
+        logger.info("")
+    else:
+        X_train_split = X_train
+        y_train_split = y_train
+        sample_weights_split = sample_weights
     
     # ==================== 温室训练策略：强制1:1平衡采样 ====================
     use_balanced_sampling = getattr(config, 'USE_BALANCED_SAMPLING', True)
@@ -1064,10 +1100,16 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     history = {
         'train_loss': [], 'supervision': [], 'soft_f1_loss': [], 'orthogonality': [],
         'consistency': [], 'margin': [], 'lambda_orth': [],
-        'lambda_con': [], 'lambda_margin': [], 'train_f1': []
+        'lambda_con': [], 'lambda_margin': [], 'train_f1': [], 'val_f1': [], 'val_threshold': [],
+        'train_f1_star': [], 'train_threshold_star': []
     }
     
     classifier.train()
+
+    best_f1 = -1.0
+    best_epoch = -1
+    best_state = None
+    best_threshold = float(getattr(config, 'MALICIOUS_THRESHOLD', 0.5))
     
     for epoch in range(config.FINETUNE_EPOCHS):
         epoch_loss = 0.0
@@ -1088,7 +1130,8 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             optimizer.zero_grad()
             
             # Extract features
-            z = backbone(X_batch, return_sequence=False)
+            with torch.no_grad():
+                z = backbone(X_batch, return_sequence=False)
             
             # Compute loss (weight-aware)
             loss, loss_dict = criterion(classifier.dual_mlp, z, y_batch, w_batch, epoch, config.FINETUNE_EPOCHS)
@@ -1117,12 +1160,67 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         for key in epoch_losses:
             epoch_losses[key] /= n_batches
         
-        # 计算训练集 Binary F1-Score
+        # 计算训练集 Binary F1-Score (固定阈值0.5，仅用于参考)
         train_probs = np.concatenate(all_train_probs)
         train_labels = np.concatenate(all_train_labels)
         train_preds = (train_probs[:, 1] >= 0.5).astype(int)
         from sklearn.metrics import f1_score
         train_f1 = f1_score(train_labels, train_preds, pos_label=1, zero_division=0)
+
+        # 训练集单类F1*(pos=1) & 最优阈值（用于无验证集时选择 best checkpoint）
+        train_f1_star = None
+        train_threshold_star = None
+        if X_val_split is None:
+            from MoudleCode.utils.helpers import find_optimal_threshold
+            train_threshold_star, _train_metric, _ = find_optimal_threshold(train_labels, train_probs, metric='f1_binary', positive_class=1)
+            train_preds_star = (train_probs[:, 1] >= float(train_threshold_star)).astype(int)
+            train_f1_star = f1_score(train_labels, train_preds_star, pos_label=1, zero_division=0)
+
+        val_f1 = None
+        val_threshold = None
+
+        if X_val_split is not None:
+            classifier.eval()
+            all_val_probs = []
+            all_val_labels = []
+            with torch.no_grad():
+                val_dataset = TensorDataset(
+                    torch.FloatTensor(X_val_split),
+                    torch.LongTensor(y_val_split),
+                    torch.FloatTensor(sample_weights_val_split)
+                )
+                val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+                for X_batch, y_batch, _w_batch in val_loader:
+                    X_batch = X_batch.to(config.DEVICE)
+                    y_batch = y_batch.to(config.DEVICE)
+                    z = backbone(X_batch, return_sequence=False)
+                    logits_a, logits_b = classifier.dual_mlp(z, return_separate=True)
+                    logits_avg = (logits_a + logits_b) / 2.0
+                    probs = torch.softmax(logits_avg, dim=1)
+                    all_val_probs.append(probs.cpu().numpy())
+                    all_val_labels.append(y_batch.cpu().numpy())
+
+            val_probs = np.concatenate(all_val_probs)
+            val_labels = np.concatenate(all_val_labels)
+
+            from MoudleCode.utils.helpers import find_optimal_threshold
+            val_threshold, val_metric, _ = find_optimal_threshold(val_labels, val_probs, metric='f1_binary', positive_class=1)
+            val_preds = (val_probs[:, 1] >= float(val_threshold)).astype(int)
+            val_f1 = f1_score(val_labels, val_preds, pos_label=1, zero_division=0)
+
+            if val_f1 > best_f1:
+                best_f1 = float(val_f1)
+                best_epoch = int(epoch + 1)
+                best_threshold = float(val_threshold)
+                best_state = {k: v.detach().cpu().clone() for k, v in classifier.state_dict().items()}
+        else:
+            if train_f1_star is None:
+                raise RuntimeError("Expected train_f1_star to be computed when val_split is disabled")
+            if train_f1_star > best_f1:
+                best_f1 = float(train_f1_star)
+                best_epoch = int(epoch + 1)
+                best_threshold = float(train_threshold_star)
+                best_state = {k: v.detach().cpu().clone() for k, v in classifier.state_dict().items()}
         
         classifier.eval()
         classifier.train()
@@ -1138,19 +1236,40 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         history['lambda_con'].append(loss_dict['lambda_con'])
         history['lambda_margin'].append(loss_dict.get('lambda_margin', 0.0))
         history['train_f1'].append(train_f1)
+        history['val_f1'].append(val_f1 if val_f1 is not None else np.nan)
+        history['val_threshold'].append(val_threshold if val_threshold is not None else np.nan)
+        history['train_f1_star'].append(train_f1_star if train_f1_star is not None else np.nan)
+        history['train_threshold_star'].append(train_threshold_star if train_threshold_star is not None else np.nan)
         
         # 每个epoch都输出详细日志
         progress = (epoch + 1) / config.FINETUNE_EPOCHS * 100
         soft_f1_str = f" | F1Loss: {epoch_losses['soft_f1']:.4f}" if epoch_losses['soft_f1'] > 0 else ""
-        logger.info(f"[Stage 3] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
-                  f"TrLoss: {epoch_loss:.4f} | "
-                  f"TrF1: {train_f1:.4f} | "
-                  f"Sup: {epoch_losses['supervision']:.4f}{soft_f1_str}")
+        if val_f1 is not None:
+            logger.info(f"[Stage 3] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
+                      f"TrLoss: {epoch_loss:.4f} | "
+                      f"TrF1@0.5: {train_f1:.4f} | "
+                      f"ValF1*: {val_f1:.4f} | "
+                      f"ValTh*: {float(val_threshold):.4f} | "
+                      f"Sup: {epoch_losses['supervision']:.4f}{soft_f1_str}")
+        else:
+            train_f1_star_disp = float(train_f1_star) if train_f1_star is not None else float('nan')
+            train_th_star_disp = float(train_threshold_star) if train_threshold_star is not None else float('nan')
+            logger.info(f"[Stage 3] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
+                      f"TrLoss: {epoch_loss:.4f} | "
+                      f"TrF1@0.5: {train_f1:.4f} | "
+                      f"TrF1*: {train_f1_star_disp:.4f} | "
+                      f"TrTh*: {train_th_star_disp:.4f} | "
+                      f"Sup: {epoch_losses['supervision']:.4f}{soft_f1_str}")
     
     logger.info("-"*70)
     logger.info("✓ Stage 3 完成: 分类器微调完成")
     logger.info(f"  训练集 - 最终损失: {history['train_loss'][-1]:.4f}, 最终F1: {history['train_f1'][-1]:.4f}")
     logger.info(f"  训练了 {config.FINETUNE_EPOCHS} 个epoch")
+    if best_epoch > 0:
+        if X_val_split is not None:
+            logger.info(f"  最佳ValF1*(pos=1, auto-threshold): {best_f1:.4f} (epoch {best_epoch}, th={best_threshold:.4f})")
+        else:
+            logger.info(f"  最佳TrF1*(pos=1, auto-threshold): {best_f1:.4f} (epoch {best_epoch}, th={best_threshold:.4f})")
     logger.info("")
     
     # 生成特征分布可视化（Stage 3分类器训练后）
@@ -1175,9 +1294,19 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     logger.info(f"  ✓ 特征分布图 (t-SNE): {feature_dist_path}")
     logger.info("")
     
-    optimal_threshold = config.MALICIOUS_THRESHOLD
+    optimal_threshold = float(best_threshold)
     
     logger.info("📁 输出文件路径:")
+
+    # Save best model by validation F1(pos=1) if validation is enabled
+    if best_state is not None:
+        best_classifier_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_best_f1.pth")
+        torch.save(best_state, best_classifier_path)
+        if X_val_split is not None:
+            logger.info(f"  ✓ 最佳模型(ValF1*, pos=1): {best_classifier_path}")
+        else:
+            logger.info(f"  ✓ 最佳模型(F1): {best_classifier_path}")
+
     # Save final model
     classifier_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_final.pth")
     torch.save(classifier.state_dict(), classifier_path)
@@ -1359,7 +1488,19 @@ def main(args):
                 logger.info(f"  ✓ 骨干网络模型: {backbone_path}")
                 logger.info("")
                 logger.info(f"✓ 加载已有骨干网络: {backbone_path}")
-                backbone.load_state_dict(torch.load(backbone_path, map_location=config.DEVICE))
+                try:
+                    backbone_state = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)
+                except TypeError:
+                    backbone_state = torch.load(backbone_path, map_location=config.DEVICE)
+                try:
+                    backbone.load_state_dict(backbone_state)
+                except RuntimeError as e:
+                    logger.warning(f"⚠ 骨干网络检查点与当前结构不完全匹配，将使用 strict=False 加载: {e}")
+                    missing, unexpected = backbone.load_state_dict(backbone_state, strict=False)
+                    if missing:
+                        logger.warning(f"  missing_keys: {missing}")
+                    if unexpected:
+                        logger.warning(f"  unexpected_keys: {unexpected}")
                 backbone.freeze()
             else:
                 logger.error(f"❌ 找不到预训练骨干网络: {backbone_path}")

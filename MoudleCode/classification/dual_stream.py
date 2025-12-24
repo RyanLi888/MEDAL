@@ -22,26 +22,25 @@ class DualStreamMLP(nn.Module):
         super().__init__()
         
         self.config = config
+        feature_dim = getattr(config, 'FEATURE_DIM', getattr(config, 'OUTPUT_DIM', config.MODEL_DIM))
         
         # 关键改进：对比学习特征需要BN层来拉伸幅度
-        self.bn_input = nn.BatchNorm1d(config.MODEL_DIM)
-        
-        # MLP A - 增强版（添加BN）
+        self.bn_input = nn.BatchNorm1d(feature_dim)
+
         self.mlp_a = nn.Sequential(
-            nn.Linear(config.MODEL_DIM, config.CLASSIFIER_HIDDEN_DIM),
-            nn.BatchNorm1d(config.CLASSIFIER_HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Dropout(0.3),  # 从0.1增加到0.3，增强正则化
-            nn.Linear(config.CLASSIFIER_HIDDEN_DIM, config.CLASSIFIER_OUTPUT_DIM)
+            nn.Linear(feature_dim, 32),
+            nn.Tanh(),
+            nn.Linear(32, 16),
+            nn.Tanh(),
+            nn.Linear(16, config.CLASSIFIER_OUTPUT_DIM)
         )
-        
-        # MLP B - 增强版（添加BN）
+
         self.mlp_b = nn.Sequential(
-            nn.Linear(config.MODEL_DIM, config.CLASSIFIER_HIDDEN_DIM),
-            nn.BatchNorm1d(config.CLASSIFIER_HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Dropout(0.3),  # 从0.1增加到0.3，增强正则化
-            nn.Linear(config.CLASSIFIER_HIDDEN_DIM, config.CLASSIFIER_OUTPUT_DIM)
+            nn.Linear(feature_dim, 32),
+            nn.Tanh(),
+            nn.Linear(32, 16),
+            nn.Tanh(),
+            nn.Linear(16, config.CLASSIFIER_OUTPUT_DIM)
         )
         
         # Initialize with different random seeds
@@ -173,6 +172,9 @@ class DualStreamLoss(nn.Module):
         
         # Label Smoothing
         self.label_smoothing = getattr(config, 'LABEL_SMOOTHING', 0.1)
+
+        self.consistency_temperature = float(getattr(config, 'CONSISTENCY_TEMPERATURE', 2.0))
+        self.consistency_warmup_epochs = int(getattr(config, 'CONSISTENCY_WARMUP_EPOCHS', 0))
     
     def soft_orthogonality_loss(self, w_a, w_b):
         """
@@ -208,11 +210,31 @@ class DualStreamLoss(nn.Module):
         Returns:
             loss: scalar
         """
-        probs_a = F.softmax(logits_a, dim=1)
-        probs_b = F.softmax(logits_b, dim=1)
-        
-        loss = F.mse_loss(probs_a, probs_b)
-        
+        t = self.consistency_temperature
+        if t <= 0:
+            t = 1.0
+
+        log_p_a = F.log_softmax(logits_a / t, dim=1)
+        log_p_b = F.log_softmax(logits_b / t, dim=1)
+        p_a = torch.exp(log_p_a)
+        p_b = torch.exp(log_p_b)
+
+        kl_ab = F.kl_div(log_p_a, p_b, reduction='batchmean')
+        kl_ba = F.kl_div(log_p_b, p_a, reduction='batchmean')
+        loss = 0.5 * (kl_ab + kl_ba) * (t * t)
+
+        return loss
+
+    def _label_smoothing_ce(self, logits, labels):
+        num_classes = logits.size(1)
+        log_probs = F.log_softmax(logits, dim=1)
+
+        with torch.no_grad():
+            smooth_labels = torch.zeros_like(log_probs)
+            smooth_labels.fill_(self.label_smoothing / (num_classes - 1))
+            smooth_labels.scatter_(1, labels.unsqueeze(1), 1.0 - self.label_smoothing)
+
+        loss = -(smooth_labels * log_probs).sum(dim=1)
         return loss
     
     def focal_loss(self, logits, labels):
@@ -360,73 +382,25 @@ class DualStreamLoss(nn.Module):
             total_loss: scalar
             loss_dict: dict of individual losses
         """
-        # Forward pass
         logits_a, logits_b = model(z, return_separate=True)
-        
-        # 是否使用 Soft F1 Loss（从 config 读取，默认启用）
-        use_soft_f1 = getattr(self.config, 'USE_SOFT_F1_LOSS', True)
-        soft_f1_weight = getattr(self.config, 'SOFT_F1_WEIGHT', 0.5)
-        
-        # Weighted supervision (no small-loss selection)
-        # 使用 Focal Loss 强调困难样本；若关闭则退回标准 CE
-        use_focal = getattr(self.config, 'USE_FOCAL_LOSS', True)
-        if use_focal:
-            loss_a_per_sample = self.focal_loss(logits_a, labels)
-            loss_b_per_sample = self.focal_loss(logits_b, labels)
-        else:
-            loss_a_per_sample = self.ce_loss(logits_a, labels)
-            loss_b_per_sample = self.ce_loss(logits_b, labels)
 
-        use_co_teaching = getattr(self.config, 'USE_CO_TEACHING', False)
-        co_teaching_warmup = int(getattr(self.config, 'CO_TEACHING_WARMUP_EPOCHS', 0))
-        co_teaching_select_rate = float(getattr(self.config, 'CO_TEACHING_SELECT_RATE', 0.7))
-        co_teaching_min_w = float(getattr(self.config, 'CO_TEACHING_MIN_SAMPLE_WEIGHT', 0.0))
+        loss_a_per_sample = self._label_smoothing_ce(logits_a, labels)
+        loss_b_per_sample = self._label_smoothing_ce(logits_b, labels)
 
+        sup_loss_a = (loss_a_per_sample * sample_weights).mean()
+        sup_loss_b = (loss_b_per_sample * sample_weights).mean()
+        loss_sup = 0.5 * (sup_loss_a + sup_loss_b)
+        loss_sup_base = loss_sup
+        loss_f1 = torch.tensor(0.0, device=z.device)
+        use_soft_f1 = False
+        soft_f1_weight = 0.0
+        use_co_teaching = False
+        co_teaching_warmup = 0
+        co_teaching_select_rate = 0.0
+        co_teaching_min_w = 0.0
         selected_for_a = None
         selected_for_b = None
 
-        if use_co_teaching and epoch >= co_teaching_warmup:
-            eligible = sample_weights >= co_teaching_min_w
-            if torch.any(eligible):
-                eligible_idx = torch.nonzero(eligible, as_tuple=False).squeeze(1)
-                eligible_count = int(eligible_idx.numel())
-                n_select = max(1, int(eligible_count * co_teaching_select_rate))
-
-                loss_a_eligible = loss_a_per_sample[eligible_idx]
-                loss_b_eligible = loss_b_per_sample[eligible_idx]
-
-                _, idx_a = torch.topk(loss_a_eligible, n_select, largest=False)
-                _, idx_b = torch.topk(loss_b_eligible, n_select, largest=False)
-
-                selected_for_b = eligible_idx[idx_a]
-                selected_for_a = eligible_idx[idx_b]
-
-                sup_loss_a = (loss_a_per_sample[selected_for_a] * sample_weights[selected_for_a]).mean()
-                sup_loss_b = (loss_b_per_sample[selected_for_b] * sample_weights[selected_for_b]).mean()
-            else:
-                sup_loss_a = (loss_a_per_sample * sample_weights).mean()
-                sup_loss_b = (loss_b_per_sample * sample_weights).mean()
-        else:
-            sup_loss_a = (loss_a_per_sample * sample_weights).mean()
-            sup_loss_b = (loss_b_per_sample * sample_weights).mean()
-        loss_sup_base = (sup_loss_a + sup_loss_b) / 2.0
-        
-        # Soft F1 Loss（直接优化 F1-Score）
-        if use_soft_f1:
-            if selected_for_a is not None and selected_for_b is not None:
-                f1_loss_a = self.soft_f1_loss(logits_a[selected_for_a], labels[selected_for_a])
-                f1_loss_b = self.soft_f1_loss(logits_b[selected_for_b], labels[selected_for_b])
-            else:
-                f1_loss_a = self.soft_f1_loss(logits_a, labels)
-                f1_loss_b = self.soft_f1_loss(logits_b, labels)
-            loss_f1 = (f1_loss_a + f1_loss_b) / 2.0
-            
-            # 混合损失：基础损失 + Soft F1 Loss
-            loss_sup = (1 - soft_f1_weight) * loss_sup_base + soft_f1_weight * loss_f1
-        else:
-            loss_sup = loss_sup_base
-            loss_f1 = torch.tensor(0.0, device=z.device)
-        
         # Soft-orthogonality loss
         w_a, w_b = model.get_first_layer_weights()
         loss_orth = self.soft_orthogonality_loss(w_a, w_b)
@@ -446,6 +420,10 @@ class DualStreamLoss(nn.Module):
             self.config.CONSISTENCY_WEIGHT_START,
             self.config.CONSISTENCY_WEIGHT_END
         )
+
+        if self.consistency_warmup_epochs > 0:
+            warmup_scale = min(1.0, float(epoch + 1) / float(self.consistency_warmup_epochs))
+            lambda_con = lambda_con * warmup_scale
         
         # Total loss
         total_loss = loss_sup + lambda_orth * loss_orth + lambda_con * loss_con

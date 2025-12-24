@@ -49,6 +49,8 @@ class Config:
     SEQUENCE_LENGTH = 1024  # L: Maximum number of packets per flow
     INPUT_FEATURE_DIM = 5   # [Length, Log-IAT, Direction, Flags, Window]
     MODEL_DIM = 64          # d_model: Embedding dimension
+    OUTPUT_DIM = 32         # backbone最终输出维度（下游分类/对比学习使用）
+    FEATURE_DIM = OUTPUT_DIM
     EMBEDDING_DROPOUT = 0.1
     POSITIONAL_ENCODING = "sinusoidal"  # 正弦位置编码
     
@@ -66,6 +68,12 @@ class Config:
     PRETRAIN_BATCH_SIZE = 64
     PRETRAIN_LR = 1e-3
     PRETRAIN_WEIGHT_DECAY = 1e-4
+
+    PRETRAIN_MIN_LR = 1e-5
+    PRETRAIN_EARLY_STOPPING = True
+    PRETRAIN_ES_WARMUP_EPOCHS = 50
+    PRETRAIN_ES_PATIENCE = 20
+    PRETRAIN_ES_MIN_DELTA = 0.01
     
     # SimMTM parameters
     SIMMTM_MASK_RATE = 0.5  # 50% masking
@@ -157,6 +165,11 @@ class Config:
     FINETUNE_BATCH_SIZE = 64
     FINETUNE_LR = 1e-4
 
+    # Stage 3: Validation split for selecting best checkpoint (by val F1 pos=1 with auto-threshold)
+    FINETUNE_VAL_SPLIT = 0.0
+
+    MALICIOUS_THRESHOLD = 0.5
+
     # Stage 3: Optional backbone fine-tuning
     # Default keeps the original design (frozen backbone) for stability.
     FINETUNE_BACKBONE = False
@@ -166,6 +179,10 @@ class Config:
     FINETUNE_BACKBONE_SCOPE = 'projection'
     # Use a smaller LR for backbone to avoid catastrophic forgetting
     FINETUNE_BACKBONE_LR = 1e-5
+
+    LABEL_SMOOTHING = 0.1
+    CONSISTENCY_TEMPERATURE = 2.0
+    CONSISTENCY_WARMUP_EPOCHS = 5
     
     # Dynamic loss weights (Linear schedule)
     # 降低正交约束权重，避免过度分离

@@ -200,7 +200,19 @@ def main():
         
         if os.path.exists(backbone_path) and not args.retrain_backbone:
             logger.info(f'  - 状态: ✓ 加载预训练模型')
-            backbone.load_state_dict(torch.load(backbone_path, map_location=config.DEVICE))
+            try:
+                state_dict = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)
+            except TypeError:
+                state_dict = torch.load(backbone_path, map_location=config.DEVICE)
+            try:
+                backbone.load_state_dict(state_dict)
+            except RuntimeError as e:
+                logger.warning(f"⚠ 骨干网络检查点与当前结构不完全匹配，将使用 strict=False 加载: {e}")
+                missing, unexpected = backbone.load_state_dict(state_dict, strict=False)
+                if missing:
+                    logger.warning(f"  missing_keys: {missing}")
+                if unexpected:
+                    logger.warning(f"  unexpected_keys: {unexpected}")
             backbone.freeze()
         else:
             if args.retrain_backbone:
@@ -253,9 +265,9 @@ def main():
         logger.info(f'  - 骨干网络: {backbone_path}')
         logger.info(f'  - 分类器: {classifier_best}')
         logger.info('')
-
+        
         # 创建测试参数，传递骨干网络路径
-        test_args = argparse.Namespace(backbone_path=backbone_path)
+        test_args = argparse.Namespace(backbone_path=backbone_path, classifier_path=classifier_best)
         test_main(test_args)
 
         result_models_dir = os.path.join(config.RESULT_DIR, 'models')

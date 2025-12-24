@@ -70,9 +70,30 @@ class Config:
     # SimMTM parameters
     SIMMTM_MASK_RATE = 0.5  # 50% masking
     
-    # SupCon parameters
+    # SupCon parameters (Legacy - 保留兼容性)
     SUPCON_TEMPERATURE = 0.1
     SUPCON_LAMBDA = 1.0  # Weight for SupCon loss
+    
+    # ==================== Instance Contrastive Learning (New) ====================
+    # 是否启用实例对比学习（替代原有的SupCon）
+    USE_INSTANCE_CONTRASTIVE = True
+    
+    # InfoNCE参数
+    # 修复说明：降低权重和增大温度，避免对比学习过度主导训练
+    # 原因：InfoNCE权重过高(1.0)导致特征过度分散，类内聚合不足，F1下降8.5%
+    INFONCE_TEMPERATURE = 0.3  # 温度系数τ（从0.1增到0.3，放宽相似度要求）
+    INFONCE_LAMBDA = 0.3  # InfoNCE损失权重（从1.0降到0.3，让SimMTM主导）
+    
+    # 流量增强参数
+    # 修复说明：降低增强强度，避免破坏关键特征
+    # 原因：过强的增强(80%裁剪)可能破坏恶意样本特征，导致Recall下降12.1%
+    TRAFFIC_AUG_CROP_PROB = 0.5  # 时序裁剪概率（从0.8降到0.5）
+    TRAFFIC_AUG_JITTER_PROB = 0.4  # 时序抖动概率（从0.6降到0.4）
+    TRAFFIC_AUG_MASK_PROB = 0.3  # 通道掩码概率（从0.5降到0.3）
+    TRAFFIC_AUG_CROP_MIN_RATIO = 0.5  # 最小裁剪比例
+    TRAFFIC_AUG_CROP_MAX_RATIO = 0.9  # 最大裁剪比例
+    TRAFFIC_AUG_JITTER_STD = 0.1  # 抖动标准差
+    TRAFFIC_AUG_MASK_RATIO = 0.15  # 掩码比例
     
     # ==================== Label Correction (Stage 2) ====================
     # CL (Confident Learning)
@@ -92,12 +113,13 @@ class Config:
     DDPM_HIDDEN_DIMS = [128, 256, 128]
     DDPM_SAMPLING_STEPS = 50  # DDIM sampling
     
-    # Differential Guidance
-    # Balanced guidance to generate realistic samples with good diversity
-    # High guidance (2.5) generates overly "typical" samples that are far from decision boundary
-    # Low guidance (<1.0) may generate samples too close to noise
-    GUIDANCE_MALICIOUS = 1.5  # Moderate guidance (balanced: good diversity + quality)
-    GUIDANCE_BENIGN = 1.2     # Slightly higher guidance to ensure quality
+    # Differential Guidance (Classifier-Free Guidance)
+    # 引导强度设置原则：
+    # - 良性流量：特征简单，无需强化 → w=1.0
+    # - 恶意流量：特征多样，适度强化 → w=1.2
+    # 过高的引导强度（如1.5+）会牺牲多样性和真实性
+    GUIDANCE_BENIGN = 1.0        # 良性流量：无引导（保持自然分布）
+    GUIDANCE_MALICIOUS = 1.2     # 恶意流量：适度强化（平衡质量与多样性）
     
     # Augmentation ratio
     # ⚠️ 问题：过多的合成数据导致分布偏移，Benign 被推向 Malicious 区域

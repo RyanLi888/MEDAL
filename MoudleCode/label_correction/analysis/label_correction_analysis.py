@@ -1512,15 +1512,23 @@ def main(args):
     
     backbone = MicroBiMambaBackbone(config)
     
+    # 确定backbone路径：优先使用命令行参数，否则使用默认路径
+    if args.backbone_path:
+        backbone_path = args.backbone_path
+    else:
+        backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    
     # Try to load pre-trained backbone
-    backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
     if os.path.exists(backbone_path) and not args.retrain_backbone:
         logger.info(f"加载预训练backbone: {backbone_path}")
         backbone.load_state_dict(torch.load(backbone_path, map_location=config.DEVICE))
         logger.info("✓ Backbone加载完成")
     else:
-        logger.warning("⚠ 未找到预训练backbone或指定了--retrain_backbone")
-        logger.warning("  将使用随机初始化的backbone")
+        if args.retrain_backbone:
+            logger.warning("⚠ 指定了--retrain_backbone，将使用随机初始化的backbone")
+        else:
+            logger.warning(f"⚠ 未找到预训练backbone: {backbone_path}")
+            logger.warning("  将使用随机初始化的backbone")
     
     features = extract_features_with_backbone(backbone, X_train, config, logger)
     
@@ -1637,6 +1645,12 @@ if __name__ == "__main__":
         "--retrain_backbone",
         action='store_true',
         help="Use randomly initialized backbone instead of pre-trained"
+    )
+    parser.add_argument(
+        "--backbone_path",
+        type=str,
+        default='',
+        help="Path to backbone model (optional, default: backbone_pretrained.pth)"
     )
     
     args = parser.parse_args()

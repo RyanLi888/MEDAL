@@ -29,6 +29,10 @@ from MoudleCode.preprocessing.pcap_parser import load_dataset
 from MoudleCode.feature_extraction.backbone import (
     MicroBiMambaBackbone, SimMTMLoss
 )
+from MoudleCode.feature_extraction.traffic_augmentation import DualViewAugmentation
+from MoudleCode.feature_extraction.instance_contrastive import (
+    InstanceContrastiveLearning, HybridPretrainingLoss
+)
 
 # 导入预处理模块
 try:
@@ -57,13 +61,21 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
         backbone: pre-trained backbone
     """
     logger.info("="*70)
-    logger.info("STAGE 1: Pre-training Backbone (SimMTM only)")
+    logger.info("STAGE 1: Pre-training Backbone")
     logger.info("="*70)
     logger.info(f"目标: 训练Micro-Bi-Mamba骨干网络，学习流量特征表示")
     logger.info(f"训练轮数: {config.PRETRAIN_EPOCHS} epochs")
     logger.info(f"批次大小: {config.PRETRAIN_BATCH_SIZE}")
     logger.info(f"学习率: {config.PRETRAIN_LR}")
-    logger.info(f"优化目标: SimMTM (掩码重构)")
+    
+    # 检查是否启用实例对比学习
+    use_instance_contrastive = getattr(config, 'USE_INSTANCE_CONTRASTIVE', False)
+    if use_instance_contrastive:
+        logger.info(f"优化目标: SimMTM + InfoNCE (实例对比学习)")
+        logger.info(f"  - InfoNCE温度: {config.INFONCE_TEMPERATURE}")
+        logger.info(f"  - InfoNCE权重: {config.INFONCE_LAMBDA}")
+    else:
+        logger.info(f"优化目标: SimMTM (掩码重构)")
     logger.info("")
     logger.info("📥 输入数据路径:")
     logger.info(f"  ✓ 训练数据: {config.BENIGN_TRAIN} (正常), {config.MALICIOUS_TRAIN} (恶意)")
@@ -72,16 +84,35 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
     backbone.train()
     backbone.to(config.DEVICE)
     
-    # Loss function
-    simmtm_loss_fn = SimMTMLoss(mask_rate=config.SIMMTM_MASK_RATE)
-    logger.info(f"✓ 损失函数初始化完成 (SimMTM掩码率: {config.SIMMTM_MASK_RATE})")
-    
-    # Optimizer
-    optimizer = optim.AdamW(
-        backbone.parameters(),
-        lr=config.PRETRAIN_LR,
-        weight_decay=config.PRETRAIN_WEIGHT_DECAY
-    )
+    # 创建增强器和损失函数
+    if use_instance_contrastive:
+        # 实例对比学习模式
+        augmentation = DualViewAugmentation(config)
+        instance_contrastive = InstanceContrastiveLearning(backbone, config).to(config.DEVICE)
+        simmtm_loss_fn = SimMTMLoss(mask_rate=config.SIMMTM_MASK_RATE)
+        hybrid_loss_fn = HybridPretrainingLoss(
+            simmtm_loss=simmtm_loss_fn,
+            instance_contrastive=instance_contrastive,
+            lambda_infonce=config.INFONCE_LAMBDA
+        )
+        logger.info(f"✓ 混合损失函数初始化完成 (SimMTM + InfoNCE)")
+        
+        # 优化器包括projection head
+        optimizer = optim.AdamW(
+            list(backbone.parameters()) + list(instance_contrastive.projection_head.parameters()),
+            lr=config.PRETRAIN_LR,
+            weight_decay=config.PRETRAIN_WEIGHT_DECAY
+        )
+    else:
+        # 原始SimMTM模式
+        simmtm_loss_fn = SimMTMLoss(mask_rate=config.SIMMTM_MASK_RATE)
+        logger.info(f"✓ 损失函数初始化完成 (SimMTM掩码率: {config.SIMMTM_MASK_RATE})")
+        
+        optimizer = optim.AdamW(
+            backbone.parameters(),
+            lr=config.PRETRAIN_LR,
+            weight_decay=config.PRETRAIN_WEIGHT_DECAY
+        )
     
     # Scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -93,11 +124,15 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
     logger.info("-"*70)
     
     # Training loop
-    history = {'loss': [], 'simmtm': []}
+    if use_instance_contrastive:
+        history = {'loss': [], 'simmtm': [], 'infonce': []}
+    else:
+        history = {'loss': [], 'simmtm': []}
     
     for epoch in range(config.PRETRAIN_EPOCHS):
         epoch_loss = 0.0
         epoch_simmtm = 0.0
+        epoch_infonce = 0.0
         
         for batch_idx, batch_data in enumerate(train_loader):
             # TensorDataset with single tensor returns the tensor directly
@@ -110,17 +145,30 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
             
             optimizer.zero_grad()
             
-            # SimMTM loss (unsupervised, only needs X)
-            loss_simmtm = simmtm_loss_fn(backbone, X_batch)
-            
-            # Total loss (only SimMTM)
-            loss = loss_simmtm
+            if use_instance_contrastive:
+                # 实例对比学习模式
+                # 生成两个增强视图
+                x_view1, x_view2 = augmentation(X_batch)
+                
+                # 计算混合损失
+                loss, loss_dict = hybrid_loss_fn(
+                    backbone=backbone,
+                    x_original=X_batch,
+                    x_view1=x_view1,
+                    x_view2=x_view2
+                )
+                
+                epoch_simmtm += loss_dict['simmtm']
+                epoch_infonce += loss_dict['infonce']
+            else:
+                # 原始SimMTM模式
+                loss = simmtm_loss_fn(backbone, X_batch)
+                epoch_simmtm += loss.item()
             
             loss.backward()
             optimizer.step()
             
             epoch_loss += loss.item()
-            epoch_simmtm += loss_simmtm.item()
         
         scheduler.step()
         
@@ -132,23 +180,52 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
         history['loss'].append(epoch_loss)
         history['simmtm'].append(epoch_simmtm)
         
+        if use_instance_contrastive:
+            epoch_infonce /= n_batches
+            history['infonce'].append(epoch_infonce)
+        
         # 每个epoch都输出日志（便于监控）
         progress = (epoch + 1) / config.PRETRAIN_EPOCHS * 100
-        logger.info(f"[Stage 1] Epoch [{epoch+1}/{config.PRETRAIN_EPOCHS}] ({progress:.1f}%) | "
-                   f"Loss: {epoch_loss:.4f} | "
-                   f"SimMTM: {epoch_simmtm:.4f} | "
-                   f"LR: {scheduler.get_last_lr()[0]:.6f}")
+        if use_instance_contrastive:
+            logger.info(f"[Stage 1] Epoch [{epoch+1}/{config.PRETRAIN_EPOCHS}] ({progress:.1f}%) | "
+                       f"Loss: {epoch_loss:.4f} | "
+                       f"SimMTM: {epoch_simmtm:.4f} | "
+                       f"InfoNCE: {epoch_infonce:.4f} | "
+                       f"LR: {scheduler.get_last_lr()[0]:.6f}")
+        else:
+            logger.info(f"[Stage 1] Epoch [{epoch+1}/{config.PRETRAIN_EPOCHS}] ({progress:.1f}%) | "
+                       f"Loss: {epoch_loss:.4f} | "
+                       f"SimMTM: {epoch_simmtm:.4f} | "
+                       f"LR: {scheduler.get_last_lr()[0]:.6f}")
     
     logger.info("-"*70)
     logger.info("✓ Stage 1 完成: 骨干网络预训练完成")
     logger.info(f"  最终损失: {history['loss'][-1]:.4f}")
     logger.info(f"  训练了 {config.PRETRAIN_EPOCHS} 个epoch")
     logger.info("")
+    
+    # 生成backbone文件名：backbone_{method}_{n_samples}.pth
+    # method: SimMTM 或 SimCLR (如果启用实例对比学习)
+    n_samples = len(train_loader.dataset)
+    if use_instance_contrastive:
+        method_name = "SimCLR"
+    else:
+        method_name = "SimMTM"
+    
+    backbone_filename = f"backbone_{method_name}_{n_samples}.pth"
+    
     logger.info("📁 输出文件路径:")
     # Save backbone to feature_extraction module directory
-    backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", backbone_filename)
     torch.save(backbone.state_dict(), backbone_path)
     logger.info(f"  ✓ 骨干网络模型: {backbone_path}")
+    logger.info(f"    (命名格式: backbone_{{方法}}_{{样本数}}.pth)")
+    
+    # 同时保存一个默认名称的副本（向后兼容）
+    default_backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    torch.save(backbone.state_dict(), default_backbone_path)
+    logger.info(f"  ✓ 默认副本: {default_backbone_path}")
+    logger.info(f"    (用于向后兼容)")
     
     return backbone, history
 
@@ -211,6 +288,14 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
         features = np.concatenate(features_list, axis=0)
     
     logger.info(f"✓ 特征提取完成: {features.shape} (样本数×特征维度)")
+    logger.info("")
+    
+    # 生成特征分布可视化（Stage 2特征提取后）
+    logger.info("📊 生成特征分布可视化...")
+    feature_dist_path = os.path.join(config.LABEL_CORRECTION_DIR, "figures", "feature_distribution_stage2.png")
+    plot_feature_space(features, y_train_clean, feature_dist_path,
+                      title="Stage 2: Feature Distribution (After Backbone Extraction)", method='tsne')
+    logger.info(f"  ✓ 特征分布图 (t-SNE): {feature_dist_path}")
     logger.info("")
 
     logger.info("="*70)
@@ -308,6 +393,223 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
         'n_drop': (action_mask == 2).sum(),
         'n_reweight': (action_mask == 3).sum()
     }
+    
+    # ========================
+    # 生成详细的标签矫正分析报告
+    # ========================
+    logger.info("")
+    logger.info("="*70)
+    logger.info("📊 生成标签矫正分析报告")
+    logger.info("="*70)
+    
+    from datetime import datetime
+    
+    # 准备分析数据
+    n_total = len(y_train_noisy if stage2_mode != 'clean_augment_only' else y_train_clean)
+    n_keep = correction_stats['n_keep']
+    n_flip = correction_stats['n_flip']
+    n_drop = correction_stats['n_drop']
+    n_reweight = correction_stats['n_reweight']
+    
+    # 计算各类别的矫正情况
+    y_noisy_input = y_train_noisy if stage2_mode != 'clean_augment_only' else y_train_clean
+    
+    # 真实噪声样本（ground truth）
+    true_noise_mask = (y_noisy_input != y_train_clean)
+    n_true_noise = true_noise_mask.sum()
+    
+    # 被识别为噪声的样本（预测）
+    predicted_noise_mask = (action_mask == 1) | (action_mask == 2)
+    n_predicted_noise = predicted_noise_mask.sum()
+    
+    # 正确识别的噪声（True Positive）
+    tp_noise = (true_noise_mask & predicted_noise_mask).sum()
+    # 错误识别的噪声（False Positive）
+    fp_noise = (~true_noise_mask & predicted_noise_mask).sum()
+    # 漏检的噪声（False Negative）
+    fn_noise = (true_noise_mask & ~predicted_noise_mask).sum()
+    # 正确保留的干净样本（True Negative）
+    tn_noise = (~true_noise_mask & ~predicted_noise_mask).sum()
+    
+    # 计算噪声检测指标
+    noise_precision = tp_noise / n_predicted_noise if n_predicted_noise > 0 else 0
+    noise_recall = tp_noise / n_true_noise if n_true_noise > 0 else 0
+    noise_f1 = 2 * noise_precision * noise_recall / (noise_precision + noise_recall) if (noise_precision + noise_recall) > 0 else 0
+    
+    # 矫正后的准确率
+    final_accuracy = (y_corrected[keep_mask] == y_train_clean[keep_mask]).mean()
+    
+    # 各动作的准确率
+    keep_samples = (action_mask == 0)
+    flip_samples = (action_mask == 1)
+    reweight_samples = (action_mask == 3)
+    
+    keep_accuracy = (y_corrected[keep_samples] == y_train_clean[keep_samples]).mean() if keep_samples.sum() > 0 else 0
+    flip_accuracy = (y_corrected[flip_samples] == y_train_clean[flip_samples]).mean() if flip_samples.sum() > 0 else 0
+    reweight_accuracy = (y_corrected[reweight_samples] == y_train_clean[reweight_samples]).mean() if reweight_samples.sum() > 0 else 0
+    
+    # 生成Markdown报告
+    report_path = os.path.join(config.LABEL_CORRECTION_DIR, "models", "correction_analysis_report.md")
+    
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write("# 标签噪声矫正分析报告\n\n")
+        f.write(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"**噪声率**: {config.LABEL_NOISE_RATE*100:.1f}%\n\n")
+        f.write(f"**矫正方法**: Hybrid Court (CL + MADE + KNN)\n\n")
+        
+        f.write("---\n\n")
+        f.write("## 1. 数据集概览\n\n")
+        f.write(f"- **总样本数**: {n_total}\n")
+        f.write(f"- **真实噪声样本数**: {n_true_noise} ({n_true_noise/n_total*100:.2f}%)\n")
+        f.write(f"- **干净样本数**: {n_total - n_true_noise} ({(n_total-n_true_noise)/n_total*100:.2f}%)\n\n")
+        
+        f.write("### 类别分布\n\n")
+        f.write("| 标签类型 | 正常样本 | 恶意样本 | 总计 |\n")
+        f.write("|---------|---------|---------|------|\n")
+        f.write(f"| 真实标签 | {(y_train_clean==0).sum()} | {(y_train_clean==1).sum()} | {len(y_train_clean)} |\n")
+        f.write(f"| 噪声标签 | {(y_noisy_input==0).sum()} | {(y_noisy_input==1).sum()} | {len(y_noisy_input)} |\n")
+        f.write(f"| 矫正后标签 | {(y_corrected==0).sum()} | {(y_corrected==1).sum()} | {len(y_corrected)} |\n\n")
+        
+        f.write("---\n\n")
+        f.write("## 2. 矫正动作统计\n\n")
+        f.write("| 动作 | 样本数 | 占比 | 准确率 | 说明 |\n")
+        f.write("|------|--------|------|--------|------|\n")
+        f.write(f"| **保持 (Keep)** | {n_keep} | {n_keep/n_total*100:.2f}% | {keep_accuracy*100:.2f}% | 标签可信，保持不变 |\n")
+        f.write(f"| **翻转 (Flip)** | {n_flip} | {n_flip/n_total*100:.2f}% | {flip_accuracy*100:.2f}% | 标签错误，翻转标签 |\n")
+        f.write(f"| **丢弃 (Drop)** | {n_drop} | {n_drop/n_total*100:.2f}% | - | 不确定性高，丢弃样本 |\n")
+        f.write(f"| **重加权 (Reweight)** | {n_reweight} | {n_reweight/n_total*100:.2f}% | {reweight_accuracy*100:.2f}% | 可疑但保留，降低权重 |\n")
+        f.write(f"| **总计** | {n_total} | 100.00% | - | - |\n\n")
+        
+        f.write("### 动作分布可视化\n\n")
+        f.write("```\n")
+        f.write(f"保持:   {'█' * int(n_keep/n_total*50)} {n_keep/n_total*100:.1f}%\n")
+        f.write(f"翻转:   {'█' * int(n_flip/n_total*50)} {n_flip/n_total*100:.1f}%\n")
+        f.write(f"丢弃:   {'█' * int(n_drop/n_total*50)} {n_drop/n_total*100:.1f}%\n")
+        f.write(f"重加权: {'█' * int(n_reweight/n_total*50)} {n_reweight/n_total*100:.1f}%\n")
+        f.write("```\n\n")
+        
+        f.write("---\n\n")
+        f.write("## 3. 噪声检测性能\n\n")
+        f.write("### 混淆矩阵（噪声检测）\n\n")
+        f.write("| | 预测为干净 | 预测为噪声 |\n")
+        f.write("|---|-----------|----------|\n")
+        f.write(f"| **真实干净** | {tn_noise} (TN) | {fp_noise} (FP) |\n")
+        f.write(f"| **真实噪声** | {fn_noise} (FN) | {tp_noise} (TP) |\n\n")
+        
+        f.write("### 噪声检测指标\n\n")
+        f.write(f"- **Precision (精确率)**: {noise_precision*100:.2f}% - 识别为噪声的样本中，真正是噪声的比例\n")
+        f.write(f"- **Recall (召回率)**: {noise_recall*100:.2f}% - 所有真实噪声中，被正确识别的比例\n")
+        f.write(f"- **F1-Score**: {noise_f1*100:.2f}% - 精确率和召回率的调和平均\n\n")
+        
+        f.write("### 性能评估\n\n")
+        if noise_f1 >= 0.8:
+            f.write("✅ **优秀** - 噪声检测性能很好，大部分噪声被正确识别\n\n")
+        elif noise_f1 >= 0.6:
+            f.write("⚠️ **良好** - 噪声检测性能尚可，但仍有改进空间\n\n")
+        else:
+            f.write("❌ **需改进** - 噪声检测性能较差，建议调整参数或方法\n\n")
+        
+        f.write("---\n\n")
+        f.write("## 4. 矫正效果评估\n\n")
+        f.write(f"- **矫正前准确率**: {(y_noisy_input == y_train_clean).mean()*100:.2f}%\n")
+        f.write(f"- **矫正后准确率**: {final_accuracy*100:.2f}%\n")
+        f.write(f"- **准确率提升**: {(final_accuracy - (y_noisy_input == y_train_clean).mean())*100:.2f}%\n\n")
+        
+        improvement = final_accuracy - (y_noisy_input == y_train_clean).mean()
+        if improvement > 0.1:
+            f.write("✅ **显著改善** - 标签矫正显著提升了数据质量\n\n")
+        elif improvement > 0.05:
+            f.write("✅ **有效改善** - 标签矫正有效提升了数据质量\n\n")
+        elif improvement > 0:
+            f.write("⚠️ **轻微改善** - 标签矫正略微提升了数据质量\n\n")
+        else:
+            f.write("❌ **无改善** - 标签矫正未能提升数据质量，建议检查参数\n\n")
+        
+        f.write("---\n\n")
+        f.write("## 5. 各组件贡献分析\n\n")
+        
+        # CL组件分析
+        cl_suspected = (pred_probs.max(axis=1) < 0.5).sum()
+        f.write(f"### CL (置信学习)\n\n")
+        f.write(f"- **识别可疑样本数**: {cl_suspected}\n")
+        f.write(f"- **平均置信度**: {pred_probs.max(axis=1).mean():.4f}\n")
+        f.write(f"- **低置信度样本 (<0.5)**: {cl_suspected} ({cl_suspected/n_total*100:.2f}%)\n\n")
+        
+        # MADE组件分析
+        dense_samples = (density_scores > 0.5).sum()
+        f.write(f"### MADE (密度估计)\n\n")
+        f.write(f"- **高密度样本数**: {dense_samples} ({dense_samples/n_total*100:.2f}%)\n")
+        f.write(f"- **平均密度分数**: {density_scores.mean():.4f}\n")
+        f.write(f"- **低密度样本 (<0.3)**: {(density_scores < 0.3).sum()} ({(density_scores < 0.3).sum()/n_total*100:.2f}%)\n\n")
+        
+        # KNN组件分析
+        high_consistency = (neighbor_consistency > 0.7).sum()
+        f.write(f"### KNN (语义投票)\n\n")
+        f.write(f"- **高一致性样本数**: {high_consistency} ({high_consistency/n_total*100:.2f}%)\n")
+        f.write(f"- **平均邻居一致性**: {neighbor_consistency.mean():.4f}\n")
+        f.write(f"- **低一致性样本 (<0.5)**: {(neighbor_consistency < 0.5).sum()} ({(neighbor_consistency < 0.5).sum()/n_total*100:.2f}%)\n\n")
+        
+        f.write("---\n\n")
+        f.write("## 6. 样本权重分布\n\n")
+        f.write(f"- **平均权重**: {correction_weight.mean():.4f}\n")
+        f.write(f"- **权重标准差**: {correction_weight.std():.4f}\n")
+        f.write(f"- **最小权重**: {correction_weight.min():.4f}\n")
+        f.write(f"- **最大权重**: {correction_weight.max():.4f}\n\n")
+        
+        f.write("### 权重分布统计\n\n")
+        f.write("| 权重范围 | 样本数 | 占比 |\n")
+        f.write("|---------|--------|------|\n")
+        f.write(f"| [0.0, 0.2) | {((correction_weight >= 0.0) & (correction_weight < 0.2)).sum()} | {((correction_weight >= 0.0) & (correction_weight < 0.2)).sum()/n_total*100:.2f}% |\n")
+        f.write(f"| [0.2, 0.4) | {((correction_weight >= 0.2) & (correction_weight < 0.4)).sum()} | {((correction_weight >= 0.2) & (correction_weight < 0.4)).sum()/n_total*100:.2f}% |\n")
+        f.write(f"| [0.4, 0.6) | {((correction_weight >= 0.4) & (correction_weight < 0.6)).sum()} | {((correction_weight >= 0.4) & (correction_weight < 0.6)).sum()/n_total*100:.2f}% |\n")
+        f.write(f"| [0.6, 0.8) | {((correction_weight >= 0.6) & (correction_weight < 0.8)).sum()} | {((correction_weight >= 0.6) & (correction_weight < 0.8)).sum()/n_total*100:.2f}% |\n")
+        f.write(f"| [0.8, 1.0] | {((correction_weight >= 0.8) & (correction_weight <= 1.0)).sum()} | {((correction_weight >= 0.8) & (correction_weight <= 1.0)).sum()/n_total*100:.2f}% |\n\n")
+        
+        f.write("---\n\n")
+        f.write("## 7. 建议与总结\n\n")
+        
+        if final_accuracy >= 0.95:
+            f.write("### ✅ 矫正效果优秀\n\n")
+            f.write("- 标签矫正效果很好，数据质量高\n")
+            f.write("- 可以直接用于后续训练\n\n")
+        elif final_accuracy >= 0.85:
+            f.write("### ✅ 矫正效果良好\n\n")
+            f.write("- 标签矫正效果较好，大部分噪声被处理\n")
+            f.write("- 建议关注低置信度样本\n\n")
+        else:
+            f.write("### ⚠️ 矫正效果一般\n\n")
+            f.write("- 标签矫正效果有限，仍有较多噪声\n")
+            f.write("- 建议调整以下参数：\n")
+            f.write("  - 增加CL的置信度阈值\n")
+            f.write("  - 调整MADE的密度阈值\n")
+            f.write("  - 增加KNN的邻居数量\n\n")
+        
+        f.write("### 关键发现\n\n")
+        if noise_precision > 0.8 and noise_recall < 0.6:
+            f.write("- **高精确率，低召回率**: 矫正策略保守，漏检了部分噪声\n")
+            f.write("  - 建议: 降低置信度阈值，增加噪声检测的敏感度\n\n")
+        elif noise_precision < 0.6 and noise_recall > 0.8:
+            f.write("- **低精确率，高召回率**: 矫正策略激进，误判了部分干净样本\n")
+            f.write("  - 建议: 提高置信度阈值，减少误判\n\n")
+        elif noise_precision > 0.7 and noise_recall > 0.7:
+            f.write("- **平衡的检测性能**: 精确率和召回率都较高，矫正策略合理\n\n")
+        
+        if n_drop > n_total * 0.2:
+            f.write("- **丢弃样本过多**: 超过20%的样本被丢弃\n")
+            f.write("  - 建议: 检查数据质量或调整丢弃阈值\n\n")
+        
+        f.write("---\n\n")
+        f.write("## 8. 输出文件\n\n")
+        f.write(f"- **矫正结果**: `{correction_results_path}`\n")
+        f.write(f"- **对比图**: `{os.path.join(config.LABEL_CORRECTION_DIR, 'figures', 'noise_correction_comparison.png')}`\n")
+        f.write(f"- **特征空间图**: `{os.path.join(config.FEATURE_EXTRACTION_DIR, 'figures', 'feature_space_before_correction.png')}`\n")
+        f.write(f"- **本报告**: `{report_path}`\n\n")
+        
+        f.write("---\n\n")
+        f.write("*报告由MEDAL-Lite自动生成*\n")
+    
+    logger.info(f"  ✓ 标签矫正分析报告: {report_path}")
+    logger.info("")
     
     # 使用全部干净样本进行训练与增强（取消验证集）
     X_clean = X_train[keep_mask]
@@ -596,7 +898,7 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
     return X_augmented, y_augmented, sample_weights, correction_stats, tabddpm, n_train_original
 
 
-def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, config, logger, n_original=None):
+def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, config, logger, n_original=None, backbone_path=None):
     """
     Stage 3: Fine-tune dual-stream classifier
     
@@ -609,6 +911,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         logger: logger
         n_original: int, number of original samples (first n_original in X_train)
                     If None, assumes all samples are original
+        backbone_path: str, path to the backbone model used (for metadata recording)
         
     Returns:
         classifier: trained MEDAL classifier
@@ -629,8 +932,13 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     logger.info("📥 输入数据路径:")
     augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_data.npz")
     logger.info(f"  ✓ 增强数据: {augmented_data_path}")
-    backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
-    logger.info(f"  ✓ 骨干网络模型: {backbone_path}")
+    
+    # 使用传入的backbone_path参数，如果没有则使用默认路径
+    if backbone_path is None:
+        backbone_path_display = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    else:
+        backbone_path_display = backbone_path
+    logger.info(f"  ✓ 骨干网络模型: {backbone_path_display}")
     logger.info("")
     
     # Create classifier
@@ -680,6 +988,11 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         )
         logger.info("✓ 优化器初始化完成 (仅优化分类器参数，骨干网络已冻结)")
     
+    logger.info("")
+    logger.info("💡 训练流程说明:")
+    logger.info("  每个batch: 原始数据 → 骨干网络(冻结) → 特征 → 分类器(训练) → 损失")
+    logger.info("  骨干网络实时提取特征，但参数不更新")
+    logger.info("")
     logger.info("="*70)
     logger.info("📊 全量训练（不划分验证集）")
     logger.info("="*70)
@@ -796,6 +1109,28 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     logger.info(f"  训练了 {config.FINETUNE_EPOCHS} 个epoch")
     logger.info("")
     
+    # 生成特征分布可视化（Stage 3分类器训练后）
+    logger.info("📊 生成特征分布可视化...")
+    logger.info("  提取训练集特征用于可视化...")
+    
+    classifier.eval()
+    with torch.no_grad():
+        # Extract features from training set for visualization
+        X_train_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
+        features_list = []
+        batch_size = 64
+        for i in range(0, len(X_train_tensor), batch_size):
+            X_batch = X_train_tensor[i:i+batch_size]
+            z_batch = backbone(X_batch, return_sequence=False)
+            features_list.append(z_batch.cpu().numpy())
+        train_features = np.concatenate(features_list, axis=0)
+    
+    feature_dist_path = os.path.join(config.CLASSIFICATION_DIR, "figures", "feature_distribution_stage3.png")
+    plot_feature_space(train_features, y_train, feature_dist_path,
+                      title="Stage 3: Feature Distribution (After Classifier Training)", method='tsne')
+    logger.info(f"  ✓ 特征分布图 (t-SNE): {feature_dist_path}")
+    logger.info("")
+    
     optimal_threshold = config.MALICIOUS_THRESHOLD
     
     logger.info("📁 输出文件路径:")
@@ -808,6 +1143,25 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     history_path = os.path.join(config.CLASSIFICATION_DIR, "models", "training_history.npz")
     np.savez(history_path, **{k: np.array(v) for k, v in history.items()})
     logger.info(f"  ✓ 训练历史: {history_path}")
+    
+    # Save model metadata (including backbone path used for training)
+    # This helps test.py know which backbone to load
+    if backbone_path is None:
+        backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    
+    metadata_path = os.path.join(config.CLASSIFICATION_DIR, "models", "model_metadata.json")
+    metadata = {
+        'backbone_path': backbone_path,  # The actual backbone path used in training
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'n_samples': len(X_train),
+        'n_original': n_original if n_original is not None else len(X_train),
+        'finetune_epochs': config.FINETUNE_EPOCHS,
+    }
+    import json
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    logger.info(f"  ✓ 模型元数据: {metadata_path}")
+    logger.info(f"    (记录了使用的骨干网络: {os.path.basename(backbone_path)})")
     
     return classifier, history, optimal_threshold
 
@@ -903,12 +1257,21 @@ def main(args):
         logger.info(f"  恶意样本: {(y_train_clean==1).sum()} 个")
         logger.info("")
         
-        # Inject label noise
-        logger.info(f"🔀 注入标签噪声 ({config.LABEL_NOISE_RATE*100:.0f}%)...")
-        y_train_noisy, noise_mask = inject_label_noise(y_train_clean, config.LABEL_NOISE_RATE)
-        logger.info(f"✓ 噪声标签创建完成: {noise_mask.sum()} 个标签被翻转")
-        logger.info(f"  原始标签分布: 正常={(y_train_clean==0).sum()}, 恶意={(y_train_clean==1).sum()}")
-        logger.info(f"  噪声标签分布: 正常={(y_train_noisy==0).sum()}, 恶意={(y_train_noisy==1).sum()}")
+        # 注意：Stage 1 (特征提取) 不需要标签，是无监督学习
+        # 只有 Stage 2 (标签矫正) 和 Stage 3 (分类) 才需要标签
+        # 因此，标签噪声注入延迟到需要时再进行
+        if start_stage >= 2:
+            # Inject label noise (only needed for Stage 2+)
+            logger.info(f"🔀 注入标签噪声 ({config.LABEL_NOISE_RATE*100:.0f}%)...")
+            y_train_noisy, noise_mask = inject_label_noise(y_train_clean, config.LABEL_NOISE_RATE)
+            logger.info(f"✓ 噪声标签创建完成: {noise_mask.sum()} 个标签被翻转")
+            logger.info(f"  原始标签分布: 正常={(y_train_clean==0).sum()}, 恶意={(y_train_clean==1).sum()}")
+            logger.info(f"  噪声标签分布: 正常={(y_train_noisy==0).sum()}, 恶意={(y_train_noisy==1).sum()}")
+        else:
+            # Stage 1 不需要标签
+            logger.info("💡 Stage 1 (特征提取) 是无监督学习，不使用标签")
+            y_train_noisy = None
+            noise_mask = None
     else:
         # Starting from Stage 3, skip raw dataset loading
         logger.info("\n" + "="*70)
@@ -935,7 +1298,13 @@ def main(args):
             return backbone
     else:
         # Load pre-trained backbone (required for Stage 2 and 3)
-        backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+        # 优先使用命令行指定的backbone_path
+        if hasattr(args, 'backbone_path') and args.backbone_path:
+            backbone_path = args.backbone_path
+            logger.info(f"使用指定的骨干网络: {backbone_path}")
+        else:
+            backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+        
         retrain_backbone = bool(getattr(args, 'retrain_backbone', False))
         if retrain_backbone:
             logger.warning("⚠ --retrain_backbone 已指定：将使用随机初始化骨干网络（不加载预训练权重）")
@@ -957,6 +1326,15 @@ def main(args):
     # Stage 2: Label Correction & Augmentation
     # ========================
     if start_stage <= 2 and end_stage >= 2:
+        # 如果从Stage 2开始，但还没有注入噪声，现在注入
+        if y_train_noisy is None and y_train_clean is not None:
+            logger.info("")
+            logger.info(f"🔀 注入标签噪声 ({config.LABEL_NOISE_RATE*100:.0f}%)...")
+            y_train_noisy, noise_mask = inject_label_noise(y_train_clean, config.LABEL_NOISE_RATE)
+            logger.info(f"✓ 噪声标签创建完成: {noise_mask.sum()} 个标签被翻转")
+            logger.info(f"  原始标签分布: 正常={(y_train_clean==0).sum()}, 恶意={(y_train_clean==1).sum()}")
+            logger.info(f"  噪声标签分布: 正常={(y_train_noisy==0).sum()}, 恶意={(y_train_noisy==1).sum()}")
+        
         stage2_mode = getattr(args, 'stage2_mode', 'standard')
         X_augmented, y_augmented, sample_weights, correction_stats, tabddpm, n_original = stage2_label_correction_and_augmentation(
             backbone, X_train, y_train_noisy, y_train_clean, config, logger, stage2_mode=stage2_mode
@@ -967,10 +1345,11 @@ def main(args):
             logger.info("✅ 已完成到 Stage 2，按 end_stage 设置提前结束")
             logger.info("="*70)
             return backbone
-    else:
-        # Load augmented data and validation set
+    elif end_stage >= 3:
+        # 跳过Stage 2，尝试加载已有增强数据，或使用原始数据
         augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_data.npz")
         if os.path.exists(augmented_data_path):
+            # 加载已有的增强数据
             logger.info("📥 输入数据路径:")
             logger.info(f"  ✓ 增强数据: {augmented_data_path}")
             backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
@@ -988,18 +1367,47 @@ def main(args):
                 # Fallback: assume all data is original if metadata not found
                 n_original = len(X_augmented)
                 logger.warning("⚠️  未找到原始数据数量标记，假设所有数据均为原始数据")
+        elif X_train is not None:
+            # 使用原始数据（不做增强和矫正）
+            logger.info("\n" + "="*70)
+            logger.info("⚠️  跳过 Stage 2，使用原始数据（带噪声标签）")
+            logger.info("="*70)
+            logger.info("")
             
+            # 如果还没有注入噪声，现在注入
+            if y_train_noisy is None:
+                logger.info(f"🔀 注入标签噪声 ({config.LABEL_NOISE_RATE*100:.0f}%)...")
+                y_train_noisy, noise_mask = inject_label_noise(y_train_clean, config.LABEL_NOISE_RATE)
+                logger.info(f"✓ 噪声标签创建完成: {noise_mask.sum()} 个标签被翻转")
+                logger.info(f"  原始标签分布: 正常={(y_train_clean==0).sum()}, 恶意={(y_train_clean==1).sum()}")
+                logger.info(f"  噪声标签分布: 正常={(y_train_noisy==0).sum()}, 恶意={(y_train_noisy==1).sum()}")
+            
+            X_augmented = X_train
+            y_augmented = y_train_noisy
+            sample_weights = np.ones(len(X_train))
+            n_original = len(X_train)
+            
+            logger.info(f"✓ 使用原始数据: {len(X_train)} 个样本")
+            logger.info("  ⚠️  注意：未进行标签矫正和数据增强，可能影响性能")
         else:
             logger.error(f"❌ 找不到增强数据: {augmented_data_path}")
-            logger.error("   请先运行 Stage 2 或从 Stage 2 开始训练")
+            logger.error("   且未加载原始数据")
+            logger.error("   请先运行 Stage 2 或从 Stage 1 开始训练")
             return
     
     # ========================
     # Stage 3: Fine-tune Classifier
     # ========================
     if end_stage >= 3 and start_stage <= 3:
+        # 确定实际使用的backbone路径（用于记录元数据）
+        if hasattr(args, 'backbone_path') and args.backbone_path:
+            actual_backbone_path = args.backbone_path
+        else:
+            actual_backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+        
         classifier, finetune_history, optimal_threshold = stage3_finetune_classifier(
-            backbone, X_augmented, y_augmented, sample_weights, config, logger, n_original=n_original
+            backbone, X_augmented, y_augmented, sample_weights, config, logger, 
+            n_original=n_original, backbone_path=actual_backbone_path
         )
     else:
         logger.info("\n" + "="*70)
@@ -1054,6 +1462,8 @@ if __name__ == "__main__":
     parser.add_argument("--stage2_mode", type=str, default="standard", choices=["standard", "clean_augment_only"])
     parser.add_argument("--retrain_backbone", action="store_true",
                        help="Use randomly initialized backbone instead of loading pretrained weights")
+    parser.add_argument("--backbone_path", type=str, default=None,
+                       help="Path to specific backbone model (e.g., backbone_SimCLR_500.pth)")
     
     args = parser.parse_args()
     

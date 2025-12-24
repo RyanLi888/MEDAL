@@ -125,25 +125,15 @@ def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
         p = precision_score(y_true, y_pred_th, pos_label=1, zero_division=0)
         r = recall_score(y_true, y_pred_th, pos_label=1, zero_division=0)
         f1 = f1_score(y_true, y_pred_th, pos_label=1, zero_division=0)
-        logger.info(f"  {th:10.4f} | {p:9.4f} | {r:7.4f} | {f1:7.4f}")
-    logger.info("")
-
-    fixed_th = 0.5
-    y_pred_fixed = (y_prob[:, 1] >= fixed_th).astype(int)
-    fixed_p = precision_score(y_true, y_pred_fixed, pos_label=1, zero_division=0)
-    fixed_r = recall_score(y_true, y_pred_fixed, pos_label=1, zero_division=0)
-    fixed_f1 = f1_score(y_true, y_pred_fixed, pos_label=1, zero_division=0)
-    from sklearn.metrics import confusion_matrix
-    fixed_cm = confusion_matrix(y_true, y_pred_fixed)
-    logger.info("📌 固定阈值评估 (threshold=0.5, Malicious=Positive):")
-    logger.info(f"  Precision (pos=1): {fixed_p:.4f}")
-    logger.info(f"  Recall    (pos=1): {fixed_r:.4f}")
-    logger.info(f"  F1 (pos=1):        {fixed_f1:.4f}")
-    logger.info(f"  Confusion Matrix:\n{fixed_cm}")
+        marker = " ← 最优" if abs(th - optimal_threshold) < 0.0001 else ""
+        logger.info(f"  {th:10.4f} | {p:9.4f} | {r:7.4f} | {f1:7.4f}{marker}")
     logger.info("")
     
-    # 使用最优阈值生成预测标签
+    # 使用最优阈值生成预测标签（这是最终使用的阈值）
     y_pred = (y_prob[:, 1] >= optimal_threshold).astype(int)
+    logger.info(f"✅ 最终评估使用最优阈值: {optimal_threshold:.4f}")
+    logger.info(f"   (下方性能指标均基于此阈值计算)")
+    logger.info("")
     
     # Calculate metrics at optimal threshold
     logger.info("📊 计算性能指标 (基于自动阈值)...")
@@ -293,9 +283,35 @@ def main(args):
     logger.info(f"  ✓ 测试数据: {config.BENIGN_TEST} (正常), {config.MALICIOUS_TEST} (恶意)")
     logger.info("")
     
+    # Try to load model metadata to get the backbone path used during training
+    metadata_path = os.path.join(config.CLASSIFICATION_DIR, "models", "model_metadata.json")
+    backbone_path_from_metadata = None
+    
+    if os.path.exists(metadata_path):
+        try:
+            import json
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            backbone_path_from_metadata = metadata.get('backbone_path')
+            if backbone_path_from_metadata:
+                logger.info(f"✓ 从模型元数据中读取到训练时使用的骨干网络:")
+                logger.info(f"  {backbone_path_from_metadata}")
+                logger.info("")
+        except Exception as e:
+            logger.warning(f"⚠ 无法读取模型元数据: {e}")
+    
     # Load backbone from feature_extraction directory
     backbone = MicroBiMambaBackbone(config)
-    backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    
+    # Determine backbone path: use metadata if available, otherwise use default
+    if backbone_path_from_metadata and os.path.exists(backbone_path_from_metadata):
+        backbone_path = backbone_path_from_metadata
+        logger.info("使用训练时的骨干网络（从元数据）")
+    else:
+        backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+        if backbone_path_from_metadata:
+            logger.warning(f"⚠ 元数据中的骨干网络不存在: {backbone_path_from_metadata}")
+            logger.warning(f"  回退到默认路径: {backbone_path}")
     
     if not os.path.exists(backbone_path):
         logger.error(f"❌ 骨干网络检查点未找到: {backbone_path}")

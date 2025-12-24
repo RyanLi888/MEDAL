@@ -70,6 +70,7 @@ def main():
     parser.add_argument('--correction_npz', type=str, default='', help='Path to correction_results.npz')
     parser.add_argument('--use_ground_truth', action='store_true')
     parser.add_argument('--retrain_backbone', action='store_true')
+    parser.add_argument('--backbone_path', type=str, default='', help='Path to backbone model (optional)')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--run_tag', type=str, default='')
     args = parser.parse_args()
@@ -155,13 +156,22 @@ def main():
         logger.info(f"Training samples: {stats['n_train_used']} | benign={stats['label_dist_corrected']['benign']} malicious={stats['label_dist_corrected']['malicious']}")
 
         backbone = MicroBiMambaBackbone(config)
-        backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, 'models', 'backbone_pretrained.pth')
+        
+        # 确定backbone路径：优先使用命令行参数，否则使用默认路径
+        if args.backbone_path:
+            backbone_path = args.backbone_path
+        else:
+            backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, 'models', 'backbone_pretrained.pth')
+        
         if os.path.exists(backbone_path) and not args.retrain_backbone:
             logger.info(f'Loading backbone: {backbone_path}')
             backbone.load_state_dict(torch.load(backbone_path, map_location=config.DEVICE))
             backbone.freeze()
         else:
-            logger.warning('Backbone checkpoint not found or --retrain_backbone specified; using randomly initialized backbone')
+            if args.retrain_backbone:
+                logger.warning('--retrain_backbone specified; using randomly initialized backbone')
+            else:
+                logger.warning(f'Backbone checkpoint not found: {backbone_path}; using randomly initialized backbone')
             backbone.freeze()
 
         X_tr = X_clean

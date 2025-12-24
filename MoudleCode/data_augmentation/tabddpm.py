@@ -451,20 +451,25 @@ class TabDDPM(nn.Module):
                         density_scores, cl_confidence, knn_confidence,
                         augmentation_ratio=4):
         """
-        Augment dataset with generated samples (weight-aware roulette sampling)
+        Augment dataset with generated samples (weight-based multiplier strategy)
         
-        增强策略详解：
+        增强策略详解（v2 - 权重倍数增强）：
         
-        1. 轮盘赌采样 (Roulette Wheel Sampling):
-           - 不是每个样本都增强，而是按权重概率采样
-           - 高质量样本更可能被选为"生成模板"
-           - 低质量样本 (w<0.2) 直接排除
+        1. 权重倍数映射 (Weight-Based Multiplier):
+           - 权重 ≥ 0.9: 4倍增强 (Tier 1/2/3/5a/5b - 高质量样本)
+           - 权重 ≥ 0.4: 2倍增强 (Tier 4 - 中等质量样本)
+           - 权重 < 0.4: 不增强 (Dropped - 低质量样本)
         
-        2. 三视图融合权重 (Three-View Fusion):
-           sampling_prob = w * density_norm * consistency_score
-           - w: Hybrid Court生命周期权重 (核心)
-           - density_norm: MADE密度分数 (归一化到[0,1])
-           - consistency_score: 0.4*CL置信度 + 0.6*KNN一致性
+        2. 公式:
+           multiplier = compute_augmentation_multiplier(weight)
+           
+           def compute_augmentation_multiplier(weight):
+               if weight >= 0.9:
+                   return 4
+               elif weight >= 0.4:
+                   return 2
+               else:
+                   return 0
         
         3. 条件生成机制:
            - 从高权重样本中采样条件特征 (Direction, Flags)
@@ -472,13 +477,14 @@ class TabDDPM(nn.Module):
            - 保证生成样本符合协议约束
         
         4. 类别平衡策略:
-           - 每个类别独立生成 n_class × augmentation_ratio 个样本
+           - 每个类别独立生成
            - 恶意类用 guidance=1.5 (强化攻击特征)
            - 良性类用 guidance=1.2 (保持正常特征)
         
         5. 权重继承:
            - 原始样本: 保留 correction_weight
-           - 合成样本: 权重=1.0 (认为是干净的)
+           - 合成样本: 继承模板样本的权重（而非固定为1.0）
+           - 原理: 合成样本的质量取决于模板样本的质量
         
         为什么不会过拟合？
         - 每次生成都从随机噪声开始
@@ -493,7 +499,7 @@ class TabDDPM(nn.Module):
             density_scores: (N,) - MADE density scores (raw)
             cl_confidence: (N,) - CL max probability per sample
             knn_confidence: (N,) - KNN consistency per sample
-            augmentation_ratio: int - how many synthetic samples per class (default=4)
+            augmentation_ratio: int - deprecated, not used in v2
             
         Returns:
             X_augmented: Augmented features
@@ -502,6 +508,7 @@ class TabDDPM(nn.Module):
         """
         device = next(self.parameters()).device
 
+        # 只保留权重>0的样本（排除Dropped）
         keep_mask = correction_weight > 0.0
         X_keep = X_clean[keep_mask]
         y_keep = y_clean[keep_mask]
@@ -515,8 +522,34 @@ class TabDDPM(nn.Module):
         # Flatten sequence to packet-level summary for conditioning
         X_flat = np.mean(X_keep, axis=1)  # (N, 5)
 
-        multipliers = np.ceil(w_keep.astype(np.float32) * 10.0).astype(int)
-        multipliers = np.clip(multipliers, 2, 8)
+        # 计算增强倍数（基于权重的分级策略）
+        def compute_augmentation_multiplier(weight):
+            """
+            根据样本权重计算增强倍数
+            
+            公式：
+                if weight >= 0.9:
+                    multiplier = 4
+                elif weight >= 0.4:
+                    multiplier = 2
+                else:
+                    multiplier = 0
+            """
+            if weight >= 0.9:
+                return 4
+            elif weight >= 0.4:
+                return 2
+            else:
+                return 0
+        
+        # 向量化计算所有样本的增强倍数
+        multipliers = np.array([compute_augmentation_multiplier(w) for w in w_keep], dtype=int)
+        
+        # 统计增强倍数分布
+        unique_mults, counts = np.unique(multipliers, return_counts=True)
+        logger.info(f"Augmentation multiplier distribution:")
+        for mult, count in zip(unique_mults, counts):
+            logger.info(f"  {mult}x: {count} samples ({100*count/len(multipliers):.1f}%)")
         
         X_synthetic_list = []
         y_synthetic_list = []
@@ -633,7 +666,8 @@ class TabDDPM(nn.Module):
 
             X_synthetic_list.append(X_generated_seq)
             y_synthetic_list.append(np.array([class_label] * n_generate))
-            w_synthetic_list.append(np.ones(n_generate, dtype=np.float32))
+            # 合成样本继承模板样本的权重
+            w_synthetic_list.append(w_templates.astype(np.float32))
         
         X_synthetic = np.concatenate(X_synthetic_list, axis=0) if X_synthetic_list else np.empty((0, self.config.SEQUENCE_LENGTH, self.input_dim))
         y_synthetic = np.concatenate(y_synthetic_list, axis=0) if y_synthetic_list else np.empty((0,))
@@ -642,9 +676,13 @@ class TabDDPM(nn.Module):
         X_augmented = np.concatenate([X_keep, X_synthetic], axis=0)
         y_augmented = np.concatenate([y_keep, y_synthetic], axis=0)
         
-        # Original samples keep their correction weights; synthetic are clean => weight 1.0
+        # 原始样本保留矫正权重；合成样本继承模板样本的权重
         sample_weights = np.concatenate([w_keep, synthetic_weights], axis=0)
         
         logger.info(f"Augmentation complete: {len(X_augmented)} total samples ({len(X_keep)} original + {len(X_synthetic)} synthetic)")
+        logger.info(f"Weight distribution after augmentation:")
+        unique_weights, weight_counts = np.unique(sample_weights.round(1), return_counts=True)
+        for w, count in zip(unique_weights, weight_counts):
+            logger.info(f"  weight={w:.1f}: {count} samples ({100*count/len(sample_weights):.1f}%)")
         
         return X_augmented, y_augmented, sample_weights

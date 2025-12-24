@@ -103,7 +103,8 @@ TIER_CONFIG = {
         'TIER_2_FLIP':      1.0,
         'TIER_3_KEEP_HI':   1.0,       # Keep: 100%纯度
         'TIER_4A_REW_HI':   0.6,       # Reweight-High: ~84%纯度
-        'TIER_4B_REW_LO':   0.2        # Reweight-Low: ~44%纯度
+        'TIER_4B_REW_LO':   0.2,       # Reweight-Low: ~44%纯度
+        'TIER_5_RESCUED_FLIP': 0.9     # Rescued-Flip: 拯救的翻转样本
     },
     
     # Phase 3a: 迭代CL拯救 (用干净数据重新训练CL)
@@ -931,7 +932,7 @@ class HybridCourt:
                         clean_labels[i] = target_label
                         action_mask[i] = 1
                         confidence[i] = iter_cl_conf_target
-                        correction_weight[i] = weights['TIER_2_FLIP']
+                        correction_weight[i] = weights['TIER_5_RESCUED_FLIP']  # 使用0.9权重
                         tier_info[i] = 'Tier 5b: Rescued-Flip'
                         n_rescued_flip += 1
                         rescued_flip_indices.append(i)

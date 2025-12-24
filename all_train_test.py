@@ -158,6 +158,10 @@ if __name__ == "__main__":
                        choices=["1", "2", "3", "test"],
                        help="Start from which stage (1=backbone pretrain, 2=label correction, 3=classifier finetune, test=testing only)")
     
+    # Backbone selection
+    parser.add_argument("--backbone_path", type=str, default=None,
+                       help="Path to specific backbone model (e.g., backbone_SimCLR_500.pth)")
+    
     args = parser.parse_args()
     
     # Override config with arguments

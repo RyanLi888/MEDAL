@@ -65,21 +65,41 @@ import torch
 import subprocess
 import re
 
-def get_gpu_utilization():
+def get_gpu_info():
     try:
-        result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.memory', '--format=csv,noheader,nounits'], 
-                              capture_output=True, text=True, check=True)
-        utils = [int(x.strip()) for x in result.stdout.strip().split('\n')]
-        return utils
+        # 获取显存使用率
+        result_util = subprocess.run(['nvidia-smi', '--query-gpu=utilization.memory', '--format=csv,noheader,nounits'], 
+                                    capture_output=True, text=True, check=True)
+        utils = [int(x.strip()) for x in result_util.stdout.strip().split('\n')]
+        
+        # 获取显存使用情况 (已用/总量)
+        result_mem = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'], 
+                                   capture_output=True, text=True, check=True)
+        mem_info = []
+        for line in result_mem.stdout.strip().split('\n'):
+            used, total = line.strip().split(',')
+            mem_info.append((int(used.strip()), int(total.strip())))
+        
+        return utils, mem_info
     except:
-        return [0] * torch.cuda.device_count()
+        count = torch.cuda.device_count()
+        return [0] * count, [(0, 0)] * count
 
-utils = get_gpu_utilization()
+utils, mem_info = get_gpu_info()
 for i in range(torch.cuda.device_count()):
     name = torch.cuda.get_device_name(i)
-    mem = torch.cuda.get_device_properties(i).total_memory / 1024**3
+    total_mem = torch.cuda.get_device_properties(i).total_memory / 1024**3
     util = utils[i] if i < len(utils) else 0
-    print(f'  {i}) {name} ({mem:.1f} GB) [占用率: {util}%]')
+    
+    if i < len(mem_info):
+        used_mb, total_mb = mem_info[i]
+        used_gb = used_mb / 1024
+        total_gb = total_mb / 1024
+        free_gb = total_gb - used_gb
+        print(f'  {i}) {name} ({total_mem:.1f} GB)')
+        print(f'      显存: {used_gb:.2f}/{total_gb:.2f} GB (已用/总量) | 空闲: {free_gb:.2f} GB | 占用率: {util}%')
+    else:
+        print(f'  {i}) {name} ({total_mem:.1f} GB) [占用率: {util}%]')
 " 2>/dev/null
         
         echo ""
@@ -399,18 +419,29 @@ case $choice in
 
         case $ab_choice in
             1)
-                # 消融实验模式1：特征提取 - 目的是训练backbone，不需要已有backbone
+                # 消融实验模式1：特征提取 - 可选择训练新backbone或使用已有backbone
                 echo ""
                 echo "[消融-特征提取]"
-                echo "说明: 将先运行 Stage 1 预训练骨干，然后用真实标签(权重=1)训练分类器并测试"
-                echo "  - Stage 1: 训练新的骨干网络"
-                echo "  - Stage 2-3: 跳过，直接用真实标签训练分类器"
+                echo "说明: 评估特征提取器（骨干网络）的质量"
+                echo "  - 选项1: 训练新的骨干网络（Stage 1），然后用真实标签训练分类器并测试"
+                echo "  - 选项2: 使用已有骨干网络，直接用真实标签训练分类器并测试"
                 echo ""
                 
-                check_and_select_backbone false
+                check_and_select_backbone true
                 
-                CMD="python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 && python scripts/training/train_clean_only_then_test.py --use_ground_truth"
-                MODE="消融-特征提取 (训练新backbone)"
+                if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
+                    echo ""
+                    echo "将使用已选择的骨干网络: $SELECTED_BACKBONE_NAME"
+                    echo "跳过 Stage 1，直接用真实标签训练分类器并测试"
+                    BACKBONE_ARG="--backbone_path $BACKBONE_PATH"
+                    CMD="python scripts/training/train_clean_only_then_test.py --use_ground_truth $BACKBONE_ARG"
+                    MODE="消融-特征提取 (使用已有backbone: $SELECTED_BACKBONE_NAME)"
+                else
+                    echo ""
+                    echo "将训练新的骨干网络（Stage 1），然后用真实标签训练分类器并测试"
+                    CMD="python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 && python scripts/training/train_clean_only_then_test.py --use_ground_truth"
+                    MODE="消融-特征提取 (训练新backbone)"
+                fi
                 LOG_PREFIX="ablation_feature_extraction"
                 ;;
             2)
@@ -476,16 +507,17 @@ case $choice in
         echo ""
         echo "请选择训练方式:"
         echo "1) SimMTM (掩码时序建模)"
-        echo "2) SimMTM + InfoNCE (实例对比学习)"
-        echo "3) 仅 InfoNCE (纯对比学习)"
+        echo "2) SimMTM + InfoNCE"
+        echo "3) SimMTM + SimSiam"
+        echo "4) SimMTM + NNCLR"
         echo ""
-        echo -n "请输入选择 (1-3, 默认1): "
-        read -r backbone_choice
-        backbone_choice=${backbone_choice:-1}
+        echo -n "请输入选择 (1-4, 默认1): "
+        read -r pretrain_mode
+        pretrain_mode=${pretrain_mode:-1}
         
         check_and_select_backbone false
         
-        case $backbone_choice in
+        case $pretrain_mode in
             1)
                 echo ""
                 echo "使用 SimMTM 训练骨干网络"
@@ -496,20 +528,29 @@ case $choice in
             2)
                 echo ""
                 echo "使用 SimMTM + InfoNCE 训练骨干网络"
-                echo "注意: 对比学习开关/权重由配置文件控制 (MoudleCode/utils/config.py)"
+                echo "注意: 对比学习权重/温度由配置文件控制 (MoudleCode/utils/config.py)"
                 echo "  - USE_INSTANCE_CONTRASTIVE / INFONCE_LAMBDA / INFONCE_TEMPERATURE"
-                CMD="python scripts/training/train.py --start_stage 1 --end_stage 1"
-                MODE="骨干网络训练 (SimMTM + InfoNCE, 使用配置文件参数)"
+                CMD="MEDAL_CONTRASTIVE_METHOD=infonce python scripts/training/train.py --start_stage 1 --end_stage 1"
+                MODE="骨干网络训练 (SimMTM + InfoNCE)"
                 LOG_PREFIX="backbone_hybrid"
                 ;;
             3)
                 echo ""
-                echo "使用纯 InfoNCE 训练骨干网络"
-                echo "注意: 对比学习开关/权重由配置文件控制 (MoudleCode/utils/config.py)"
-                echo "  - 若要纯 InfoNCE，请在配置中将 SimMTM 相关权重置0，并启用 USE_INSTANCE_CONTRASTIVE"
-                CMD="python scripts/training/train.py --start_stage 1 --end_stage 1"
-                MODE="骨干网络训练 (纯 InfoNCE, 使用配置文件参数)"
-                LOG_PREFIX="backbone_infonce"
+                echo "使用 SimMTM + SimSiam 训练骨干网络"
+                echo "注意: 对比学习权重由配置文件控制 (MoudleCode/utils/config.py)"
+                echo "  - USE_INSTANCE_CONTRASTIVE / INFONCE_LAMBDA"
+                CMD="MEDAL_CONTRASTIVE_METHOD=simsiam python scripts/training/train.py --start_stage 1 --end_stage 1"
+                MODE="骨干网络训练 (SimMTM + SimSiam)"
+                LOG_PREFIX="backbone_simsiam"
+                ;;
+            4)
+                echo ""
+                echo "使用 SimMTM + NNCLR 训练骨干网络"
+                echo "注意: 对比学习权重/温度由配置文件控制 (MoudleCode/utils/config.py)"
+                echo "  - USE_INSTANCE_CONTRASTIVE / INFONCE_LAMBDA / INFONCE_TEMPERATURE / NNCLR_QUEUE_SIZE"
+                CMD="MEDAL_CONTRASTIVE_METHOD=nnclr python scripts/training/train.py --start_stage 1 --end_stage 1"
+                MODE="骨干网络训练 (SimMTM + NNCLR)"
+                LOG_PREFIX="backbone_nnclr"
                 ;;
             *)
                 echo -e "${RED}无效选择${NC}"

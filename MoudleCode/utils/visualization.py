@@ -76,7 +76,7 @@ def plot_feature_space(features, labels, save_path, title="Feature Space", metho
     
     # Dimensionality reduction
     if method == 'tsne':
-        reducer = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=1000)
+        reducer = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000)
     else:  # pca
         reducer = PCA(n_components=2, random_state=42)
     
@@ -534,7 +534,7 @@ def plot_real_vs_synthetic_comparison(X_real, X_synthetic, y_real, y_synthetic, 
     
     # Dimensionality reduction
     if method == 'tsne':
-        reducer = TSNE(n_components=2, random_state=42, perplexity=min(30, len(X_combined)//4), n_iter=1000)
+        reducer = TSNE(n_components=2, random_state=42, perplexity=min(30, len(X_combined)//4), max_iter=1000)
     else:  # pca
         reducer = PCA(n_components=2, random_state=42)
     

@@ -39,8 +39,12 @@ class BackboneEvaluator:
         # 加载骨干网络
         print(f"[加载] 骨干网络: {backbone_path}")
         self.backbone = MicroBiMambaBackbone(config)
-        
-        checkpoint = torch.load(backbone_path, map_location=device)
+
+        load_location = 'cpu' if str(device) != 'cpu' else 'cpu'
+        try:
+            checkpoint = torch.load(backbone_path, map_location=load_location, weights_only=True)
+        except TypeError:
+            checkpoint = torch.load(backbone_path, map_location=load_location)
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
         else:

@@ -193,6 +193,34 @@ class TabDDPM(nn.Module):
 
         x = torch.max(torch.min(x, self.raw_max), self.raw_min)
         return x
+
+    @staticmethod
+    def _topk_discrete_values(values, max_values):
+        values = np.asarray(values)
+        if values.size == 0:
+            return np.asarray([], dtype=np.float32)
+        uniq, cnt = np.unique(values.astype(np.float32), return_counts=True)
+        if uniq.size > max_values:
+            idx = np.argpartition(cnt, -max_values)[-max_values:]
+            uniq = uniq[idx]
+        uniq = np.sort(uniq)
+        return uniq
+
+    @staticmethod
+    def _quantize_to_vocab(x, vocab):
+        x = np.asarray(x, dtype=np.float32)
+        vocab = np.asarray(vocab, dtype=np.float32)
+        if vocab.size == 0:
+            return x
+        flat = x.reshape(-1)
+        pos = np.searchsorted(vocab, flat, side='left')
+        pos0 = np.clip(pos - 1, 0, vocab.size - 1)
+        pos1 = np.clip(pos, 0, vocab.size - 1)
+        v0 = vocab[pos0]
+        v1 = vocab[pos1]
+        choose1 = np.abs(flat - v1) < np.abs(flat - v0)
+        out = np.where(choose1, v1, v0)
+        return out.reshape(x.shape)
     
     def q_sample(self, x_0, t, noise=None):
         """
@@ -572,8 +600,27 @@ class TabDDPM(nn.Module):
             
             # Guidance per class
             guidance_scale = self.config.GUIDANCE_MALICIOUS if class_label == 1 else self.config.GUIDANCE_BENIGN
-            templates = np.repeat(X_seq_class[template_mask], repeats=mult_class[template_mask], axis=0)
-            w_templates = np.repeat(w_class[template_mask], repeats=mult_class[template_mask], axis=0)
+            use_weighted_sampling = bool(getattr(self.config, 'AUGMENT_USE_WEIGHTED_SAMPLING', True))
+            X_templates_pool = X_seq_class[template_mask]
+            w_templates_pool = w_class[template_mask]
+            mult_templates_pool = mult_class[template_mask]
+            n_generate = int(mult_templates_pool.sum())
+            if n_generate <= 0:
+                continue
+
+            if use_weighted_sampling:
+                p = w_templates_pool.astype(np.float64)
+                p_sum = float(p.sum())
+                if p_sum <= 0:
+                    p = np.ones_like(p, dtype=np.float64) / max(len(p), 1)
+                else:
+                    p = p / p_sum
+                idx = np.random.choice(len(X_templates_pool), size=n_generate, replace=True, p=p)
+                templates = X_templates_pool[idx]
+                w_templates = w_templates_pool[idx]
+            else:
+                templates = np.repeat(X_templates_pool, repeats=mult_templates_pool, axis=0)
+                w_templates = np.repeat(w_templates_pool, repeats=mult_templates_pool, axis=0)
             n_generate = templates.shape[0]
             logger.info(f"Generating {n_generate} synthetic samples for class {class_label} (guidance={guidance_scale})")
 
@@ -620,48 +667,62 @@ class TabDDPM(nn.Module):
                 gen_dep_all = active_rows[:, dep_idx]
                 cond_all = templates[:, :, cond_idx][pad_mask]
 
-                max_stats_samples = 200000
-                if real_dep_all.shape[0] > max_stats_samples:
-                    idx = np.random.choice(real_dep_all.shape[0], max_stats_samples, replace=False)
-                    real_dep = real_dep_all[idx]
-                else:
-                    real_dep = real_dep_all
+                enable_cov_match = bool(getattr(self.config, 'ENABLE_COVARIANCE_MATCHING', False))
+                enable_quant = bool(getattr(self.config, 'ENABLE_DISCRETE_QUANTIZATION', True))
+                quant_indices = list(getattr(self.config, 'DISCRETE_QUANTIZE_INDICES', [4]))
+                max_vocab = int(getattr(self.config, 'DISCRETE_QUANTIZE_MAX_VALUES', 4096))
 
-                if gen_dep_all.shape[0] > max_stats_samples:
-                    idx = np.random.choice(gen_dep_all.shape[0], max_stats_samples, replace=False)
-                    gen_dep = gen_dep_all[idx]
-                else:
-                    gen_dep = gen_dep_all
+                if enable_cov_match:
+                    max_stats_samples = 200000
+                    if real_dep_all.shape[0] > max_stats_samples:
+                        idx = np.random.choice(real_dep_all.shape[0], max_stats_samples, replace=False)
+                        real_dep = real_dep_all[idx]
+                    else:
+                        real_dep = real_dep_all
 
-                mu_r = real_dep.mean(axis=0)
-                mu_g = gen_dep.mean(axis=0)
-                cr = real_dep - mu_r
-                cg = gen_dep - mu_g
-                cov_r = (cr.T @ cr) / max(len(real_dep) - 1, 1)
-                cov_g = (cg.T @ cg) / max(len(gen_dep) - 1, 1)
+                    if gen_dep_all.shape[0] > max_stats_samples:
+                        idx = np.random.choice(gen_dep_all.shape[0], max_stats_samples, replace=False)
+                        gen_dep = gen_dep_all[idx]
+                    else:
+                        gen_dep = gen_dep_all
 
-                eps = 1e-6
-                cov_r = cov_r + eps * np.eye(cov_r.shape[0], dtype=np.float32)
-                cov_g = cov_g + eps * np.eye(cov_g.shape[0], dtype=np.float32)
+                    mu_r = real_dep.mean(axis=0)
+                    mu_g = gen_dep.mean(axis=0)
+                    cr = real_dep - mu_r
+                    cg = gen_dep - mu_g
+                    cov_r = (cr.T @ cr) / max(len(real_dep) - 1, 1)
+                    cov_g = (cg.T @ cg) / max(len(gen_dep) - 1, 1)
 
-                eig_g, vec_g = np.linalg.eigh(cov_g)
-                eig_r, vec_r = np.linalg.eigh(cov_r)
-                eig_g = np.clip(eig_g, eps, None)
-                eig_r = np.clip(eig_r, eps, None)
+                    eps = 1e-6
+                    cov_r = cov_r + eps * np.eye(cov_r.shape[0], dtype=np.float32)
+                    cov_g = cov_g + eps * np.eye(cov_g.shape[0], dtype=np.float32)
 
-                inv_sqrt_g = (vec_g @ np.diag(1.0 / np.sqrt(eig_g)) @ vec_g.T).astype(np.float32)
-                sqrt_r = (vec_r @ np.diag(np.sqrt(eig_r)) @ vec_r.T).astype(np.float32)
+                    eig_g, vec_g = np.linalg.eigh(cov_g)
+                    eig_r, vec_r = np.linalg.eigh(cov_r)
+                    eig_g = np.clip(eig_g, eps, None)
+                    eig_r = np.clip(eig_r, eps, None)
 
-                gen_dep_centered = (gen_dep_all - mu_g).astype(np.float32)
-                gen_dep_matched = (gen_dep_centered @ inv_sqrt_g @ sqrt_r) + mu_r
+                    inv_sqrt_g = (vec_g @ np.diag(1.0 / np.sqrt(eig_g)) @ vec_g.T).astype(np.float32)
+                    sqrt_r = (vec_r @ np.diag(np.sqrt(eig_r)) @ vec_r.T).astype(np.float32)
 
-                # Write back: modify active rows then assign rows back to the flattened view
-                active_rows[:, dep_idx] = gen_dep_matched.astype(np.float32)
+                    gen_dep_centered = (gen_dep_all - mu_g).astype(np.float32)
+                    gen_dep_matched = (gen_dep_centered @ inv_sqrt_g @ sqrt_r) + mu_r
+
+                    active_rows[:, dep_idx] = gen_dep_matched.astype(np.float32)
 
                 active_packets_t = torch.from_numpy(active_rows).to(device)
                 active_packets_t = self.project_protocol_constraints(active_packets_t)
                 active_rows = active_packets_t.detach().cpu().numpy().astype(np.float32)
                 active_rows[:, cond_idx] = cond_all.astype(np.float32)
+
+                if enable_quant and len(quant_indices) > 0:
+                    for q_idx in quant_indices:
+                        if int(q_idx) < 0 or int(q_idx) >= self.input_dim:
+                            continue
+                        real_vals = X_seq_class[:, :, int(q_idx)][real_pad_mask]
+                        vocab = self._topk_discrete_values(real_vals, max_vocab)
+                        active_rows[:, int(q_idx)] = self._quantize_to_vocab(active_rows[:, int(q_idx)], vocab)
+
                 flat[active_idx] = active_rows
 
             X_synthetic_list.append(X_generated_seq)

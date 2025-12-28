@@ -49,7 +49,7 @@ class Config:
     SEQUENCE_LENGTH = 1024  # L: Maximum number of packets per flow
     INPUT_FEATURE_DIM = 5   # [Length, Log-IAT, Direction, Flags, Window]
     MODEL_DIM = 64          # d_model: Embedding dimension
-    OUTPUT_DIM = 32         # backbone最终输出维度（下游分类/对比学习使用）
+    OUTPUT_DIM = 64         # backbone最终输出维度（下游分类/对比学习使用）
     FEATURE_DIM = OUTPUT_DIM
     EMBEDDING_DROPOUT = 0.1
     POSITIONAL_ENCODING = "sinusoidal"  # 正弦位置编码
@@ -64,16 +64,18 @@ class Config:
     MAMBA_PROJECTION_DIM = 128   # Concat后的投影维度(64*2)
     
     # ==================== Pre-training (Stage 1) ====================
-    PRETRAIN_EPOCHS = 200
-    PRETRAIN_BATCH_SIZE = 64
+    PRETRAIN_EPOCHS = 300  # 从 200 增加到 300，给 InfoNCE 更多收敛时间
+    PRETRAIN_BATCH_SIZE = 64  # 降低批次大小以适应10.75GB显存 (从128降至64)
+    PRETRAIN_BATCH_SIZE_NNCLR = 64  # NNCLR 专用批次大小（显存占用高，需要更小）
+    PRETRAIN_GRADIENT_ACCUMULATION_STEPS = 2  # 梯度累积步数，有效批次 = 64 * 2 = 128
+                                              # 仅用于 NNCLR，保持与其他方法相同的有效批次
     PRETRAIN_LR = 1e-3
     PRETRAIN_WEIGHT_DECAY = 1e-4
-
     PRETRAIN_MIN_LR = 1e-5
     PRETRAIN_EARLY_STOPPING = True
     PRETRAIN_ES_WARMUP_EPOCHS = 50
-    PRETRAIN_ES_PATIENCE = 20
-    PRETRAIN_ES_MIN_DELTA = 0.01
+    PRETRAIN_ES_PATIENCE = 30  # 从 20 增加到 30，更宽容的早停策略
+    PRETRAIN_ES_MIN_DELTA = 0.005  # 从 0.01 降低到 0.005，更敏感的改进检测
     
     # SimMTM parameters
     SIMMTM_MASK_RATE = 0.5  # 50% masking
@@ -85,12 +87,18 @@ class Config:
     # ==================== Instance Contrastive Learning (New) ====================
     # 是否启用实例对比学习（替代原有的SupCon）
     USE_INSTANCE_CONTRASTIVE = True
+
+    CONTRASTIVE_METHOD = os.getenv("MEDAL_CONTRASTIVE_METHOD", "infonce").lower()
+    NNCLR_QUEUE_SIZE = 4096
+    NNCLR_MIN_SIMILARITY = 0.0
+    NNCLR_WARMUP_EPOCHS = 0
     
     # InfoNCE参数
-    # 修复说明：降低权重和增大温度，避免对比学习过度主导训练
-    # 原因：InfoNCE权重过高(1.0)导致特征过度分散，类内聚合不足，F1下降8.5%
-    INFONCE_TEMPERATURE = 0.3  # 温度系数τ（从0.1增到0.3，放宽相似度要求）
-    INFONCE_LAMBDA = 0.3  # InfoNCE损失权重（从1.0降到0.3，让SimMTM主导）
+    # 修复说明：调整温度和权重，优化对比学习收敛性
+    # 温度从 0.3 增加到 0.5：让损失更平滑，更容易收敛到较低值
+    # 权重保持 0.3：平衡 SimMTM 和 InfoNCE 的贡献
+    INFONCE_TEMPERATURE = 0.5  # 温度系数τ（从0.3增到0.5，让损失更平滑易收敛）
+    INFONCE_LAMBDA = 0.5  # InfoNCE损失权重（保持0.3，让SimMTM主导）
     
     # 流量增强参数
     # 修复说明：降低增强强度，避免破坏关键特征
@@ -142,6 +150,12 @@ class Config:
     # Feature indices for conditioning
     COND_FEATURE_INDICES = [2, 3]  # Direction, Flags
     DEP_FEATURE_INDICES = [0, 1, 4]  # Length, Log-IAT, Window
+
+    ENABLE_COVARIANCE_MATCHING = False
+    ENABLE_DISCRETE_QUANTIZATION = True
+    DISCRETE_QUANTIZE_INDICES = [4]
+    DISCRETE_QUANTIZE_MAX_VALUES = 4096
+    AUGMENT_USE_WEIGHTED_SAMPLING = True
     
     # ==================== Classification (Stage 3) ====================
     # Dual-Stream MLP
@@ -160,10 +174,22 @@ class Config:
     
     # Fine-tuning parameters
     # Increased from 50 to 80 to allow Focal Loss and Margin Loss to fully converge
-    # Margin Loss weight increases from 0.3 to 0.7, needs more epochs to reach full effect
-    FINETUNE_EPOCHS = 80
+    # Further increased to 150 based on training curve analysis (2025-12-25):
+    #   - Loss still decreasing at epoch 80: 16.55→0.56 (not converged)
+    #   - F1 still improving: 0.7913@ep40 → 0.7946@ep56 → 0.8158@ep53
+    #   - No overfitting signs with 2500 augmented samples
+    FINETUNE_EPOCHS = 150
     FINETUNE_BATCH_SIZE = 64
     FINETUNE_LR = 1e-4
+    FINETUNE_MIN_LR = 1e-6  # Minimum learning rate for cosine annealing
+    
+    # Stage 3: Early Stopping (智能训练终止)
+    FINETUNE_EARLY_STOPPING = True  # 启用早停机制
+    FINETUNE_ES_WARMUP_EPOCHS = 30  # 前30轮不触发早停（让模型充分学习）
+    FINETUNE_ES_PATIENCE = 25       # 25轮F1不改善则停止（比Stage1更宽容）
+    FINETUNE_ES_MIN_DELTA = 0.002   # F1改善阈值：0.2%（避免微小波动触发早停）
+    FINETUNE_ES_METRIC = 'f1_optimal'  # 监控指标：最优F1分数（自动阈值）
+    FINETUNE_ES_ALLOW_TRAIN_METRIC = False
 
     # Stage 3: Validation split for selecting best checkpoint (by val F1 pos=1 with auto-threshold)
     FINETUNE_VAL_SPLIT = 0.0
@@ -194,7 +220,7 @@ class Config:
     # Co-teaching
     CO_TEACHING_SELECT_RATE = 0.7  # Select top 70% low-loss samples
 
-    USE_CO_TEACHING = True
+    USE_CO_TEACHING = False
     CO_TEACHING_WARMUP_EPOCHS = 10
     CO_TEACHING_MIN_SAMPLE_WEIGHT = 0.5
     
@@ -219,8 +245,8 @@ class Config:
     # Soft F1 Loss: 直接优化 Binary F1-Score
     # ⚠️ 注意：在 1:1 平衡训练集上，Soft F1 Loss 可能导致过度分离
     # 降低权重以减少对恶意类的过度偏好
-    USE_SOFT_F1_LOSS = True        # 启用 Soft F1 Loss
-    SOFT_F1_WEIGHT = 0.3           # 从 0.5 降到 0.3，减少 F1 Loss 的影响
+    USE_SOFT_F1_LOSS = False        # 启用 Soft F1 Loss
+    SOFT_F1_WEIGHT = 0.1           # 从 0.5 降到 0.3，减少 F1 Loss 的影响
     
     # Margin Loss (ArcFace-style): adds margin between classes
     # Disabled initially to avoid probability distortion (can re-enable after model stabilizes)

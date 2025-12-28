@@ -1176,7 +1176,7 @@ def plot_feature_distributions(results, y_true, noise_mask, save_dir, logger):
     
     # Use t-SNE for dimensionality reduction
     logger.info("Running t-SNE for dimensionality reduction...")
-    tsne = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=1000)
+    tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000)
     features_2d = tsne.fit_transform(features)
     logger.info("✓ t-SNE complete")
     

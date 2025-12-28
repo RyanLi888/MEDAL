@@ -49,6 +49,45 @@ from MoudleCode.classification.dual_stream import MEDAL_Classifier, DualStreamLo
 import logging
 
 
+def _load_state_dict_shape_safe(model, state_dict, logger, prefix="model"):
+    model_sd = model.state_dict()
+    filtered = {}
+    skipped_missing = []
+    skipped_shape = []
+    for k, v in state_dict.items():
+        if k not in model_sd:
+            skipped_missing.append(k)
+            continue
+        try:
+            if tuple(v.shape) != tuple(model_sd[k].shape):
+                skipped_shape.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
+                continue
+        except Exception:
+            skipped_shape.append((k, None, None))
+            continue
+        filtered[k] = v
+
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+
+    if skipped_shape:
+        logger.warning(f"⚠ {prefix} checkpoint contains shape-mismatched keys; they were skipped (showing up to 20):")
+        for k, src, dst in skipped_shape[:20]:
+            logger.warning(f"  - {k}: ckpt={src} model={dst}")
+    if skipped_missing:
+        logger.warning(f"⚠ {prefix} checkpoint contains unknown keys; they were skipped (showing up to 20):")
+        for k in skipped_missing[:20]:
+            logger.warning(f"  - {k}")
+    if missing:
+        logger.warning(f"⚠ {prefix} missing_keys after loading (showing up to 20): {missing[:20]}")
+    if unexpected:
+        logger.warning(f"⚠ {prefix} unexpected_keys after loading (showing up to 20): {unexpected[:20]}")
+
+    logger.info(
+        f"✓ {prefix} state_dict loaded (matched={len(filtered)}/{len(state_dict)}; "
+        f"skipped_shape={len(skipped_shape)} skipped_unknown={len(skipped_missing)})"
+    )
+
+
 def stage1_pretrain_backbone(backbone, train_loader, config, logger):
     """
     Stage 1: Pre-train backbone with SimMTM only (unsupervised)
@@ -62,20 +101,41 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
     Returns:
         backbone: pre-trained backbone
     """
+    # Clear GPU cache before starting
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.info("✓ GPU 缓存已清理")
+    
     logger.info("="*70)
     logger.info("STAGE 1: Pre-training Backbone")
     logger.info("="*70)
     logger.info(f"目标: 训练Micro-Bi-Mamba骨干网络，学习流量特征表示")
     logger.info(f"训练轮数: {config.PRETRAIN_EPOCHS} epochs")
-    logger.info(f"批次大小: {config.PRETRAIN_BATCH_SIZE}")
+    
+    # 显示实际使用的批次大小
+    actual_batch_size = train_loader.batch_size
+    logger.info(f"批次大小: {actual_batch_size}")
+    
     logger.info(f"学习率: {config.PRETRAIN_LR}")
     
     # 检查是否启用实例对比学习
     use_instance_contrastive = getattr(config, 'USE_INSTANCE_CONTRASTIVE', False)
+    contrastive_method = getattr(config, 'CONTRASTIVE_METHOD', 'infonce')
     if use_instance_contrastive:
-        logger.info(f"优化目标: SimMTM + InfoNCE (实例对比学习)")
-        logger.info(f"  - InfoNCE温度: {config.INFONCE_TEMPERATURE}")
-        logger.info(f"  - InfoNCE权重: {config.INFONCE_LAMBDA}")
+        method = contrastive_method
+        logger.info(f"优化目标: SimMTM + {str(method).upper()} (实例对比学习)")
+        if str(method).lower() in ['infonce', 'nnclr']:
+            logger.info(f"  - 温度: {config.INFONCE_TEMPERATURE}")
+        logger.info(f"  - 权重: {config.INFONCE_LAMBDA}")
+        
+        # NNCLR 默认启用梯度累积（由 PRETRAIN_GRADIENT_ACCUMULATION_STEPS 控制）
+        if str(method).lower() == 'nnclr':
+            gradient_accumulation_steps = int(getattr(config, 'PRETRAIN_GRADIENT_ACCUMULATION_STEPS', 1))
+            if gradient_accumulation_steps > 1:
+                effective_batch_size = actual_batch_size * gradient_accumulation_steps
+                logger.info(f"  - 梯度累积: {gradient_accumulation_steps} 步")
+                logger.info(f"  - 有效批次: {actual_batch_size} × {gradient_accumulation_steps} = {effective_batch_size}")
     else:
         logger.info(f"优化目标: SimMTM (掩码重构)")
     logger.info("")
@@ -140,6 +200,37 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
     best_epoch = -1
     best_state = None
     no_improve = 0
+    
+    # Gradient accumulation (用于 NNCLR，保持有效批次不变)
+    use_gradient_accumulation = (
+        use_instance_contrastive and
+        str(contrastive_method).lower() == 'nnclr' and
+        int(getattr(config, 'PRETRAIN_GRADIENT_ACCUMULATION_STEPS', 1)) > 1
+    )
+
+    if use_gradient_accumulation:
+        gradient_accumulation_steps = int(getattr(config, 'PRETRAIN_GRADIENT_ACCUMULATION_STEPS', 2))
+    else:
+        gradient_accumulation_steps = 1  # 禁用梯度累积
+
+    if use_instance_contrastive:
+        method_lower = str(contrastive_method).lower()
+        temperature = float(getattr(config, 'INFONCE_TEMPERATURE', getattr(config, 'SUPCON_TEMPERATURE', 0.1)))
+        lambda_infonce = float(getattr(config, 'INFONCE_LAMBDA', 1.0))
+        effective_batch_size = int(actual_batch_size) * int(gradient_accumulation_steps)
+        logger.info("[Stage 1] Contrastive config:")
+        logger.info(f"  - method: {str(contrastive_method).upper()}")
+        logger.info(f"  - temperature: {temperature}")
+        logger.info(f"  - lambda_infonce: {lambda_infonce}")
+        logger.info(f"  - per-step batch_size: {int(actual_batch_size)}")
+        logger.info(f"  - gradient_accumulation_steps: {int(gradient_accumulation_steps)}")
+        logger.info(f"  - effective_batch_size: {effective_batch_size}")
+        if method_lower in ['infonce', 'simclr', 'nnclr']:
+            approx_negatives = max(2 * int(actual_batch_size) - 2, 0)
+            logger.info(f"  - negatives per anchor (within step): ~{approx_negatives}")
+        if method_lower == 'nnclr':
+            nnclr_queue_size = int(getattr(config, 'NNCLR_QUEUE_SIZE', 4096))
+            logger.info(f"  - nnclr queue size: {nnclr_queue_size}")
 
     for epoch in range(config.PRETRAIN_EPOCHS):
         epoch_loss = 0.0
@@ -155,19 +246,21 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
                 X_batch = batch_data  # Already a single tensor
             X_batch = X_batch.to(config.DEVICE)
             
-            optimizer.zero_grad()
+            # Only zero grad at the start of accumulation
+            if batch_idx % gradient_accumulation_steps == 0:
+                optimizer.zero_grad()
             
             if use_instance_contrastive:
-                # 实例对比学习模式
-                # 生成两个增强视图
+                # 增强视图
                 x_view1, x_view2 = augmentation(X_batch)
                 
-                # 计算混合损失
+                # 混合损失
                 loss, loss_dict = hybrid_loss_fn(
                     backbone=backbone,
                     x_original=X_batch,
                     x_view1=x_view1,
-                    x_view2=x_view2
+                    x_view2=x_view2,
+                    epoch=epoch
                 )
                 
                 epoch_simmtm += loss_dict['simmtm']
@@ -177,10 +270,15 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
                 loss = simmtm_loss_fn(backbone, X_batch)
                 epoch_simmtm += loss.item()
             
+            # Scale loss by accumulation steps
+            loss = loss / gradient_accumulation_steps
             loss.backward()
-            optimizer.step()
             
-            epoch_loss += loss.item()
+            # Only step optimizer after accumulation
+            if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                optimizer.step()
+            
+            epoch_loss += loss.item() * gradient_accumulation_steps  # Restore original scale for logging
         
         scheduler.step()
         
@@ -199,10 +297,11 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
         # 每个epoch都输出日志（便于监控）
         progress = (epoch + 1) / config.PRETRAIN_EPOCHS * 100
         if use_instance_contrastive:
+            method_name = str(contrastive_method).upper()
             logger.info(f"[Stage 1] Epoch [{epoch+1}/{config.PRETRAIN_EPOCHS}] ({progress:.1f}%) | "
                        f"Loss: {epoch_loss:.4f} | "
                        f"SimMTM: {epoch_simmtm:.4f} | "
-                       f"InfoNCE: {epoch_infonce:.4f} | "
+                       f"{method_name}: {epoch_infonce:.4f} | "
                        f"LR: {scheduler.get_last_lr()[0]:.6f}")
         else:
             logger.info(f"[Stage 1] Epoch [{epoch+1}/{config.PRETRAIN_EPOCHS}] ({progress:.1f}%) | "
@@ -228,7 +327,7 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
             break
 
     if best_state is not None:
-        backbone.load_state_dict(best_state)
+        _load_state_dict_shape_safe(backbone, best_state, logger, prefix="backbone(best)")
         backbone.to(config.DEVICE)
     
     logger.info("-"*70)
@@ -243,7 +342,8 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
     # method: SimMTM 或 SimCLR (如果启用实例对比学习)
     n_samples = len(train_loader.dataset)
     if use_instance_contrastive:
-        method_name = "SimCLR"
+        method = getattr(config, 'CONTRASTIVE_METHOD', 'infonce')
+        method_name = f"SimMTM_{str(method).upper()}"
     else:
         method_name = "SimMTM"
     
@@ -1111,6 +1211,26 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     best_state = None
     best_threshold = float(getattr(config, 'MALICIOUS_THRESHOLD', 0.5))
     
+    # Early stopping variables
+    use_early_stopping = bool(getattr(config, 'FINETUNE_EARLY_STOPPING', False))
+    es_warmup_epochs = int(getattr(config, 'FINETUNE_ES_WARMUP_EPOCHS', 30))
+    es_patience = int(getattr(config, 'FINETUNE_ES_PATIENCE', 25))
+    es_min_delta = float(getattr(config, 'FINETUNE_ES_MIN_DELTA', 0.002))
+    no_improve_count = 0
+    best_es_metric = -1.0
+    allow_train_metric_es = bool(getattr(config, 'FINETUNE_ES_ALLOW_TRAIN_METRIC', False))
+    if use_early_stopping and X_val_split is None and not allow_train_metric_es:
+        use_early_stopping = False
+        logger.info("⚠️  早停已自动禁用：未设置验证集 (FINETUNE_VAL_SPLIT=0)，训练集指标不适合作为早停依据")
+        logger.info("")
+    
+    if use_early_stopping:
+        logger.info(f"✓ 早停机制已启用:")
+        logger.info(f"  - 预热轮数: {es_warmup_epochs} (前{es_warmup_epochs}轮不触发早停)")
+        logger.info(f"  - 耐心值: {es_patience} (连续{es_patience}轮不改善则停止)")
+        logger.info(f"  - 改善阈值: {es_min_delta:.4f} (F1改善需超过{es_min_delta*100:.2f}%)")
+        logger.info("")
+    
     for epoch in range(config.FINETUNE_EPOCHS):
         epoch_loss = 0.0
         epoch_losses = {
@@ -1241,6 +1361,31 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         history['train_f1_star'].append(train_f1_star if train_f1_star is not None else np.nan)
         history['train_threshold_star'].append(train_threshold_star if train_threshold_star is not None else np.nan)
         
+        # Early stopping check
+        if use_early_stopping and (epoch + 1) >= es_warmup_epochs:
+            current_metric = val_f1 if val_f1 is not None else train_f1_star
+            if current_metric is not None:
+                current_metric = float(current_metric)
+                if current_metric > (best_es_metric + es_min_delta):
+                    best_es_metric = current_metric
+                    no_improve_count = 0
+                else:
+                    no_improve_count += 1
+                    
+                    if no_improve_count >= es_patience:
+                        logger.info("")
+                        logger.info("="*70)
+                        logger.info(f"🛑 早停触发 (Early Stopping Triggered)")
+                        logger.info("="*70)
+                        logger.info(f"  当前轮次: Epoch {epoch+1}/{config.FINETUNE_EPOCHS}")
+                        logger.info(f"  最佳F1: {best_f1:.4f} (Epoch {best_epoch})")
+                        logger.info(f"  当前F1: {current_metric:.4f}")
+                        logger.info(f"  连续{no_improve_count}轮未改善超过{es_min_delta:.4f}")
+                        logger.info(f"  提前终止训练，节省 {config.FINETUNE_EPOCHS - epoch - 1} 轮")
+                        logger.info("="*70)
+                        logger.info("")
+                        break
+        
         # 每个epoch都输出详细日志
         progress = (epoch + 1) / config.FINETUNE_EPOCHS * 100
         soft_f1_str = f" | F1Loss: {epoch_losses['soft_f1']:.4f}" if epoch_losses['soft_f1'] > 0 else ""
@@ -1263,8 +1408,11 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     
     logger.info("-"*70)
     logger.info("✓ Stage 3 完成: 分类器微调完成")
+    actual_epochs = len(history['train_loss'])
     logger.info(f"  训练集 - 最终损失: {history['train_loss'][-1]:.4f}, 最终F1: {history['train_f1'][-1]:.4f}")
-    logger.info(f"  训练了 {config.FINETUNE_EPOCHS} 个epoch")
+    logger.info(f"  实际训练轮数: {actual_epochs}/{config.FINETUNE_EPOCHS} epochs")
+    if actual_epochs < config.FINETUNE_EPOCHS:
+        logger.info(f"  ✓ 早停生效，节省了 {config.FINETUNE_EPOCHS - actual_epochs} 轮训练")
     if best_epoch > 0:
         if X_val_split is not None:
             logger.info(f"  最佳ValF1*(pos=1, auto-threshold): {best_f1:.4f} (epoch {best_epoch}, th={best_threshold:.4f})")
@@ -1458,9 +1606,22 @@ def main(args):
     backbone = MicroBiMambaBackbone(config)
     
     if start_stage <= 1:
+        # 根据对比学习方法选择批次大小
+        use_instance_contrastive = getattr(config, 'USE_INSTANCE_CONTRASTIVE', False)
+        contrastive_method = getattr(config, 'CONTRASTIVE_METHOD', 'infonce')
+        
+        if use_instance_contrastive and str(contrastive_method).lower() == 'nnclr':
+            # NNCLR 需要更小的批次以避免显存溢出
+            batch_size = getattr(config, 'PRETRAIN_BATCH_SIZE_NNCLR', 64)
+            logger.info(f"✓ 检测到 NNCLR 方法，使用专用批次大小: {batch_size}")
+            logger.info(f"  (NNCLR 显存占用高，需要减小批次)")
+        else:
+            # SimMTM 或 InfoNCE 使用默认批次大小
+            batch_size = config.PRETRAIN_BATCH_SIZE
+        
         # SimMTM is unsupervised, so we only need X_train, not labels
         dataset = TensorDataset(torch.FloatTensor(X_train))
-        train_loader = DataLoader(dataset, batch_size=config.PRETRAIN_BATCH_SIZE, shuffle=True)
+        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
         backbone, pretrain_history = stage1_pretrain_backbone(backbone, train_loader, config, logger)
         # Backbone is already saved in stage1_pretrain_backbone function
@@ -1492,16 +1653,8 @@ def main(args):
                     backbone_state = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)
                 except TypeError:
                     backbone_state = torch.load(backbone_path, map_location=config.DEVICE)
-                try:
-                    backbone.load_state_dict(backbone_state)
-                except RuntimeError as e:
-                    logger.warning(f"⚠ 骨干网络检查点与当前结构不完全匹配，将使用 strict=False 加载: {e}")
-                    missing, unexpected = backbone.load_state_dict(backbone_state, strict=False)
-                    if missing:
-                        logger.warning(f"  missing_keys: {missing}")
-                    if unexpected:
-                        logger.warning(f"  unexpected_keys: {unexpected}")
-                backbone.freeze()
+                _load_state_dict_shape_safe(backbone, backbone_state, logger, prefix="backbone")
+                logger.info(f"✓ 加载已有骨干网络: {backbone_path}")
             else:
                 logger.error(f"❌ 找不到预训练骨干网络: {backbone_path}")
                 logger.error("   请先运行 Stage 1 或从 Stage 1 开始训练")

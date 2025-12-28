@@ -384,22 +384,57 @@ class DualStreamLoss(nn.Module):
         """
         logits_a, logits_b = model(z, return_separate=True)
 
-        loss_a_per_sample = self._label_smoothing_ce(logits_a, labels)
-        loss_b_per_sample = self._label_smoothing_ce(logits_b, labels)
+        # ---- Supervision loss (default: label-smoothing CE with sample weights) ----
+        if sample_weights is None:
+            sample_weights = torch.ones_like(labels, dtype=torch.float32, device=z.device)
+        else:
+            sample_weights = sample_weights.to(device=z.device, dtype=torch.float32)
 
-        sup_loss_a = (loss_a_per_sample * sample_weights).mean()
-        sup_loss_b = (loss_b_per_sample * sample_weights).mean()
-        loss_sup = 0.5 * (sup_loss_a + sup_loss_b)
-        loss_sup_base = loss_sup
-        loss_f1 = torch.tensor(0.0, device=z.device)
-        use_soft_f1 = False
-        soft_f1_weight = 0.0
-        use_co_teaching = False
-        co_teaching_warmup = 0
-        co_teaching_select_rate = 0.0
-        co_teaching_min_w = 0.0
+        # Optional co-teaching (disabled by default; keep for experiments)
+        use_co_teaching = bool(getattr(self.config, 'USE_CO_TEACHING', False))
+        co_teaching_warmup = int(getattr(self.config, 'CO_TEACHING_WARMUP_EPOCHS', 0))
+        co_teaching_select_rate = float(getattr(self.config, 'CO_TEACHING_SELECT_RATE', 0.7))
+        co_teaching_min_w = float(getattr(self.config, 'CO_TEACHING_MIN_SAMPLE_WEIGHT', 0.0))
+        use_focal = bool(getattr(self.config, 'USE_FOCAL_LOSS', False))
+
         selected_for_a = None
         selected_for_b = None
+
+        if use_co_teaching and epoch >= co_teaching_warmup:
+            eligible = sample_weights >= co_teaching_min_w
+            if eligible.any():
+                logits_a_e = logits_a[eligible]
+                logits_b_e = logits_b[eligible]
+                labels_e = labels[eligible]
+                loss_a_ct, loss_b_ct = self.co_teaching_loss(
+                    logits_a_e, logits_b_e, labels_e,
+                    select_rate=co_teaching_select_rate,
+                    use_focal=use_focal
+                )
+                loss_sup_base = 0.5 * (loss_a_ct + loss_b_ct)
+                loss_sup = loss_sup_base
+                selected_for_a = eligible.nonzero(as_tuple=False).squeeze(1)
+                selected_for_b = eligible.nonzero(as_tuple=False).squeeze(1)
+            else:
+                use_co_teaching = False
+        
+        if not use_co_teaching:
+            loss_a_per_sample = self._label_smoothing_ce(logits_a, labels)
+            loss_b_per_sample = self._label_smoothing_ce(logits_b, labels)
+            sup_loss_a = (loss_a_per_sample * sample_weights).mean()
+            sup_loss_b = (loss_b_per_sample * sample_weights).mean()
+            loss_sup_base = 0.5 * (sup_loss_a + sup_loss_b)
+            loss_sup = loss_sup_base
+
+        # Optional SoftF1 (disabled by default; can be enabled in config)
+        use_soft_f1 = bool(getattr(self.config, 'USE_SOFT_F1_LOSS', False))
+        soft_f1_weight = float(getattr(self.config, 'SOFT_F1_WEIGHT', 0.0)) if use_soft_f1 else 0.0
+        loss_f1 = torch.tensor(0.0, device=z.device)
+        if use_soft_f1 and soft_f1_weight > 0:
+            loss_f1_a = self.soft_f1_loss(logits_a, labels)
+            loss_f1_b = self.soft_f1_loss(logits_b, labels)
+            loss_f1 = 0.5 * (loss_f1_a + loss_f1_b)
+            loss_sup = (1.0 - soft_f1_weight) * loss_sup_base + soft_f1_weight * loss_f1
 
         # Soft-orthogonality loss
         w_a, w_b = model.get_first_layer_weights()

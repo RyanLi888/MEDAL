@@ -37,6 +37,45 @@ except ImportError:
 import logging
 
 
+def _load_state_dict_shape_safe(model, state_dict, logger, prefix="model"):
+    model_sd = model.state_dict()
+    filtered = {}
+    skipped_missing = []
+    skipped_shape = []
+    for k, v in state_dict.items():
+        if k not in model_sd:
+            skipped_missing.append(k)
+            continue
+        try:
+            if tuple(v.shape) != tuple(model_sd[k].shape):
+                skipped_shape.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
+                continue
+        except Exception:
+            skipped_shape.append((k, None, None))
+            continue
+        filtered[k] = v
+
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+
+    if skipped_shape:
+        logger.warning(f"⚠ {prefix} checkpoint contains shape-mismatched keys; they were skipped (showing up to 20):")
+        for k, src, dst in skipped_shape[:20]:
+            logger.warning(f"  - {k}: ckpt={src} model={dst}")
+    if skipped_missing:
+        logger.warning(f"⚠ {prefix} checkpoint contains unknown keys; they were skipped (showing up to 20):")
+        for k in skipped_missing[:20]:
+            logger.warning(f"  - {k}")
+    if missing:
+        logger.warning(f"⚠ {prefix} missing_keys after loading (showing up to 20): {missing[:20]}")
+    if unexpected:
+        logger.warning(f"⚠ {prefix} unexpected_keys after loading (showing up to 20): {unexpected[:20]}")
+
+    logger.info(
+        f"✓ {prefix} state_dict loaded (matched={len(filtered)}/{len(state_dict)}; "
+        f"skipped_shape={len(skipped_shape)} skipped_unknown={len(skipped_missing)})"
+    )
+
+
 def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
     """
     Test the model on test dataset
@@ -339,15 +378,8 @@ def main(args):
         backbone_state = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)
     except TypeError:
         backbone_state = torch.load(backbone_path, map_location=config.DEVICE)
-    try:
-        backbone.load_state_dict(backbone_state)
-    except RuntimeError as e:
-        logger.warning(f"⚠ 骨干网络检查点与当前结构不完全匹配，将使用 strict=False 加载: {e}")
-        missing, unexpected = backbone.load_state_dict(backbone_state, strict=False)
-        if missing:
-            logger.warning(f"  missing_keys: {missing}")
-        if unexpected:
-            logger.warning(f"  unexpected_keys: {unexpected}")
+
+    _load_state_dict_shape_safe(backbone, backbone_state, logger, prefix="backbone")
     backbone.freeze()
     logger.info(f"✓ 骨干网络加载完成")
     

@@ -94,16 +94,17 @@ class TabDDPM(nn.Module):
     Operates on configurable-dimensional raw features with protocol-aware generation
     """
     
-    def __init__(self, config):
+    def __init__(self, config, input_dim=None, cond_indices=None, dep_indices=None, enable_protocol_constraints=True):
         super().__init__()
         
         self.config = config
-        self.input_dim = config.INPUT_FEATURE_DIM
+        self.input_dim = int(input_dim if input_dim is not None else config.INPUT_FEATURE_DIM)
         self.timesteps = config.DDPM_TIMESTEPS
+        self.enable_protocol_constraints = bool(enable_protocol_constraints)
         
         # Condition and dependence feature indices (must be defined before denoising_net)
-        self.cond_indices = config.COND_FEATURE_INDICES
-        self.dep_indices = config.DEP_FEATURE_INDICES
+        self.cond_indices = list(cond_indices) if cond_indices is not None else list(config.COND_FEATURE_INDICES)
+        self.dep_indices = list(dep_indices) if dep_indices is not None else list(config.DEP_FEATURE_INDICES)
         
         # Denoising network
         # Input: x_t (D) + t (1) + y (1) + x_cond (len(cond_indices))
@@ -159,22 +160,23 @@ class TabDDPM(nn.Module):
         raw_max = np.percentile(X_raw, p_high, axis=0)
 
         # Protocol-aligned hard ranges (keep others by percentile)
-        if self.input_dim >= 1:
-            raw_min[0] = 0.0
-            raw_max[0] = 1.0
-        if self.input_dim >= 2:
-            raw_min[1] = max(float(raw_min[1]), 0.0)
-        if self.input_dim >= 3:
-            raw_min[2] = -1.0
-            raw_max[2] = 1.0
-        if self.input_dim >= 4:
-            raw_min[3] = max(float(raw_min[3]), 0.0)
-        if self.input_dim >= 5:
-            raw_min[4] = 0.0
-            raw_max[4] = 1.0
-        if self.input_dim >= 6:
-            raw_min[5] = 0.0
-            raw_max[5] = 1.0
+        if self.enable_protocol_constraints:
+            if self.input_dim >= 1:
+                raw_min[0] = 0.0
+                raw_max[0] = 1.0
+            if self.input_dim >= 2:
+                raw_min[1] = max(float(raw_min[1]), 0.0)
+            if self.input_dim >= 3:
+                raw_min[2] = -1.0
+                raw_max[2] = 1.0
+            if self.input_dim >= 4:
+                raw_min[3] = max(float(raw_min[3]), 0.0)
+            if self.input_dim >= 5:
+                raw_min[4] = 0.0
+                raw_max[4] = 1.0
+            if self.input_dim >= 6:
+                raw_min[5] = 0.0
+                raw_max[5] = 1.0
 
         device = self.feature_mean.device
         self.feature_mean.data.copy_(torch.from_numpy(mean).to(device))
@@ -195,18 +197,19 @@ class TabDDPM(nn.Module):
 
     def project_protocol_constraints(self, x_raw):
         x = x_raw
-        if self.input_dim >= 1:
-            x[..., 0] = torch.clamp(x[..., 0], 0.0, 1.0)
-        if self.input_dim >= 2:
-            x[..., 1] = torch.clamp(x[..., 1], 0.0, float('inf'))
-        if self.input_dim >= 3:
-            x[..., 2] = torch.clamp(x[..., 2], -1.0, 1.0)
-        if self.input_dim >= 4:
-            x[..., 3] = torch.clamp(x[..., 3], 0.0, float('inf'))
-        if self.input_dim >= 5:
-            x[..., 4] = torch.clamp(x[..., 4], 0.0, 1.0)
-        if self.input_dim >= 6:
-            x[..., 5] = torch.clamp(x[..., 5], 0.0, 1.0)
+        if self.enable_protocol_constraints:
+            if self.input_dim >= 1:
+                x[..., 0] = torch.clamp(x[..., 0], 0.0, 1.0)
+            if self.input_dim >= 2:
+                x[..., 1] = torch.clamp(x[..., 1], 0.0, float('inf'))
+            if self.input_dim >= 3:
+                x[..., 2] = torch.clamp(x[..., 2], -1.0, 1.0)
+            if self.input_dim >= 4:
+                x[..., 3] = torch.clamp(x[..., 3], 0.0, float('inf'))
+            if self.input_dim >= 5:
+                x[..., 4] = torch.clamp(x[..., 4], 0.0, 1.0)
+            if self.input_dim >= 6:
+                x[..., 5] = torch.clamp(x[..., 5], 0.0, 1.0)
 
         x = torch.max(torch.min(x, self.raw_max), self.raw_min)
         return x
@@ -261,7 +264,7 @@ class TabDDPM(nn.Module):
         
         return x_t
     
-    def predict_noise(self, x_t, t, y, x_cond):
+    def predict_noise(self, x_t, t, y, x_cond=None):
         """
         Predict noise using denoising network
         
@@ -277,6 +280,9 @@ class TabDDPM(nn.Module):
         # Normalize timestep
         t_norm = t.float() / self.timesteps
         
+        if x_cond is None:
+            x_cond = torch.empty((x_t.shape[0], 0), device=x_t.device, dtype=x_t.dtype)
+
         # Concatenate inputs
         net_input = torch.cat([
             x_t,  # (B, D)
@@ -441,7 +447,7 @@ class TabDDPM(nn.Module):
         return x_prev
     
     @torch.no_grad()
-    def sample(self, n_samples, y, x_cond, guidance_scale=1.0, device='cpu'):
+    def sample(self, n_samples, y, x_cond=None, guidance_scale=1.0, device='cpu'):
         """
         Generate samples using DDIM sampling (逆向扩散过程)
         
@@ -472,8 +478,15 @@ class TabDDPM(nn.Module):
         if int(self.scaler_fitted.item()) != 1:
             raise RuntimeError("TabDDPM scaler not fitted. Call fit_scaler(...) before sampling.")
 
-        x_cond_raw = x_cond
-        x_cond_scaled = (x_cond_raw - self.feature_mean[self.cond_indices]) / self.feature_std[self.cond_indices]
+        cond_dim = len(self.cond_indices)
+        if cond_dim > 0:
+            if x_cond is None:
+                raise ValueError("x_cond must be provided when cond_indices is non-empty")
+            x_cond_raw = x_cond
+            x_cond_scaled = (x_cond_raw - self.feature_mean[self.cond_indices]) / self.feature_std[self.cond_indices]
+        else:
+            x_cond_raw = None
+            x_cond_scaled = torch.empty((n_samples, 0), device=device)
 
         x_t = torch.randn(n_samples, self.input_dim, device=device)
 
@@ -485,12 +498,134 @@ class TabDDPM(nn.Module):
             x_t = self.p_sample(x_t, t, y, x_cond_scaled, guidance_scale)
 
         x_0_scaled = x_t
-        x_0_scaled[:, self.cond_indices] = x_cond_scaled
+        if cond_dim > 0:
+            x_0_scaled[:, self.cond_indices] = x_cond_scaled
 
         x_0_raw = self.inverse_transform(x_0_scaled)
-        x_0_raw[:, self.cond_indices] = x_cond_raw
+        if cond_dim > 0:
+            x_0_raw[:, self.cond_indices] = x_cond_raw
         x_0_raw = self.project_protocol_constraints(x_0_raw)
         return x_0_raw
+
+    def augment_feature_dataset(self, Z_clean, y_clean, correction_weight):
+        device = next(self.parameters()).device
+
+        Z_clean = np.asarray(Z_clean, dtype=np.float32)
+        y_clean = np.asarray(y_clean).astype(int)
+        correction_weight = np.asarray(correction_weight, dtype=np.float32)
+
+        if Z_clean.ndim != 2 or Z_clean.shape[1] != self.input_dim:
+            raise ValueError(f"Z_clean must have shape (N, {self.input_dim}), got {Z_clean.shape}")
+
+        keep_mask = correction_weight > 0.0
+        Z_keep = Z_clean[keep_mask]
+        y_keep = y_clean[keep_mask]
+        w_keep = correction_weight[keep_mask]
+
+        logger.info(f"Augmenting feature dataset: {len(Z_keep)} clean samples retained")
+
+        augmentation_mode = getattr(self.config, 'AUGMENTATION_MODE', 'weighted')
+        if augmentation_mode == 'fixed':
+            fixed_multiplier = int(getattr(self.config, 'STAGE2_FEATURE_AUG_MULTIPLIER', 5))
+            multipliers = np.full(len(w_keep), fixed_multiplier, dtype=int)
+            logger.info(f"Using fixed augmentation mode: {fixed_multiplier}x for all samples")
+        else:
+            tier1_min_w = float(getattr(self.config, 'STAGE2_FEATURE_TIER1_MIN_WEIGHT', 0.9))
+            tier1_mult = int(getattr(self.config, 'STAGE2_FEATURE_TIER1_MULTIPLIER', 10))
+            tier2_min_w = float(getattr(self.config, 'STAGE2_FEATURE_TIER2_MIN_WEIGHT', 0.7))
+            tier2_mult = int(getattr(self.config, 'STAGE2_FEATURE_TIER2_MULTIPLIER', 5))
+            low_mult = int(getattr(self.config, 'STAGE2_FEATURE_LOWCONF_MULTIPLIER', 0))
+
+            def compute_augmentation_multiplier(weight):
+                if weight >= tier1_min_w:
+                    return tier1_mult
+                if weight >= tier2_min_w:
+                    return tier2_mult
+                return low_mult
+            multipliers = np.array([compute_augmentation_multiplier(w) for w in w_keep], dtype=int)
+            logger.info(f"Using weighted augmentation mode")
+
+        unique_mults, counts = np.unique(multipliers, return_counts=True)
+        logger.info("Feature augmentation multiplier distribution:")
+        for mult, count in zip(unique_mults, counts):
+            logger.info(f"  {mult}x: {count} samples ({100*count/len(multipliers):.1f}%)")
+
+        Z_synthetic_list = []
+        y_synthetic_list = []
+        w_synthetic_list = []
+
+        use_weighted_sampling = bool(getattr(self.config, 'AUGMENT_USE_WEIGHTED_SAMPLING', True))
+
+        for class_label in np.unique(y_keep):
+            class_mask = y_keep == class_label
+            Z_class = Z_keep[class_mask]
+            mult_class = multipliers[class_mask]
+            w_class = w_keep[class_mask]
+
+            min_w_template = float(getattr(self.config, 'AUGMENT_TEMPLATE_MIN_WEIGHT', 0.5))
+            min_w_template_hard = float(getattr(self.config, 'AUGMENT_TEMPLATE_MIN_WEIGHT_HARD', 0.2))
+            template_mask = w_class >= min_w_template
+            if template_mask.sum() == 0:
+                template_mask = w_class >= min_w_template_hard
+            if template_mask.sum() == 0:
+                template_mask = np.ones_like(w_class, dtype=bool)
+
+            Z_templates_pool = Z_class[template_mask]
+            w_templates_pool = w_class[template_mask]
+            mult_templates_pool = mult_class[template_mask]
+            n_generate = int(mult_templates_pool.sum())
+            if n_generate <= 0:
+                continue
+
+            if use_weighted_sampling:
+                p = w_templates_pool.astype(np.float64)
+                p_sum = float(p.sum())
+                if p_sum <= 0:
+                    p = np.ones_like(p, dtype=np.float64) / max(len(p), 1)
+                else:
+                    p = p / p_sum
+                idx = np.random.choice(len(Z_templates_pool), size=n_generate, replace=True, p=p)
+                w_templates = w_templates_pool[idx]
+            else:
+                w_templates = np.repeat(w_templates_pool, repeats=mult_templates_pool, axis=0)
+            n_generate = int(w_templates.shape[0])
+
+            guidance_scale = self.config.GUIDANCE_MALICIOUS if int(class_label) == 1 else self.config.GUIDANCE_BENIGN
+            logger.info(f"Generating {n_generate} synthetic feature samples for class {class_label} (guidance={guidance_scale})")
+
+            y_tensor = torch.full((n_generate,), int(class_label), dtype=torch.long, device=device)
+            Z_generated = []
+            batch_size = 4096
+            for i in range(0, n_generate, batch_size):
+                end_i = min(i + batch_size, n_generate)
+                batch_y = y_tensor[i:end_i]
+                batch_generated = self.sample(
+                    n_samples=len(batch_y),
+                    y=batch_y,
+                    x_cond=None,
+                    guidance_scale=guidance_scale,
+                    device=device
+                )
+                Z_generated.append(batch_generated.detach().cpu().numpy().astype(np.float32))
+            Z_generated = np.concatenate(Z_generated, axis=0)
+
+            Z_synthetic_list.append(Z_generated)
+            y_synthetic_list.append(np.full(n_generate, int(class_label), dtype=int))
+            w_synthetic_list.append(w_templates.astype(np.float32))
+
+        if len(Z_synthetic_list) == 0:
+            logger.info("No synthetic feature samples generated; returning original features")
+            return Z_keep, y_keep, w_keep
+
+        Z_synth = np.concatenate(Z_synthetic_list, axis=0)
+        y_synth = np.concatenate(y_synthetic_list, axis=0)
+        w_synth = np.concatenate(w_synthetic_list, axis=0)
+
+        Z_aug = np.concatenate([Z_keep, Z_synth], axis=0)
+        y_aug = np.concatenate([y_keep, y_synth], axis=0)
+        w_aug = np.concatenate([w_keep, w_synth], axis=0)
+
+        return Z_aug, y_aug, w_aug
 
     def augment_dataset(self, X_clean, y_clean, action_mask, correction_weight,
                         density_scores, cl_confidence, knn_confidence,

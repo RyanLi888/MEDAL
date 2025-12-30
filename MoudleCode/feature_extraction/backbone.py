@@ -125,7 +125,16 @@ class MicroBiMambaBackbone(nn.Module):
         self.projection = nn.Linear(config.MODEL_DIM * 2, self.output_dim)
         
         # Decoder for SimMTM (pre-training only)
-        self.decoder = nn.Linear(self.output_dim, config.INPUT_FEATURE_DIM)
+        use_mlp_decoder = bool(getattr(config, 'SIMMTM_DECODER_USE_MLP', False))
+        decoder_hidden_dim = int(getattr(config, 'SIMMTM_DECODER_HIDDEN_DIM', 64))
+        if use_mlp_decoder:
+            self.decoder = nn.Sequential(
+                nn.Linear(self.output_dim, decoder_hidden_dim),
+                nn.GELU(),
+                nn.Linear(decoder_hidden_dim, config.INPUT_FEATURE_DIM),
+            )
+        else:
+            self.decoder = nn.Linear(self.output_dim, config.INPUT_FEATURE_DIM)
         
         self.frozen = False
     

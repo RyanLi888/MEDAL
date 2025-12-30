@@ -99,7 +99,18 @@ class Config:
     PRETRAIN_ES_MIN_DELTA = 0.005  # 从 0.01 降低到 0.005，更敏感的改进检测
     
     # SimMTM parameters
-    SIMMTM_MASK_RATE = 0.5  # 50% masking
+    SIMMTM_MASK_RATE = float(os.environ.get('MEDAL_SIMMTM_MASK_RATE', 0.5))  # 50% masking
+
+    AUG_CROP_PROB = float(os.environ.get('MEDAL_AUG_CROP_PROB', 0.8))
+    AUG_JITTER_PROB = float(os.environ.get('MEDAL_AUG_JITTER_PROB', 0.6))
+    AUG_CHANNEL_MASK_PROB = float(os.environ.get('MEDAL_AUG_CHANNEL_MASK_PROB', 0.5))
+    AUG_CROP_MIN_RATIO = float(os.environ.get('MEDAL_AUG_CROP_MIN_RATIO', 0.5))
+    AUG_CROP_MAX_RATIO = float(os.environ.get('MEDAL_AUG_CROP_MAX_RATIO', 0.9))
+    AUG_JITTER_STD = float(os.environ.get('MEDAL_AUG_JITTER_STD', 0.1))
+    AUG_CHANNEL_MASK_RATIO = float(os.environ.get('MEDAL_AUG_CHANNEL_MASK_RATIO', 0.15))
+
+    SIMMTM_DECODER_USE_MLP = bool(int(os.environ.get('MEDAL_SIMMTM_DECODER_USE_MLP', 0)))
+    SIMMTM_DECODER_HIDDEN_DIM = int(os.environ.get('MEDAL_SIMMTM_DECODER_HIDDEN_DIM', 64))
     
     # SupCon parameters (Legacy - 保留兼容性)
     SUPCON_TEMPERATURE = 0.1
@@ -152,6 +163,64 @@ class Config:
     
     # ==================== Data Augmentation (Stage 2) ====================
     # TabDDPM parameters
+    STAGE2_USE_TABDDPM = True
+    _env_stage2_tabddpm = os.environ.get('MEDAL_STAGE2_USE_TABDDPM', '').strip().lower()
+    if _env_stage2_tabddpm in ('0', 'false', 'no', 'n', 'off'):
+        STAGE2_USE_TABDDPM = False
+    elif _env_stage2_tabddpm in ('1', 'true', 'yes', 'y', 'on'):
+        STAGE2_USE_TABDDPM = True
+
+    # TabDDPM training space: 'raw' (sequence/packet-level, legacy) or 'feature' (backbone feature space)
+    STAGE2_TABDDPM_SPACE = str(os.environ.get('MEDAL_STAGE2_TABDDPM_SPACE', 'raw')).strip().lower()
+    if STAGE2_TABDDPM_SPACE not in ('raw', 'feature'):
+        STAGE2_TABDDPM_SPACE = 'raw'
+
+    STAGE2_FEATURE_AUG_MULTIPLIER = 5
+    _env_stage2_feat_mult = os.environ.get('MEDAL_STAGE2_FEATURE_AUG_MULTIPLIER', '').strip()
+    if _env_stage2_feat_mult:
+        try:
+            STAGE2_FEATURE_AUG_MULTIPLIER = int(float(_env_stage2_feat_mult))
+        except ValueError:
+            pass
+
+    STAGE2_FEATURE_TIER1_MIN_WEIGHT = 0.9
+    _env_stage2_feat_t1 = os.environ.get('MEDAL_STAGE2_FEATURE_TIER1_MIN_WEIGHT', '').strip()
+    if _env_stage2_feat_t1:
+        try:
+            STAGE2_FEATURE_TIER1_MIN_WEIGHT = float(_env_stage2_feat_t1)
+        except ValueError:
+            pass
+    STAGE2_FEATURE_TIER1_MULTIPLIER = 10
+    _env_stage2_feat_t1m = os.environ.get('MEDAL_STAGE2_FEATURE_TIER1_MULTIPLIER', '').strip()
+    if _env_stage2_feat_t1m:
+        try:
+            STAGE2_FEATURE_TIER1_MULTIPLIER = int(float(_env_stage2_feat_t1m))
+        except ValueError:
+            pass
+
+    STAGE2_FEATURE_TIER2_MIN_WEIGHT = 0.7
+    _env_stage2_feat_t2 = os.environ.get('MEDAL_STAGE2_FEATURE_TIER2_MIN_WEIGHT', '').strip()
+    if _env_stage2_feat_t2:
+        try:
+            STAGE2_FEATURE_TIER2_MIN_WEIGHT = float(_env_stage2_feat_t2)
+        except ValueError:
+            pass
+    STAGE2_FEATURE_TIER2_MULTIPLIER = 5
+    _env_stage2_feat_t2m = os.environ.get('MEDAL_STAGE2_FEATURE_TIER2_MULTIPLIER', '').strip()
+    if _env_stage2_feat_t2m:
+        try:
+            STAGE2_FEATURE_TIER2_MULTIPLIER = int(float(_env_stage2_feat_t2m))
+        except ValueError:
+            pass
+
+    STAGE2_FEATURE_LOWCONF_MULTIPLIER = 0
+    _env_stage2_feat_lowm = os.environ.get('MEDAL_STAGE2_FEATURE_LOWCONF_MULTIPLIER', '').strip()
+    if _env_stage2_feat_lowm:
+        try:
+            STAGE2_FEATURE_LOWCONF_MULTIPLIER = int(float(_env_stage2_feat_lowm))
+        except ValueError:
+            pass
+
     DDPM_EPOCHS = 300
     DDPM_EARLY_STOPPING = True
     DDPM_ES_WARMUP_EPOCHS = 20
@@ -250,6 +319,37 @@ class Config:
         STAGE3_ONLINE_AUGMENTATION = True
     elif _env_stage3_aug in ('0', 'false', 'no', 'n', 'off'):
         STAGE3_ONLINE_AUGMENTATION = False
+
+    STAGE3_MIXED_STREAM = False
+    _env_stage3_mixed = os.environ.get('MEDAL_STAGE3_MIXED_STREAM', '').strip().lower()
+    if _env_stage3_mixed in ('1', 'true', 'yes', 'y', 'on'):
+        STAGE3_MIXED_STREAM = True
+    elif _env_stage3_mixed in ('0', 'false', 'no', 'n', 'off'):
+        STAGE3_MIXED_STREAM = False
+
+    STAGE3_MIXED_REAL_BATCH_SIZE = 32
+    _env_mixed_real_bs = os.environ.get('MEDAL_STAGE3_MIXED_REAL_BATCH_SIZE', '').strip()
+    if _env_mixed_real_bs:
+        try:
+            STAGE3_MIXED_REAL_BATCH_SIZE = int(float(_env_mixed_real_bs))
+        except ValueError:
+            pass
+
+    STAGE3_MIXED_SYN_BATCH_SIZE = 256
+    _env_mixed_syn_bs = os.environ.get('MEDAL_STAGE3_MIXED_SYN_BATCH_SIZE', '').strip()
+    if _env_mixed_syn_bs:
+        try:
+            STAGE3_MIXED_SYN_BATCH_SIZE = int(float(_env_mixed_syn_bs))
+        except ValueError:
+            pass
+
+    STAGE3_MIXED_REAL_LOSS_SCALE = 1.0
+    _env_mixed_real_scale = os.environ.get('MEDAL_STAGE3_MIXED_REAL_LOSS_SCALE', '').strip()
+    if _env_mixed_real_scale:
+        try:
+            STAGE3_MIXED_REAL_LOSS_SCALE = float(_env_mixed_real_scale)
+        except ValueError:
+            pass
     
     # Stage 3: ST-Mixup (Spatio-Temporal Mixup) 增强
     # 渐进式类内混合，增强决策边界鲁棒性
@@ -470,6 +570,25 @@ class Config:
     # 只有高质量样本才能作为生成模板，避免低质量样本污染合成数据
     AUGMENT_TEMPLATE_MIN_WEIGHT = 0.7   # 从 0.5 提高到 0.7，只用高质量样本
     AUGMENT_TEMPLATE_MIN_WEIGHT_HARD = 0.5  # 从 0.2 提高到 0.5，硬门槛也提高
+
+    # ==================== Label Correction (HybridCourt) ====================
+    HYBRIDCOURT_DYNAMIC_DENSITY_THRESHOLDS = False
+    _env_hc_dyn = os.environ.get('MEDAL_HYBRIDCOURT_DYNAMIC_DENSITY_THRESHOLDS', '').strip().lower()
+    if _env_hc_dyn in ('1', 'true', 'yes', 'y', 'on'):
+        HYBRIDCOURT_DYNAMIC_DENSITY_THRESHOLDS = True
+    elif _env_hc_dyn in ('0', 'false', 'no', 'n', 'off'):
+        HYBRIDCOURT_DYNAMIC_DENSITY_THRESHOLDS = False
+
+    HYBRIDCOURT_DENSITY_HIGH_PCT = float(os.environ.get('MEDAL_HYBRIDCOURT_DENSITY_HIGH_PCT', 90))
+    HYBRIDCOURT_DENSITY_LOW_PCT = float(os.environ.get('MEDAL_HYBRIDCOURT_DENSITY_LOW_PCT', 50))
+
+    # ==================== Classifier Input ====================
+    CLASSIFIER_INPUT_IS_FEATURES = False
+    _env_cls_feat = os.environ.get('MEDAL_CLASSIFIER_INPUT_IS_FEATURES', '').strip().lower()
+    if _env_cls_feat in ('1', 'true', 'yes', 'y', 'on'):
+        CLASSIFIER_INPUT_IS_FEATURES = True
+    elif _env_cls_feat in ('0', 'false', 'no', 'n', 'off'):
+        CLASSIFIER_INPUT_IS_FEATURES = False
     
     # ==================== Hardware & Training ====================
     GPU_ID = int(os.environ.get('MEDAL_GPU_ID', '7'))  # 默认使用GPU 7

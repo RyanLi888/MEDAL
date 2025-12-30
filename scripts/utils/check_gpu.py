@@ -124,8 +124,12 @@ def show_training_estimate():
     print("\n" + "="*60)
     print("训练时间估算 (基于实际数据量，流数在处理时统计)")
     print("="*60)
-    
-    import torch
+
+    try:
+        import torch
+    except ImportError:
+        print("\n⚠️  无法估算训练时间：PyTorch未安装")
+        return
     
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)

@@ -78,6 +78,11 @@ class DualStreamMLP(nn.Module):
                 logits_avg: (B, 2)
         """
         # 关键改进：先对输入特征进行BatchNorm
+        # 防御性处理：如果误传入 (B, L, D)，先做 mean pooling 回到 (B, D)
+        if z.dim() == 3:
+            z = z.mean(dim=1)
+        if z.dim() != 2:
+            raise ValueError(f"DualStreamMLP expects z of shape (B, D) (or (B, L, D)), got {tuple(z.shape)}")
         z = self.bn_input(z)
         
         logits_a = self.mlp_a(z)
@@ -501,12 +506,17 @@ class MEDAL_Classifier(nn.Module):
             logits: (B, 2) or ((B, 2), (B, 2)) if return_separate
             z: (B, 64) if return_features
         """
+        input_is_features = bool(getattr(self.config, 'CLASSIFIER_INPUT_IS_FEATURES', False))
+
         # Extract features
-        if getattr(self.config, 'FINETUNE_BACKBONE', False):
-            z = self.backbone(x, return_sequence=False)
+        if input_is_features or (isinstance(x, torch.Tensor) and x.dim() == 2):
+            z = x
         else:
-            with torch.no_grad():
+            if getattr(self.config, 'FINETUNE_BACKBONE', False):
                 z = self.backbone(x, return_sequence=False)
+            else:
+                with torch.no_grad():
+                    z = self.backbone(x, return_sequence=False)
         
         # Classification
         if return_separate or self.training:

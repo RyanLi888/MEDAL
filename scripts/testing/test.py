@@ -15,6 +15,8 @@ from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 import argparse
 from datetime import datetime
+import json
+import csv
 
 from sklearn.metrics import precision_score, recall_score, f1_score
 
@@ -221,6 +223,81 @@ def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
     return metrics
 
 
+def _infer_family_from_filename(filename: str) -> str:
+    name = str(filename).lower()
+    if 'dnscat' in name or 'dnscat2' in name:
+        return 'dnscat2'
+    if 'iodine' in name:
+        return 'iodine'
+    if 'dohbrw' in name or 'doh' in name:
+        return 'doh'
+    return 'unknown'
+
+
+def _export_family_breakdown(save_prefix: str, y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, test_files, config, logger):
+    if test_files is None:
+        return
+
+    if len(test_files) != len(y_true):
+        logger.warning(f"⚠ test_files 长度({len(test_files)})与样本数({len(y_true)})不一致，跳过分组评估")
+        return
+
+    families = np.array([_infer_family_from_filename(f) for f in test_files], dtype=object)
+    unique_families = sorted(set(families.tolist()))
+
+    rows = []
+    for fam in unique_families:
+        idx = families == fam
+        n = int(idx.sum())
+        if n <= 0:
+            continue
+        y_t = y_true[idx]
+        y_p = y_pred[idx]
+        y_pb = y_prob[idx]
+
+        p = precision_score(y_t, y_p, pos_label=1, zero_division=0)
+        r = recall_score(y_t, y_p, pos_label=1, zero_division=0)
+        f1 = f1_score(y_t, y_p, pos_label=1, zero_division=0)
+        acc = float((y_t == y_p).mean()) if n > 0 else 0.0
+
+        rows.append({
+            'family': fam,
+            'n_samples': n,
+            'n_benign': int((y_t == 0).sum()),
+            'n_malicious': int((y_t == 1).sum()),
+            'accuracy': float(acc),
+            'precision_pos': float(p),
+            'recall_pos': float(r),
+            'f1_pos': float(f1),
+        })
+
+    if not rows:
+        return
+
+    models_dir = os.path.join(config.RESULT_DIR, 'models')
+    os.makedirs(models_dir, exist_ok=True)
+
+    csv_path = os.path.join(models_dir, f'{save_prefix}_family_metrics.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    json_path = os.path.join(models_dir, f'{save_prefix}_family_report.json')
+    payload = {
+        'save_prefix': save_prefix,
+        'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'family_metrics': rows,
+    }
+    with open(json_path, 'w') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    logger.info("")
+    logger.info("📁 分组评估输出:")
+    logger.info(f"  ✓ CSV:  {csv_path}")
+    logger.info(f"  ✓ JSON: {json_path}")
+
+
 def main(args):
     """Main testing function"""
     
@@ -391,6 +468,15 @@ def main(args):
         
         # Test single model
         metrics = test_model(classifier, X_test, y_test, config, logger)
+        try:
+            results_path = os.path.join(config.RESULT_DIR, 'models', 'test_predictions.npz')
+            npz = np.load(results_path, allow_pickle=True)
+            y_true = npz['y_true']
+            y_pred = npz['y_pred']
+            y_prob = npz['y_prob']
+            _export_family_breakdown('test', y_true, y_pred, y_prob, test_files, config, logger)
+        except Exception as e:
+            logger.warning(f"⚠ 分组评估导出失败: {e}")
         
         logger.info("")
         logger.info("="*70)
@@ -451,6 +537,15 @@ def main(args):
         # Test model with specific save prefix
         save_prefix = "test_best" if model_name == "Best F1" else "test_final"
         metrics = test_model(classifier, X_test, y_test, config, logger, save_prefix=save_prefix)
+        try:
+            results_path = os.path.join(config.RESULT_DIR, 'models', f'{save_prefix}_predictions.npz')
+            npz = np.load(results_path, allow_pickle=True)
+            y_true = npz['y_true']
+            y_pred = npz['y_pred']
+            y_prob = npz['y_prob']
+            _export_family_breakdown(save_prefix, y_true, y_pred, y_prob, test_files, config, logger)
+        except Exception as e:
+            logger.warning(f"⚠ 分组评估导出失败: {e}")
         all_metrics[model_name] = metrics
         
         logger.info("")

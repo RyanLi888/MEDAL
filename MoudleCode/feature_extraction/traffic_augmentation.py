@@ -28,19 +28,19 @@ class TrafficAugmentation:
         self.seq_len = config.SEQUENCE_LENGTH  # 1024
         
         # 增强策略的概率
-        self.crop_prob = 0.8  # 80%概率进行裁剪
-        self.jitter_prob = 0.6  # 60%概率进行抖动
-        self.mask_prob = 0.5  # 50%概率进行掩码
+        self.crop_prob = float(getattr(config, 'AUG_CROP_PROB', 0.8))
+        self.jitter_prob = float(getattr(config, 'AUG_JITTER_PROB', 0.6))
+        self.mask_prob = float(getattr(config, 'AUG_CHANNEL_MASK_PROB', 0.5))
         
         # 裁剪参数
-        self.crop_min_ratio = 0.5  # 最小裁剪比例（保留50%）
-        self.crop_max_ratio = 0.9  # 最大裁剪比例（保留90%）
+        self.crop_min_ratio = float(getattr(config, 'AUG_CROP_MIN_RATIO', 0.5))
+        self.crop_max_ratio = float(getattr(config, 'AUG_CROP_MAX_RATIO', 0.9))
         
         # 抖动参数（针对Log-IAT维度）
-        self.jitter_std = 0.1  # 高斯噪声标准差
+        self.jitter_std = float(getattr(config, 'AUG_JITTER_STD', 0.1))
         
         # 掩码参数
-        self.mask_ratio = 0.15  # 掩码比例
+        self.mask_ratio = float(getattr(config, 'AUG_CHANNEL_MASK_RATIO', 0.15))
         
     def __call__(self, x):
         """

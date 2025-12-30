@@ -175,14 +175,21 @@ else
 fi
 
 # Check if virtual environment exists and activate it
-if [ -d "$HOME/anaconda3/envs/RAPIER" ]; then
-    print_message "$GREEN" "激活conda环境: RAPIER"
-    source "$HOME/anaconda3/bin/activate" RAPIER
+# If user already activated a conda env (e.g. MEDAL), do not switch env implicitly.
+if [ -n "${CONDA_DEFAULT_ENV:-}" ]; then
+    print_message "$GREEN" "检测到当前已激活 conda 环境: ${CONDA_DEFAULT_ENV}"
+    print_message "$GREEN" "将继续使用当前环境，不再自动切换到 RAPIER/medal"
     echo ""
-elif [ -d "$HOME/anaconda3/envs/medal" ]; then
-    print_message "$GREEN" "激活conda环境: medal"
-    source "$HOME/anaconda3/bin/activate" medal
-    echo ""
+else
+    if [ -d "$HOME/anaconda3/envs/RAPIER" ]; then
+        print_message "$GREEN" "激活conda环境: RAPIER"
+        source "$HOME/anaconda3/bin/activate" RAPIER
+        echo ""
+    elif [ -d "$HOME/anaconda3/envs/medal" ]; then
+        print_message "$GREEN" "激活conda环境: medal"
+        source "$HOME/anaconda3/bin/activate" medal
+        echo ""
+    fi
 fi
 
 # Convert noise rates to array

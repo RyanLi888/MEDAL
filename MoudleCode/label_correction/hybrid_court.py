@@ -11,6 +11,7 @@ Hybrid Court: Label Noise Correction Module v11
 import numpy as np
 import torch
 import torch.nn as nn
+import copy
 from sklearn.model_selection import KFold
 from sklearn.neighbors import NearestNeighbors
 from sklearn.linear_model import LogisticRegression
@@ -300,7 +301,36 @@ class HybridCourt:
             k=config.KNN_NEIGHBORS,
             metric=getattr(config, 'KNN_METRIC', 'euclidean')
         )
-        self.tier_config = TIER_CONFIG.copy()
+        self.tier_config = copy.deepcopy(TIER_CONFIG)
+
+    def _maybe_update_density_thresholds(self, density_scores: np.ndarray):
+        if density_scores is None or len(density_scores) == 0:
+            return
+
+        enabled = bool(getattr(self.config, 'HYBRIDCOURT_DYNAMIC_DENSITY_THRESHOLDS', False))
+        if not enabled:
+            return
+
+        high_pct = float(getattr(self.config, 'HYBRIDCOURT_DENSITY_HIGH_PCT', 90.0))
+        low_pct = float(getattr(self.config, 'HYBRIDCOURT_DENSITY_LOW_PCT', 50.0))
+        high_pct = float(np.clip(high_pct, 0.0, 100.0))
+        low_pct = float(np.clip(low_pct, 0.0, 100.0))
+        if low_pct > high_pct:
+            low_pct, high_pct = high_pct, low_pct
+
+        low_th = float(np.percentile(density_scores, low_pct))
+        high_th = float(np.percentile(density_scores, high_pct))
+
+        dd = self.tier_config['PHASE1_THRESHOLDS']['DENSITY_DEFENSE']
+        dd['HIGH_DENSITY']['threshold'] = high_th
+        dd['MID_DENSITY']['threshold_min'] = low_th
+        dd['MID_DENSITY']['threshold_max'] = high_th
+        dd['LOW_DENSITY']['threshold'] = low_th
+
+        logger.info(
+            "[HybridCourt] 动态密度阈值已启用: "
+            f"LOW<{low_th:.4f} (pct={low_pct}), HIGH>{high_th:.4f} (pct={high_pct})"
+        )
 
     def correct_labels(self, features, noisy_labels, device='cpu', y_true=None):
         """三阶段标签矫正 (严格版)"""
@@ -338,6 +368,7 @@ class HybridCourt:
         suspected_noise, pred_labels, pred_probs = self.cl.fit_predict(features, noisy_labels)
         self.made.fit(features, device=device)
         is_dense, density_scores = self.made.predict_density(features, device=device)
+        self._maybe_update_density_thresholds(density_scores)
         self.knn.fit(features)
         neighbor_labels, neighbor_consistency = self.knn.predict_semantic_label(features, noisy_labels)
         

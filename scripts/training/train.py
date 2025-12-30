@@ -717,122 +717,265 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
     density_clean = density_scores[keep_mask]
     cl_conf_clean = cl_confidence[keep_mask]
     knn_conf_clean = neighbor_consistency[keep_mask]
-    
-    # Data augmentation with TabDDPM
-    logger.info("")
-    logger.info("步骤 2.2: TabDDPM 数据增强模型训练")
-    logger.info(f"  目标: 学习流量特征分布，生成符合协议逻辑的合成样本")
-    ddpm_epochs = int(getattr(config, 'DDPM_EPOCHS', 100))
-    logger.info(f"  训练轮数: {ddpm_epochs} epochs")
-    logger.info(f"  引导策略: 恶意样本(w={config.GUIDANCE_MALICIOUS}), 良性样本(w={config.GUIDANCE_BENIGN})")
-    logger.info("  开始训练...")
-    
-    tabddpm = TabDDPM(config).to(config.DEVICE)
 
-    # Fit scaler on packet-level features (exclude zero-padding packets)
-    X_packets_all = X_clean.reshape(-1, X_clean.shape[-1])
-    vm_idx = getattr(config, 'VALID_MASK_INDEX', None)
-    if vm_idx is not None and int(vm_idx) >= 0 and int(vm_idx) < X_packets_all.shape[1]:
-        packet_mask = X_packets_all[:, int(vm_idx)] > 0.5
+    # Save kept real sequences for Stage 3 mixed-stream training (feature-mode)
+    try:
+        real_kept_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "real_kept_data.npz")
+        np.savez(
+            real_kept_path,
+            X_real=X_clean,
+            y_real=y_clean,
+            sample_weights_real=weights_clean
+        )
+        logger.info(f"  ✓ 已保存 Stage3 双流训练所需真实序列: {real_kept_path}")
+    except Exception as e:
+        logger.warning(f"⚠ 无法保存 real_kept_data.npz（Stage3 双流训练可能不可用）: {e}")
+    
+    stage2_use_tabddpm = bool(getattr(config, 'STAGE2_USE_TABDDPM', True))
+    stage2_tabddpm_space = str(getattr(config, 'STAGE2_TABDDPM_SPACE', 'raw')).lower()
+    if stage2_tabddpm_space not in ('raw', 'feature'):
+        stage2_tabddpm_space = 'raw'
+
+    if not stage2_use_tabddpm:
+        logger.info("")
+        logger.info("步骤 2.2: TabDDPM 数据增强（已跳过）")
+        logger.info("  说明: 当前配置已禁用 Stage2 TabDDPM，以避免 packet-level 生成破坏时序结构")
+        logger.info("  将直接使用标签矫正后的干净样本进入 Stage 3（可配合 ST-Mixup / 采样策略进行在线增强）")
+
+        X_augmented = X_clean
+        y_augmented = y_clean
+        sample_weights = weights_clean
+    elif stage2_tabddpm_space == 'feature':
+        logger.info("")
+        logger.info("步骤 2.2: TabDDPM 数据增强 (Feature Space)")
+        logger.info("  目标: 在骨干网络特征空间中训练/生成，避免破坏时序结构")
+
+        Z_clean = features[keep_mask]
+
+        tabddpm = TabDDPM(
+            config,
+            input_dim=Z_clean.shape[1],
+            cond_indices=[],
+            dep_indices=list(range(Z_clean.shape[1])),
+            enable_protocol_constraints=False
+        ).to(config.DEVICE)
+
+        tabddpm.fit_scaler(Z_clean)
+
+        optimizer_ddpm = optim.AdamW(tabddpm.parameters(), lr=1e-4)
+        n_epochs_ddpm = int(getattr(config, 'DDPM_EPOCHS', 100))
+        ddpm_use_early_stopping = bool(getattr(config, 'DDPM_EARLY_STOPPING', True))
+        ddpm_es_warmup_epochs = int(getattr(config, 'DDPM_ES_WARMUP_EPOCHS', 20))
+        ddpm_es_patience = int(getattr(config, 'DDPM_ES_PATIENCE', 30))
+        ddpm_es_min_delta = float(getattr(config, 'DDPM_ES_MIN_DELTA', 0.001))
+
+        dataset_ddpm = TensorDataset(
+            torch.FloatTensor(Z_clean),
+            torch.LongTensor(y_clean)
+        )
+        loader_ddpm = DataLoader(dataset_ddpm, batch_size=2048, shuffle=True)
+
+        ddpm_best_loss = float('inf')
+        ddpm_best_epoch = -1
+        ddpm_best_state = None
+        ddpm_no_improve = 0
+
+        tabddpm.train()
+        for epoch in range(n_epochs_ddpm):
+            epoch_loss = 0.0
+            for Z_batch, y_batch in loader_ddpm:
+                z_0 = Z_batch.to(config.DEVICE)
+                y_batch = y_batch.to(config.DEVICE)
+                optimizer_ddpm.zero_grad()
+                loss = tabddpm.compute_loss(
+                    z_0, y_batch,
+                    mask_prob=float(getattr(config, 'MASK_PROBABILITY', 0.5)),
+                    mask_lambda=float(getattr(config, 'MASK_LAMBDA', 0.1)),
+                    p_uncond=0.2
+                )
+                loss.backward()
+                optimizer_ddpm.step()
+                epoch_loss += float(loss.item())
+
+            avg_loss = epoch_loss / max(len(loader_ddpm), 1)
+            logger.info(f"[TabDDPM-Feature] Epoch [{epoch+1}/{n_epochs_ddpm}] | Loss: {avg_loss:.4f}")
+
+            improved = (ddpm_best_loss - float(avg_loss)) > ddpm_es_min_delta
+            if improved:
+                ddpm_best_loss = float(avg_loss)
+                ddpm_best_epoch = int(epoch + 1)
+                ddpm_best_state = {k: v.detach().cpu().clone() for k, v in tabddpm.state_dict().items()}
+                ddpm_no_improve = 0
+            else:
+                ddpm_no_improve += 1
+
+            if ddpm_use_early_stopping and (epoch + 1) >= ddpm_es_warmup_epochs and ddpm_no_improve >= ddpm_es_patience:
+                logger.info(
+                    f"[TabDDPM-Feature] EarlyStopping at epoch {epoch+1}: best_loss={ddpm_best_loss:.4f} (epoch {ddpm_best_epoch})"
+                )
+                break
+
+        if ddpm_best_state is not None:
+            tabddpm.load_state_dict(ddpm_best_state)
+            tabddpm.to(config.DEVICE)
+
+        logger.info("步骤 2.3: 生成增强特征")
+        Z_augmented, y_augmented, sample_weights = tabddpm.augment_feature_dataset(
+            Z_clean, y_clean, weights_clean
+        )
+
+        n_train_original = int(Z_clean.shape[0])
+        n_synthetic = int(Z_augmented.shape[0] - n_train_original)
+        logger.info(f"✓ 特征增强完成: 从 {n_train_original} 增强到 {len(Z_augmented)} (合成={n_synthetic})")
+
+        # Save TabDDPM model
+        tabddpm_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "tabddpm_feature.pth")
+        torch.save(tabddpm.state_dict(), tabddpm_path)
+        logger.info(f"  ✓ TabDDPM(Feature)模型: {tabddpm_path}")
+
+        # Save augmented features
+        augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_features.npz")
+        is_original_mask = np.zeros(len(Z_augmented), dtype=bool)
+        is_original_mask[:n_train_original] = True
+        np.savez(
+            augmented_data_path,
+            Z_augmented=Z_augmented,
+            y_augmented=y_augmented,
+            is_original=is_original_mask,
+            n_original=n_train_original,
+            sample_weights=sample_weights
+        )
+        logger.info(f"  ✓ 增强特征: {augmented_data_path}")
+
+        # Feature space quality visualization
+        from MoudleCode.utils.visualization import plot_feature_space
+        feature_cmp_path = os.path.join(config.DATA_AUGMENTATION_DIR, "figures", "real_vs_synthetic_features_tsne.png")
+        plot_feature_space(
+            np.concatenate([Z_augmented[:n_train_original], Z_augmented[n_train_original:]], axis=0),
+            np.concatenate([y_augmented[:n_train_original], y_augmented[n_train_original:]], axis=0),
+            feature_cmp_path,
+            title="TabDDPM Feature Generation: Real + Synthetic",
+            method='tsne'
+        )
+        logger.info(f"  ✓ t-SNE对比图(Feature): {feature_cmp_path}")
+
+        return Z_augmented, y_augmented, sample_weights, correction_stats, tabddpm, n_train_original
     else:
-        packet_mask = np.any(X_packets_all != 0.0, axis=1)
-    X_packets_valid = X_packets_all[packet_mask]
-    if X_packets_valid.shape[0] == 0:
-        X_packets_valid = X_packets_all
-        packet_mask = None
-    tabddpm.fit_scaler(X_packets_valid)
-    
-    # Train TabDDPM
-    optimizer_ddpm = optim.AdamW(tabddpm.parameters(), lr=1e-4)
-    n_epochs_ddpm = ddpm_epochs
-	
-    ddpm_use_early_stopping = bool(getattr(config, 'DDPM_EARLY_STOPPING', True))
-    ddpm_es_warmup_epochs = int(getattr(config, 'DDPM_ES_WARMUP_EPOCHS', 20))
-    ddpm_es_patience = int(getattr(config, 'DDPM_ES_PATIENCE', 30))
-    ddpm_es_min_delta = float(getattr(config, 'DDPM_ES_MIN_DELTA', 0.001))
-	
-    ddpm_best_loss = float('inf')
-    ddpm_best_epoch = -1
-    ddpm_best_state = None
-    ddpm_no_improve = 0
-    
-    # 使用 packet-level 数据训练 TabDDPM（避免只看第一个包导致分布偏移）
-    # 同时过滤掉 padding=0 的无效包，避免模型学到大量“全零包”导致 Length/IAT/BurstSize 分布漂移
-    X_packets = X_packets_valid  # (n_valid, D)
-    y_packets_all = np.repeat(y_clean, X_clean.shape[1])    # (N*L,)
-    y_packets = y_packets_all[packet_mask] if packet_mask is not None else y_packets_all
-    dataset_ddpm = TensorDataset(
-        torch.FloatTensor(X_packets),
-        torch.LongTensor(y_packets)
-    )
-    loader_ddpm = DataLoader(dataset_ddpm, batch_size=2048, shuffle=True)
-    
-    tabddpm.train()
-    for epoch in range(n_epochs_ddpm):
-        epoch_loss = 0.0
-        for X_batch, y_batch in loader_ddpm:
-            x_0 = X_batch.to(config.DEVICE)  # (B, D)
-            y_batch = y_batch.to(config.DEVICE)
-            
-            optimizer_ddpm.zero_grad()
-            loss = tabddpm.compute_loss(
-                x_0, y_batch,
-                mask_prob=config.MASK_PROBABILITY,
-                mask_lambda=config.MASK_LAMBDA,
-                p_uncond=0.2  # Classifier-free guidance training
-            )
-            loss.backward()
-            optimizer_ddpm.step()
-            
-            epoch_loss += loss.item()
+        # Data augmentation with TabDDPM
+        logger.info("")
+        logger.info("步骤 2.2: TabDDPM 数据增强模型训练")
+        logger.info(f"  目标: 学习流量特征分布，生成符合协议逻辑的合成样本")
+        ddpm_epochs = int(getattr(config, 'DDPM_EPOCHS', 100))
+        logger.info(f"  训练轮数: {ddpm_epochs} epochs")
+        logger.info(f"  引导策略: 恶意样本(w={config.GUIDANCE_MALICIOUS}), 良性样本(w={config.GUIDANCE_BENIGN})")
+        logger.info("  开始训练...")
         
-        # 每个epoch输出
-        avg_loss = epoch_loss / len(loader_ddpm)
-        progress = (epoch + 1) / n_epochs_ddpm * 100
-        logger.info(f"[TabDDPM] Epoch [{epoch+1}/{n_epochs_ddpm}] ({progress:.1f}%) | Loss: {avg_loss:.4f}")
-	
-        improved = (ddpm_best_loss - float(avg_loss)) > ddpm_es_min_delta
-        if improved:
-            ddpm_best_loss = float(avg_loss)
-            ddpm_best_epoch = int(epoch + 1)
-            ddpm_best_state = {k: v.detach().cpu().clone() for k, v in tabddpm.state_dict().items()}
-            ddpm_no_improve = 0
-        else:
-            ddpm_no_improve += 1
-	
-        if ddpm_use_early_stopping and (epoch + 1) >= ddpm_es_warmup_epochs and ddpm_no_improve >= ddpm_es_patience:
-            logger.info(
-                f"[TabDDPM] EarlyStopping triggered at epoch {epoch+1}: "
-                f"best_loss={ddpm_best_loss:.4f} (epoch {ddpm_best_epoch}), "
-                f"no_improve={ddpm_no_improve}, min_delta={ddpm_es_min_delta}"
-            )
-            break
+        tabddpm = TabDDPM(config).to(config.DEVICE)
 
-    if ddpm_best_state is not None:
-        tabddpm.load_state_dict(ddpm_best_state)
-        tabddpm.to(config.DEVICE)
+        # Fit scaler on packet-level features (exclude zero-padding packets)
+        X_packets_all = X_clean.reshape(-1, X_clean.shape[-1])
+        vm_idx = getattr(config, 'VALID_MASK_INDEX', None)
+        if vm_idx is not None and int(vm_idx) >= 0 and int(vm_idx) < X_packets_all.shape[1]:
+            packet_mask = X_packets_all[:, int(vm_idx)] > 0.5
+        else:
+            packet_mask = np.any(X_packets_all != 0.0, axis=1)
+        X_packets_valid = X_packets_all[packet_mask]
+        if X_packets_valid.shape[0] == 0:
+            X_packets_valid = X_packets_all
+            packet_mask = None
+        tabddpm.fit_scaler(X_packets_valid)
     
-    # Generate augmented samples (增强全部干净样本)
-    logger.info("-"*70)
-    logger.info("✓ TabDDPM 训练完成")
-    if ddpm_best_epoch > 0:
-        logger.info(f"  最佳TabDDPM损失: {ddpm_best_loss:.4f} (epoch {ddpm_best_epoch})")
-    logger.info("")
-    logger.info("步骤 2.3: 生成增强样本")
-    logger.info(f"  训练集样本数: {len(X_clean)}")
-    multipliers = np.ceil(weights_clean.astype(np.float32) * 10.0).astype(int)
-    multipliers = np.maximum(multipliers, 2)
-    expected_synthetic = int(multipliers.sum())
-    logger.info("  增强策略: per-sample 倍数 = max(2, ceil(sample_weight*10))")
-    logger.info(f"  倍数统计: min={multipliers.min()}, max={multipliers.max()}, mean={multipliers.mean():.2f}")
-    logger.info(f"  预期生成: ~{expected_synthetic} 个合成样本")
-    logger.info("  开始生成...")
+        # Train TabDDPM
+        optimizer_ddpm = optim.AdamW(tabddpm.parameters(), lr=1e-4)
+        n_epochs_ddpm = ddpm_epochs
+	
+        ddpm_use_early_stopping = bool(getattr(config, 'DDPM_EARLY_STOPPING', True))
+        ddpm_es_warmup_epochs = int(getattr(config, 'DDPM_ES_WARMUP_EPOCHS', 20))
+        ddpm_es_patience = int(getattr(config, 'DDPM_ES_PATIENCE', 30))
+        ddpm_es_min_delta = float(getattr(config, 'DDPM_ES_MIN_DELTA', 0.001))
+	
+        ddpm_best_loss = float('inf')
+        ddpm_best_epoch = -1
+        ddpm_best_state = None
+        ddpm_no_improve = 0
     
-    X_augmented, y_augmented, sample_weights = tabddpm.augment_dataset(
-        X_clean, y_clean, action_clean, weights_clean,
-        density_clean, cl_conf_clean, knn_conf_clean,
-        augmentation_ratio=config.AUGMENTATION_RATIO_MIN
-    )
+        # 使用 packet-level 数据训练 TabDDPM（避免只看第一个包导致分布偏移）
+        # 同时过滤掉 padding=0 的无效包，避免模型学到大量“全零包”导致 Length/IAT/BurstSize 分布漂移
+        X_packets = X_packets_valid  # (n_valid, D)
+        y_packets_all = np.repeat(y_clean, X_clean.shape[1])    # (N*L,)
+        y_packets = y_packets_all[packet_mask] if packet_mask is not None else y_packets_all
+        dataset_ddpm = TensorDataset(
+            torch.FloatTensor(X_packets),
+            torch.LongTensor(y_packets)
+        )
+        loader_ddpm = DataLoader(dataset_ddpm, batch_size=2048, shuffle=True)
+    
+        tabddpm.train()
+        for epoch in range(n_epochs_ddpm):
+            epoch_loss = 0.0
+            for X_batch, y_batch in loader_ddpm:
+                x_0 = X_batch.to(config.DEVICE)  # (B, D)
+                y_batch = y_batch.to(config.DEVICE)
+                
+                optimizer_ddpm.zero_grad()
+                loss = tabddpm.compute_loss(
+                    x_0, y_batch,
+                    mask_prob=config.MASK_PROBABILITY,
+                    mask_lambda=config.MASK_LAMBDA,
+                    p_uncond=0.2  # Classifier-free guidance training
+                )
+                loss.backward()
+                optimizer_ddpm.step()
+                
+                epoch_loss += loss.item()
+            
+            # 每个epoch输出
+            avg_loss = epoch_loss / len(loader_ddpm)
+            progress = (epoch + 1) / n_epochs_ddpm * 100
+            logger.info(f"[TabDDPM] Epoch [{epoch+1}/{n_epochs_ddpm}] ({progress:.1f}%) | Loss: {avg_loss:.4f}")
+	
+            improved = (ddpm_best_loss - float(avg_loss)) > ddpm_es_min_delta
+            if improved:
+                ddpm_best_loss = float(avg_loss)
+                ddpm_best_epoch = int(epoch + 1)
+                ddpm_best_state = {k: v.detach().cpu().clone() for k, v in tabddpm.state_dict().items()}
+                ddpm_no_improve = 0
+            else:
+                ddpm_no_improve += 1
+	
+            if ddpm_use_early_stopping and (epoch + 1) >= ddpm_es_warmup_epochs and ddpm_no_improve >= ddpm_es_patience:
+                logger.info(
+                    f"[TabDDPM] EarlyStopping triggered at epoch {epoch+1}: "
+                    f"best_loss={ddpm_best_loss:.4f} (epoch {ddpm_best_epoch}), "
+                    f"no_improve={ddpm_no_improve}, min_delta={ddpm_es_min_delta}"
+                )
+                break
+
+        if ddpm_best_state is not None:
+            tabddpm.load_state_dict(ddpm_best_state)
+            tabddpm.to(config.DEVICE)
+    
+        # Generate augmented samples (增强全部干净样本)
+        logger.info("-"*70)
+        logger.info("✓ TabDDPM 训练完成")
+        if ddpm_best_epoch > 0:
+            logger.info(f"  最佳TabDDPM损失: {ddpm_best_loss:.4f} (epoch {ddpm_best_epoch})")
+        logger.info("")
+        logger.info("步骤 2.3: 生成增强样本")
+        logger.info(f"  训练集样本数: {len(X_clean)}")
+        multipliers = np.ceil(weights_clean.astype(np.float32) * 10.0).astype(int)
+        multipliers = np.maximum(multipliers, 2)
+        expected_synthetic = int(multipliers.sum())
+        logger.info("  增强策略: per-sample 倍数 = max(2, ceil(sample_weight*10))")
+        logger.info(f"  倍数统计: min={multipliers.min()}, max={multipliers.max()}, mean={multipliers.mean():.2f}")
+        logger.info(f"  预期生成: ~{expected_synthetic} 个合成样本")
+        logger.info("  开始生成...")
+        
+        X_augmented, y_augmented, sample_weights = tabddpm.augment_dataset(
+            X_clean, y_clean, action_clean, weights_clean,
+            density_clean, cl_conf_clean, knn_conf_clean,
+            augmentation_ratio=config.AUGMENTATION_RATIO_MIN
+        )
     
     n_train_original = len(X_clean)
     n_synthetic = len(X_augmented) - n_train_original
@@ -1075,7 +1218,16 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_data.npz")
     logger.info(f"  ✓ 增强数据: {augmented_data_path}")
 
+    input_is_features = bool(getattr(config, 'CLASSIFIER_INPUT_IS_FEATURES', False))
+    try:
+        if hasattr(X_train, 'ndim') and int(X_train.ndim) == 2:
+            input_is_features = True
+    except Exception:
+        pass
+
     finetune_backbone = bool(getattr(config, 'FINETUNE_BACKBONE', False))
+    if input_is_features:
+        finetune_backbone = False
     finetune_scope = str(getattr(config, 'FINETUNE_BACKBONE_SCOPE', 'projection')).lower()
     finetune_backbone_lr = float(getattr(config, 'FINETUNE_BACKBONE_LR', 1e-5))
     
@@ -1086,7 +1238,13 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         backbone_path_display = backbone_path
     logger.info(f"  ✓ 骨干网络模型: {backbone_path_display}")
     logger.info("")
-    
+
+    if input_is_features:
+        config.CLASSIFIER_INPUT_IS_FEATURES = True
+        logger.info("🧩 Stage 3: 检测到输入为特征向量 (B, D)，将跳过骨干网络并仅训练分类头")
+        logger.info("  - FINETUNE_BACKBONE 将被强制关闭（合成特征无法反传到骨干）")
+        logger.info("  - Stage3 在线增强 / ST-Mixup 将被关闭（仅对原始序列有效）")
+
     # Create classifier
     classifier = MEDAL_Classifier(backbone, config).to(config.DEVICE)
     logger.info("✓ 双流分类器创建完成 (MLP_A + MLP_B)")
@@ -1109,6 +1267,8 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
 
     # Stage 3 online augmentation (input-level)
     use_stage3_online_aug = bool(getattr(config, 'STAGE3_ONLINE_AUGMENTATION', False))
+    if input_is_features:
+        use_stage3_online_aug = False
     augmentor = None
     if use_stage3_online_aug:
         from MoudleCode.feature_extraction.traffic_augmentation import TrafficAugmentation
@@ -1119,6 +1279,8 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     
     # Stage 3 ST-Mixup (Spatio-Temporal Mixup)
     use_st_mixup = bool(getattr(config, 'STAGE3_USE_ST_MIXUP', False))
+    if input_is_features:
+        use_st_mixup = False
     st_mixup = None
     if use_st_mixup:
         from MoudleCode.feature_extraction.st_mixup import create_st_mixup
@@ -1302,7 +1464,10 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             eval_loader = DataLoader(train_dataset, batch_size=getattr(config, 'TEST_BATCH_SIZE', 256), shuffle=False)
             for X_b, y_b, _w_b in eval_loader:
                 X_b = X_b.to(config.DEVICE)
-                z_b = backbone(X_b, return_sequence=False)
+                if input_is_features:
+                    z_b = X_b
+                else:
+                    z_b = backbone(X_b, return_sequence=False)
                 logits_a, logits_b = classifier.dual_mlp(z_b, return_separate=True)
                 logits_avg = (logits_a + logits_b) / 2.0
                 p = torch.softmax(logits_avg, dim=1)[:, 1]
@@ -1390,6 +1555,60 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     logger.info("")
     logger.info("开始训练...")
     logger.info("-"*70)
+
+    use_mixed_stream = bool(getattr(config, 'STAGE3_MIXED_STREAM', False))
+    # Mixed-stream requires feature-space synthetic inputs.
+    if use_mixed_stream and not input_is_features:
+        use_mixed_stream = False
+        logger.warning("⚠ STAGE3_MIXED_STREAM=True 但当前输入不是特征向量，将回退到单流训练")
+
+    real_loader = None
+    syn_loader = None
+    real_loss_scale = 1.0
+    if use_mixed_stream:
+        real_kept_path = os.path.join(config.DATA_AUGMENTATION_DIR, 'models', 'real_kept_data.npz')
+        if not os.path.exists(real_kept_path):
+            logger.warning(f"⚠ 未找到真实序列缓存文件: {real_kept_path}，将回退到单流特征训练")
+            use_mixed_stream = False
+        else:
+            try:
+                real_npz = np.load(real_kept_path, allow_pickle=True)
+                X_real_all = real_npz['X_real']
+                y_real_all = real_npz['y_real']
+                w_real_all = real_npz['sample_weights_real']
+            except Exception as e:
+                logger.warning(f"⚠ 加载真实序列缓存失败，将回退到单流特征训练: {e}")
+                use_mixed_stream = False
+
+    if use_mixed_stream:
+        if n_original is None:
+            n_original = int(len(X_real_all))
+        n_original = int(min(int(n_original), int(len(X_train))))
+        Z_syn = X_train[n_original:]
+        y_syn = y_train[n_original:]
+        w_syn = sample_weights[n_original:]
+
+        real_bs = int(getattr(config, 'STAGE3_MIXED_REAL_BATCH_SIZE', 32))
+        syn_bs = int(getattr(config, 'STAGE3_MIXED_SYN_BATCH_SIZE', 256))
+        real_loss_scale = float(getattr(config, 'STAGE3_MIXED_REAL_LOSS_SCALE', 1.0))
+
+        real_dataset = TensorDataset(
+            torch.FloatTensor(X_real_all),
+            torch.LongTensor(y_real_all),
+            torch.FloatTensor(w_real_all)
+        )
+        real_loader = DataLoader(real_dataset, batch_size=real_bs, shuffle=True, drop_last=True)
+
+        if len(Z_syn) > 0:
+            syn_dataset = TensorDataset(
+                torch.FloatTensor(Z_syn),
+                torch.LongTensor(y_syn),
+                torch.FloatTensor(w_syn)
+            )
+            syn_loader = DataLoader(syn_dataset, batch_size=syn_bs, shuffle=True, drop_last=True)
+        else:
+            syn_loader = None
+            logger.warning("⚠ Mixed-Stream: 未检测到合成特征样本（Z_syn为空），将仅使用真实序列流训练")
     
     # Training loop
     history = {
@@ -1458,69 +1677,159 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         all_train_probs = []
         all_train_labels = []
         
-        for X_batch, y_batch, w_batch in train_loader:
-            X_batch = X_batch.to(config.DEVICE)
-            y_batch = y_batch.to(config.DEVICE)
-            w_batch = w_batch.to(config.DEVICE)
-            
-            optimizer.zero_grad()
-            
-            # Online augmentation (training only)
-            # Step 1: TrafficAugmentation (物理感知的单样本增强)
-            if augmentor is not None:
-                X_batch, _ = augmentor(X_batch)
-            
-            # Step 2: ST-Mixup (类内时空混合，渐进式启用)
-            if st_mixup is not None:
-                if st_mixup_mode == 'selective':
-                    # 选择性模式：需要传入模型
-                    X_batch, y_batch = st_mixup(
-                        X_batch, y_batch, 
-                        epoch=epoch, 
-                        total_epochs=config.FINETUNE_EPOCHS,
-                        classifier=classifier,
-                        backbone=backbone
-                    )
-                else:
-                    # 类内模式：不需要模型
-                    X_batch, y_batch = st_mixup(
-                        X_batch, y_batch,
-                        epoch=epoch,
-                        total_epochs=config.FINETUNE_EPOCHS
-                    )
+        if use_mixed_stream:
+            iter_real = iter(real_loader)
+            iter_syn = iter(syn_loader) if syn_loader is not None else None
+            n_steps = len(syn_loader) if syn_loader is not None else len(real_loader)
 
-            # Extract features
-            if finetune_backbone:
-                z = backbone(X_batch, return_sequence=False)
-            else:
+            for _step in range(int(max(n_steps, 1))):
+                try:
+                    Xb_real, yb_real, wb_real = next(iter_real)
+                except StopIteration:
+                    iter_real = iter(real_loader)
+                    Xb_real, yb_real, wb_real = next(iter_real)
+
+                if iter_syn is not None:
+                    try:
+                        zb_syn, yb_syn, wb_syn = next(iter_syn)
+                    except StopIteration:
+                        iter_syn = iter(syn_loader)
+                        zb_syn, yb_syn, wb_syn = next(iter_syn)
+                else:
+                    zb_syn = None
+                    yb_syn = None
+                    wb_syn = None
+
+                Xb_real = Xb_real.to(config.DEVICE)
+                yb_real = yb_real.to(config.DEVICE)
+                wb_real = wb_real.to(config.DEVICE, dtype=torch.float32) * float(real_loss_scale)
+
+                if zb_syn is not None:
+                    zb_syn = zb_syn.to(config.DEVICE)
+                    yb_syn = yb_syn.to(config.DEVICE)
+                    wb_syn = wb_syn.to(config.DEVICE, dtype=torch.float32)
+
+                optimizer.zero_grad()
+
+                # Stream A: Real sequences -> optional online aug -> backbone
+                if augmentor is not None:
+                    Xb_real, _ = augmentor(Xb_real)
+
+                if finetune_backbone:
+                    z_real = backbone(Xb_real, return_sequence=False)
+                else:
+                    with torch.no_grad():
+                        z_real = backbone(Xb_real, return_sequence=False)
+
+                # Stream B: Synthetic features passthrough
+                if zb_syn is not None:
+                    z_total = torch.cat([z_real, zb_syn], dim=0)
+                    y_total = torch.cat([yb_real, yb_syn], dim=0)
+                    w_total = torch.cat([wb_real, wb_syn], dim=0)
+                else:
+                    z_total = z_real
+                    y_total = yb_real
+                    w_total = wb_real
+
+                loss, loss_dict = criterion(
+                    classifier.dual_mlp,
+                    z_total,
+                    y_total,
+                    w_total,
+                    epoch,
+                    config.FINETUNE_EPOCHS
+                )
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss_dict['total']
+                epoch_losses['supervision'] += loss_dict['supervision']
+                epoch_losses['soft_f1'] += loss_dict.get('soft_f1', 0.0)
+                epoch_losses['orthogonality'] += loss_dict['orthogonality']
+                epoch_losses['consistency'] += loss_dict['consistency']
+                if 'margin' in loss_dict:
+                    epoch_losses['margin'] = epoch_losses.get('margin', 0.0) + loss_dict['margin']
+                if 'logit_margin_scale' in loss_dict:
+                    epoch_losses['logit_margin_scale'] = epoch_losses.get('logit_margin_scale', 0.0) + float(loss_dict['logit_margin_scale'])
+
                 with torch.no_grad():
-                    z = backbone(X_batch, return_sequence=False)
+                    logits_a, logits_b = classifier.dual_mlp(z_total, return_separate=True)
+                    logits_avg = (logits_a + logits_b) / 2.0
+                    probs = torch.softmax(logits_avg, dim=1)
+                    all_train_probs.append(probs.cpu().numpy())
+                    all_train_labels.append(y_total.cpu().numpy())
+        else:
+            for X_batch, y_batch, w_batch in train_loader:
+                X_batch = X_batch.to(config.DEVICE)
+                y_batch = y_batch.to(config.DEVICE)
+                w_batch = w_batch.to(config.DEVICE)
+
+                optimizer.zero_grad()
+
+                if input_is_features:
+                    z = X_batch
+                else:
+                    # Online augmentation (training only)
+                    # Step 1: TrafficAugmentation (物理感知的单样本增强)
+                    if augmentor is not None:
+                        X_batch, _ = augmentor(X_batch)
+
+                    # Step 2: ST-Mixup (类内时空混合，渐进式启用)
+                    if st_mixup is not None:
+                        if st_mixup_mode == 'selective':
+                            # 选择性模式：需要传入模型
+                            X_batch, y_batch = st_mixup(
+                                X_batch, y_batch,
+                                epoch=epoch,
+                                total_epochs=config.FINETUNE_EPOCHS,
+                                classifier=classifier,
+                                backbone=backbone
+                            )
+                        else:
+                            # 类内模式：不需要模型
+                            X_batch, y_batch = st_mixup(
+                                X_batch, y_batch,
+                                epoch=epoch,
+                                total_epochs=config.FINETUNE_EPOCHS
+                            )
+
+                    # Extract features
+                    if finetune_backbone:
+                        z = backbone(X_batch, return_sequence=False)
+                    else:
+                        with torch.no_grad():
+                            z = backbone(X_batch, return_sequence=False)
+
+                # Compute loss (weight-aware)
+                loss, loss_dict = criterion(classifier.dual_mlp, z, y_batch, w_batch, epoch, config.FINETUNE_EPOCHS)
             
-            # Compute loss (weight-aware)
-            loss, loss_dict = criterion(classifier.dual_mlp, z, y_batch, w_batch, epoch, config.FINETUNE_EPOCHS)
-            
-            loss.backward()
-            optimizer.step()
-            
-            epoch_loss += loss_dict['total']
-            epoch_losses['supervision'] += loss_dict['supervision']
-            epoch_losses['soft_f1'] += loss_dict.get('soft_f1', 0.0)
-            epoch_losses['orthogonality'] += loss_dict['orthogonality']
-            epoch_losses['consistency'] += loss_dict['consistency']
-            if 'margin' in loss_dict:
-                epoch_losses['margin'] = epoch_losses.get('margin', 0.0) + loss_dict['margin']
-            if 'logit_margin_scale' in loss_dict:
-                epoch_losses['logit_margin_scale'] = epoch_losses.get('logit_margin_scale', 0.0) + float(loss_dict['logit_margin_scale'])
-            
-            # 收集预测概率用于计算 F1
-            with torch.no_grad():
-                logits_a, logits_b = classifier.dual_mlp(z, return_separate=True)
-                logits_avg = (logits_a + logits_b) / 2.0
-                probs = torch.softmax(logits_avg, dim=1)
-                all_train_probs.append(probs.cpu().numpy())
-                all_train_labels.append(y_batch.cpu().numpy())
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss_dict['total']
+                epoch_losses['supervision'] += loss_dict['supervision']
+                epoch_losses['soft_f1'] += loss_dict.get('soft_f1', 0.0)
+                epoch_losses['orthogonality'] += loss_dict['orthogonality']
+                epoch_losses['consistency'] += loss_dict['consistency']
+                if 'margin' in loss_dict:
+                    epoch_losses['margin'] = epoch_losses.get('margin', 0.0) + loss_dict['margin']
+                if 'logit_margin_scale' in loss_dict:
+                    epoch_losses['logit_margin_scale'] = epoch_losses.get('logit_margin_scale', 0.0) + float(loss_dict['logit_margin_scale'])
+
+                # 收集预测概率用于计算 F1
+                with torch.no_grad():
+                    logits_a, logits_b = classifier.dual_mlp(z, return_separate=True)
+                    logits_avg = (logits_a + logits_b) / 2.0
+                    probs = torch.softmax(logits_avg, dim=1)
+                    all_train_probs.append(probs.cpu().numpy())
+                    all_train_labels.append(y_batch.cpu().numpy())
         
-        n_batches = len(train_loader)
+        n_batches = int(max(len(train_loader), 1))
+        if use_mixed_stream:
+            if syn_loader is not None:
+                n_batches = int(max(len(syn_loader), 1))
+            else:
+                n_batches = int(max(len(real_loader), 1))
         epoch_loss /= n_batches
         for key in epoch_losses:
             epoch_losses[key] /= n_batches
@@ -1558,7 +1867,10 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
                 for X_batch, y_batch, _w_batch in val_loader:
                     X_batch = X_batch.to(config.DEVICE)
                     y_batch = y_batch.to(config.DEVICE)
-                    z = backbone(X_batch, return_sequence=False)
+                    if input_is_features:
+                        z = X_batch
+                    else:
+                        z = backbone(X_batch, return_sequence=False)
                     logits_a, logits_b = classifier.dual_mlp(z, return_separate=True)
                     logits_avg = (logits_a + logits_b) / 2.0
                     probs = torch.softmax(logits_avg, dim=1)
@@ -1675,15 +1987,18 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     if finetune_backbone:
         backbone.eval()
     with torch.no_grad():
-        # Extract features from training set for visualization
-        X_train_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
-        features_list = []
-        batch_size = 64
-        for i in range(0, len(X_train_tensor), batch_size):
-            X_batch = X_train_tensor[i:i+batch_size]
-            z_batch = backbone(X_batch, return_sequence=False)
-            features_list.append(z_batch.cpu().numpy())
-        train_features = np.concatenate(features_list, axis=0)
+        if input_is_features:
+            train_features = np.asarray(X_train, dtype=np.float32)
+        else:
+            # Extract features from training set for visualization
+            X_train_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
+            features_list = []
+            batch_size = 64
+            for i in range(0, len(X_train_tensor), batch_size):
+                X_batch = X_train_tensor[i:i+batch_size]
+                z_batch = backbone(X_batch, return_sequence=False)
+                features_list.append(z_batch.cpu().numpy())
+            train_features = np.concatenate(features_list, axis=0)
     
     feature_dist_path = os.path.join(config.CLASSIFICATION_DIR, "figures", "feature_distribution_stage3.png")
     plot_feature_space(train_features, y_train, feature_dist_path,

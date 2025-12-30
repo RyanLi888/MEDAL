@@ -64,11 +64,19 @@ echo "  output:   $OUT_DIR"
 echo "============================================================"
 echo ""
 
+DEVICE_ARG="cpu"
+if python -c "import torch; print('1' if torch.cuda.is_available() else '0')" >/dev/null 2>&1; then
+  HAS_CUDA=$(python -c "import torch; print('1' if torch.cuda.is_available() else '0')" 2>/dev/null || echo "0")
+  if [ "$HAS_CUDA" = "1" ]; then
+    DEVICE_ARG="cuda"
+  fi
+fi
+
 python scripts/evaluate_backbone.py \
   --backbone "$BACKBONE_PATH" \
   --data_root "$DATA_ROOT" \
   --output "$OUT_DIR" \
-  --device "${CUDA_VISIBLE_DEVICES:+cuda}${CUDA_VISIBLE_DEVICES:+:0}" 2>&1 | tee "$OUT_DIR/evaluation_console.log"
+  --device "$DEVICE_ARG" 2>&1 | tee "$OUT_DIR/evaluation_console.log"
 
 echo ""
 echo "✓ 完成"

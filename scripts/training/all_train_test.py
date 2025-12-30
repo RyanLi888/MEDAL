@@ -4,9 +4,11 @@ Runs complete training and testing pipeline
 """
 import sys
 import os
-# 添加项目根目录到路径
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
-sys.path.insert(0, project_root)
+from pathlib import Path
+
+# Ensure project root is on sys.path when running as a script
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
 
 import argparse
 from datetime import datetime

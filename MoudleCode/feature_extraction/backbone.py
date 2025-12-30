@@ -93,12 +93,21 @@ class MicroBiMambaBackbone(nn.Module):
         Forward pass
         
         Args:
-            x: (B, L, 5) - input features
+            x: (B, L, D_in) - input features
             return_sequence: If True, return sequence features; else return pooled features
             
         Returns:
             z: (B, output_dim) if return_sequence=False, else (B, L, output_dim)
         """
+        valid_mask = None
+        valid_mask_index = getattr(self.config, 'VALID_MASK_INDEX', None)
+        if valid_mask_index is not None:
+            try:
+                if int(valid_mask_index) >= 0 and int(valid_mask_index) < x.shape[-1]:
+                    valid_mask = x[:, :, int(valid_mask_index)]
+            except Exception:
+                valid_mask = None
+
         # Embedding
         x = self.embedding(x)  # (B, L, d_model)
         x = self.pos_encoding(x)
@@ -122,8 +131,14 @@ class MicroBiMambaBackbone(nn.Module):
             z = self.projection(x_combined)  # (B, L, d_model)
         else:
             # Average pooling and combine for single vector output
-            z_fwd = torch.mean(x_fwd, dim=1)  # (B, d_model)
-            z_bwd = torch.mean(x_bwd, dim=1)  # (B, d_model)
+            if valid_mask is not None:
+                m = (valid_mask > 0.5).to(dtype=x_fwd.dtype, device=x_fwd.device).unsqueeze(-1)  # (B, L, 1)
+                denom = m.sum(dim=1).clamp_min(1e-6)
+                z_fwd = (x_fwd * m).sum(dim=1) / denom
+                z_bwd = (x_bwd * m).sum(dim=1) / denom
+            else:
+                z_fwd = torch.mean(x_fwd, dim=1)  # (B, d_model)
+                z_bwd = torch.mean(x_bwd, dim=1)  # (B, d_model)
             z_cat = torch.cat([z_fwd, z_bwd], dim=-1)  # (B, 2*d_model)
             z = self.projection(z_cat)  # (B, d_model)
         
@@ -163,43 +178,63 @@ class SimMTMLoss(nn.Module):
         
         Args:
             backbone: Micro-Bi-Mamba backbone model
-            x_original: (B, L, 5) - original input
+            x_original: (B, L, D_in) - original input
             
         Returns:
             loss: scalar
             loss_dict: dictionary with individual loss components
         """
         B, L, D = x_original.shape
+
+        valid_mask_index = getattr(backbone.config, 'VALID_MASK_INDEX', None)
+        valid = None
+        if valid_mask_index is not None:
+            try:
+                if int(valid_mask_index) >= 0 and int(valid_mask_index) < D:
+                    valid = x_original[:, :, int(valid_mask_index)] > 0.5
+            except Exception:
+                valid = None
         
         # Step 1: Create mask (randomly mask 50% of time steps)
         mask = torch.rand(B, L, device=x_original.device) < self.mask_rate
+        if valid is not None:
+            mask = mask & valid
         
         # Masked input
         x_masked = x_original.clone()
         x_masked[mask] = 0.0
+        if valid_mask_index is not None and int(valid_mask_index) >= 0 and int(valid_mask_index) < D:
+            x_masked[:, :, int(valid_mask_index)] = x_original[:, :, int(valid_mask_index)]
         
         # Get sequence features from masked input
-        z_seq = backbone(x_masked, return_sequence=True)  # (B, L, 64)
+        z_seq = backbone(x_masked, return_sequence=True)  # (B, L, d) where d=OUTPUT_DIM
         
         # Step 2: Manifold Calibration
         # Pool to get feature vector for each sample
-        z_pooled = torch.mean(z_seq, dim=1)  # (B, 64)
+        if valid is not None:
+            m = valid.to(dtype=z_seq.dtype).unsqueeze(-1)  # (B, L, 1)
+            denom = m.sum(dim=1).clamp_min(1e-6)
+            z_pooled = (z_seq * m).sum(dim=1) / denom
+        else:
+            z_pooled = torch.mean(z_seq, dim=1)  # (B, d)
         
         # Compute batch center (theoretical center) for manifold calibration
         # Group by labels if available, otherwise use entire batch
         with torch.no_grad():
-            z_batch_center = torch.mean(z_pooled, dim=0, keepdim=True)  # (1, 64)
-            z_batch_center = z_batch_center.expand(B, -1)  # (B, 64)
+            z_batch_center = torch.mean(z_pooled, dim=0, keepdim=True)  # (1, d)
+            z_batch_center = z_batch_center.expand(B, -1)  # (B, d)
         
         # Manifold alignment loss (align features to batch center)
         manifold_loss = F.mse_loss(z_pooled, z_batch_center.detach())
         
         # Step 3: Reconstruction loss
         # Decode to reconstruct original features
-        x_recon = backbone.decoder(z_seq)  # (B, L, 5)
+        x_recon = backbone.decoder(z_seq)  # (B, L, D_in)
         
         # Reconstruction loss (only on masked positions)
         mask_expanded = mask.unsqueeze(-1).expand_as(x_original)
+        if valid_mask_index is not None and int(valid_mask_index) >= 0 and int(valid_mask_index) < D:
+            mask_expanded[:, :, int(valid_mask_index)] = False
         if mask_expanded.sum() > 0:
             recon_loss = F.mse_loss(x_recon[mask_expanded], x_original[mask_expanded])
         else:

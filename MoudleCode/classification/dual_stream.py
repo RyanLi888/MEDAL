@@ -318,88 +318,58 @@ class DualStreamLoss(nn.Module):
         return loss
     
     def co_teaching_loss(self, logits_a, logits_b, labels, select_rate=0.7, use_focal=True):
-        """
-        Co-teaching loss: each network selects samples for the other
-        RAPIER-style: Pure CrossEntropy without class weights (after TabDDPM augmentation, classes are balanced)
-        
-        Args:
-            logits_a: (B, 2)
-            logits_b: (B, 2)
-            labels: (B,)
-            select_rate: float - percentage of samples to select
-            use_focal: bool - whether to use focal loss (controlled by config)
-            
-        Returns:
-            loss_a: scalar - loss for MLP A
-            loss_b: scalar - loss for MLP B
-        """
+        """Co-teaching: each network selects small-loss samples for the other."""
         batch_size = labels.shape[0]
         n_select = max(1, int(batch_size * select_rate))
         
-        # Compute individual losses
-        # RAPIER-style: Use standard CrossEntropy as base (no class weights in loss computation)
-        # Class weights are now 1.0:1.0, so no need to apply them
         if use_focal:
-            # Use focal loss for hard example mining (but with balanced alpha=0.5)
             loss_a_per_sample = self.focal_loss(logits_a, labels)
             loss_b_per_sample = self.focal_loss(logits_b, labels)
         else:
-            # Use standard cross-entropy (RAPIER-style pure CE)
             loss_a_per_sample = self.ce_loss(logits_a, labels)
             loss_b_per_sample = self.ce_loss(logits_b, labels)
         
-        # Note: Class weights are now 1.0:1.0, so no need to apply them
-        # This makes the loss computation cleaner and more aligned with RAPIER
-        
-        # MLP A selects clean samples for MLP B (small-loss selection)
+        # A selects for B
         _, indices_a = torch.topk(loss_a_per_sample, n_select, largest=False)
         loss_b = loss_b_per_sample[indices_a].mean()
         
-        # MLP B selects clean samples for MLP A (small-loss selection)
+        # B selects for A
         _, indices_b = torch.topk(loss_b_per_sample, n_select, largest=False)
         loss_a = loss_a_per_sample[indices_b].mean()
         
         return loss_a, loss_b
     
     def forward(self, model, z, labels, sample_weights, epoch, total_epochs):
-        """
-        Compute total loss with dynamic weighting (weight-aware supervision)
-        
-        混合损失策略：
-        - 基础损失（Focal/CE）：提供稳定的梯度
-        - Soft F1 Loss：直接优化 Binary F1-Score
-        - 混合比例：0.5 * 基础损失 + 0.5 * Soft F1 Loss
-        
-        Args:
-            model: DualStreamMLP model
-            z: (B, 64) - features
-            labels: (B,) - labels
-            sample_weights: (B,) - per-sample weights from Stage 2
-            epoch: int - current epoch
-            total_epochs: int - total epochs
-        
-        Returns:
-            total_loss: scalar
-            loss_dict: dict of individual losses
-        """
         logits_a, logits_b = model(z, return_separate=True)
 
-        # ---- Supervision loss (default: label-smoothing CE with sample weights) ----
+        use_logit_margin = bool(getattr(self.config, 'USE_LOGIT_MARGIN', False))
+        logit_margin_m = float(getattr(self.config, 'LOGIT_MARGIN_M', 0.0))
+        logit_margin_warmup = int(getattr(self.config, 'LOGIT_MARGIN_WARMUP_EPOCHS', 0))
+        margin_scale = 0.0
+        if use_logit_margin and logit_margin_m > 0:
+            one_hot = torch.zeros_like(logits_a)
+            one_hot.scatter_(1, labels.unsqueeze(1), 1.0)
+            if logit_margin_warmup > 0:
+                margin_scale = min(1.0, float(epoch + 1) / float(logit_margin_warmup))
+            else:
+                margin_scale = 1.0
+            logits_a = logits_a - (one_hot * (logit_margin_m * margin_scale))
+            logits_b = logits_b - (one_hot * (logit_margin_m * margin_scale))
+        
         if sample_weights is None:
             sample_weights = torch.ones_like(labels, dtype=torch.float32, device=z.device)
         else:
             sample_weights = sample_weights.to(device=z.device, dtype=torch.float32)
-
-        # Optional co-teaching (disabled by default; keep for experiments)
+        
         use_co_teaching = bool(getattr(self.config, 'USE_CO_TEACHING', False))
         co_teaching_warmup = int(getattr(self.config, 'CO_TEACHING_WARMUP_EPOCHS', 0))
         co_teaching_select_rate = float(getattr(self.config, 'CO_TEACHING_SELECT_RATE', 0.7))
         co_teaching_min_w = float(getattr(self.config, 'CO_TEACHING_MIN_SAMPLE_WEIGHT', 0.0))
         use_focal = bool(getattr(self.config, 'USE_FOCAL_LOSS', False))
-
+        
         selected_for_a = None
         selected_for_b = None
-
+        
         if use_co_teaching and epoch >= co_teaching_warmup:
             eligible = sample_weights >= co_teaching_min_w
             if eligible.any():
@@ -419,14 +389,19 @@ class DualStreamLoss(nn.Module):
                 use_co_teaching = False
         
         if not use_co_teaching:
-            loss_a_per_sample = self._label_smoothing_ce(logits_a, labels)
-            loss_b_per_sample = self._label_smoothing_ce(logits_b, labels)
+            # Balanced sampling already handled by the DataLoader; do not add class-weight compensation here.
+            if use_focal:
+                loss_a_per_sample = self.focal_loss(logits_a, labels)
+                loss_b_per_sample = self.focal_loss(logits_b, labels)
+            else:
+                loss_a_per_sample = self._label_smoothing_ce(logits_a, labels)
+                loss_b_per_sample = self._label_smoothing_ce(logits_b, labels)
+            
             sup_loss_a = (loss_a_per_sample * sample_weights).mean()
             sup_loss_b = (loss_b_per_sample * sample_weights).mean()
             loss_sup_base = 0.5 * (sup_loss_a + sup_loss_b)
             loss_sup = loss_sup_base
-
-        # Optional SoftF1 (disabled by default; can be enabled in config)
+        
         use_soft_f1 = bool(getattr(self.config, 'USE_SOFT_F1_LOSS', False))
         soft_f1_weight = float(getattr(self.config, 'SOFT_F1_WEIGHT', 0.0)) if use_soft_f1 else 0.0
         loss_f1 = torch.tensor(0.0, device=z.device)
@@ -435,15 +410,11 @@ class DualStreamLoss(nn.Module):
             loss_f1_b = self.soft_f1_loss(logits_b, labels)
             loss_f1 = 0.5 * (loss_f1_a + loss_f1_b)
             loss_sup = (1.0 - soft_f1_weight) * loss_sup_base + soft_f1_weight * loss_f1
-
-        # Soft-orthogonality loss
+        
         w_a, w_b = model.get_first_layer_weights()
         loss_orth = self.soft_orthogonality_loss(w_a, w_b)
-        
-        # Consistency loss
         loss_con = self.consistency_loss(logits_a, logits_b)
         
-        # Dynamic weights
         lambda_orth = self.config.get_dynamic_weight(
             epoch, total_epochs,
             self.config.SOFT_ORTH_WEIGHT_START,
@@ -460,8 +431,19 @@ class DualStreamLoss(nn.Module):
             warmup_scale = min(1.0, float(epoch + 1) / float(self.consistency_warmup_epochs))
             lambda_con = lambda_con * warmup_scale
         
-        # Total loss
-        total_loss = loss_sup + lambda_orth * loss_orth + lambda_con * loss_con
+        use_margin_loss = bool(getattr(self.config, 'USE_MARGIN_LOSS', False))
+        margin_weight = float(getattr(self.config, 'MARGIN_LOSS_WEIGHT', 0.0)) if use_margin_loss else 0.0
+        margin_w_start = float(getattr(self.config, 'MARGIN_LOSS_WEIGHT_START', 0.0))
+        margin_w_end = float(getattr(self.config, 'MARGIN_LOSS_WEIGHT_END', margin_weight))
+        lambda_margin = 0.0
+        loss_margin = torch.tensor(0.0, device=z.device)
+        if use_margin_loss and margin_weight > 0:
+            lambda_margin = float(self.config.get_dynamic_weight(epoch, total_epochs, margin_w_start, margin_w_end))
+            loss_margin_a = self.margin_loss(logits_a, labels, z)
+            loss_margin_b = self.margin_loss(logits_b, labels, z)
+            loss_margin = 0.5 * (loss_margin_a + loss_margin_b)
+
+        total_loss = loss_sup + lambda_orth * loss_orth + lambda_con * loss_con + lambda_margin * loss_margin
         
         loss_dict = {
             'total': total_loss.item(),
@@ -470,10 +452,13 @@ class DualStreamLoss(nn.Module):
             'soft_f1': loss_f1.item() if use_soft_f1 else 0.0,
             'orthogonality': loss_orth.item(),
             'consistency': loss_con.item(),
-            'margin': 0.0,
+            'margin': loss_margin.item() if (use_margin_loss and margin_weight > 0) else 0.0,
+            'use_logit_margin': float(bool(use_logit_margin and logit_margin_m > 0)),
+            'logit_margin_m': float(logit_margin_m) if (use_logit_margin and logit_margin_m > 0) else 0.0,
+            'logit_margin_scale': float(margin_scale) if (use_logit_margin and logit_margin_m > 0) else 0.0,
             'lambda_orth': lambda_orth,
             'lambda_con': lambda_con,
-            'lambda_margin': 0.0,
+            'lambda_margin': float(lambda_margin),
             'soft_f1_weight': soft_f1_weight if use_soft_f1 else 0.0,
             'use_co_teaching': float(bool(use_co_teaching and epoch >= co_teaching_warmup)),
             'co_teaching_select_rate': float(co_teaching_select_rate),
@@ -508,7 +493,7 @@ class MEDAL_Classifier(nn.Module):
         Forward pass
         
         Args:
-            x: (B, L, 5) - input sequences
+            x: (B, L, D) - input sequences
             return_features: bool - if True, also return backbone features
             return_separate: bool - if True, return separate logits from two streams
             
@@ -544,7 +529,7 @@ class MEDAL_Classifier(nn.Module):
         Predict labels and probabilities
         
         Args:
-            x: (B, L, 5) - input sequences
+            x: (B, L, D) - input sequences
             threshold: float - decision threshold for malicious class (default: 0.5)
                        If None, uses config.MALICIOUS_THRESHOLD or 0.5
             

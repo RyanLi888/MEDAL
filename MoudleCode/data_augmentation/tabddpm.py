@@ -15,7 +15,7 @@ For structure-aware data augmentation
    
 3. 条件-依赖解耦 (Condition-Dependence Decoupling)
    - 条件特征 (固定): Direction, Flags - 协议约束
-   - 依赖特征 (生成): Length, IAT, Window - 学习分布
+   - 依赖特征 (生成): Length, IAT, BurstSize - 学习分布
    - 训练时随机mask依赖特征，强制模型学习特征间依赖关系
 
 训练目标：
@@ -91,22 +91,22 @@ class TabDDPM(nn.Module):
     """
     Tabular Denoising Diffusion Probabilistic Model
     
-    Operates on 5-dimensional raw features with protocol-aware generation
+    Operates on configurable-dimensional raw features with protocol-aware generation
     """
     
     def __init__(self, config):
         super().__init__()
         
         self.config = config
-        self.input_dim = config.INPUT_FEATURE_DIM  # 5
+        self.input_dim = config.INPUT_FEATURE_DIM
         self.timesteps = config.DDPM_TIMESTEPS
         
         # Condition and dependence feature indices (must be defined before denoising_net)
-        self.cond_indices = config.COND_FEATURE_INDICES  # [2, 3] - Direction, Flags
-        self.dep_indices = config.DEP_FEATURE_INDICES    # [0, 1, 4] - Length, IAT, Window
+        self.cond_indices = config.COND_FEATURE_INDICES
+        self.dep_indices = config.DEP_FEATURE_INDICES
         
         # Denoising network
-        # Input: x_t (5) + t (1) + y (1) + x_cond (len(cond_indices))
+        # Input: x_t (D) + t (1) + y (1) + x_cond (len(cond_indices))
         cond_dim = len(self.cond_indices)  # Number of conditional features
         denoising_input_dim = self.input_dim + 1 + 1 + cond_dim  # x + t + y + cond_features
         
@@ -114,7 +114,7 @@ class TabDDPM(nn.Module):
         logger.info(f"TabDDPM initialization:")
         logger.info(f"  input_dim: {self.input_dim}")
         logger.info(f"  cond_indices: {self.cond_indices} (dim={cond_dim})")
-        logger.info(f"  denoising_net input_dim: {denoising_input_dim} (5 + 1 + 1 + {cond_dim})")
+        logger.info(f"  denoising_net input_dim: {denoising_input_dim} ({self.input_dim} + 1 + 1 + {cond_dim})")
         
         self.denoising_net = ResidualMLP(
             input_dim=denoising_input_dim,
@@ -158,14 +158,23 @@ class TabDDPM(nn.Module):
         raw_min = np.percentile(X_raw, p_low, axis=0)
         raw_max = np.percentile(X_raw, p_high, axis=0)
 
-        raw_min[0] = 0.0
-        raw_max[0] = 1.0
-        raw_min[2] = -1.0
-        raw_max[2] = 1.0
-        raw_min[3] = 0.0
-        raw_max[3] = 1.0
-        raw_min[4] = 0.0
-        raw_max[4] = 1.0
+        # Protocol-aligned hard ranges (keep others by percentile)
+        if self.input_dim >= 1:
+            raw_min[0] = 0.0
+            raw_max[0] = 1.0
+        if self.input_dim >= 2:
+            raw_min[1] = max(float(raw_min[1]), 0.0)
+        if self.input_dim >= 3:
+            raw_min[2] = -1.0
+            raw_max[2] = 1.0
+        if self.input_dim >= 4:
+            raw_min[3] = max(float(raw_min[3]), 0.0)
+        if self.input_dim >= 5:
+            raw_min[4] = 0.0
+            raw_max[4] = 1.0
+        if self.input_dim >= 6:
+            raw_min[5] = 0.0
+            raw_max[5] = 1.0
 
         device = self.feature_mean.device
         self.feature_mean.data.copy_(torch.from_numpy(mean).to(device))
@@ -186,10 +195,18 @@ class TabDDPM(nn.Module):
 
     def project_protocol_constraints(self, x_raw):
         x = x_raw
-        x[..., 0] = torch.clamp(x[..., 0], 0.0, 1.0)
-        x[..., 2] = torch.clamp(x[..., 2], -1.0, 1.0)
-        x[..., 3] = torch.clamp(x[..., 3], 0.0, 1.0)
-        x[..., 4] = torch.clamp(x[..., 4], 0.0, 1.0)
+        if self.input_dim >= 1:
+            x[..., 0] = torch.clamp(x[..., 0], 0.0, 1.0)
+        if self.input_dim >= 2:
+            x[..., 1] = torch.clamp(x[..., 1], 0.0, float('inf'))
+        if self.input_dim >= 3:
+            x[..., 2] = torch.clamp(x[..., 2], -1.0, 1.0)
+        if self.input_dim >= 4:
+            x[..., 3] = torch.clamp(x[..., 3], 0.0, float('inf'))
+        if self.input_dim >= 5:
+            x[..., 4] = torch.clamp(x[..., 4], 0.0, 1.0)
+        if self.input_dim >= 6:
+            x[..., 5] = torch.clamp(x[..., 5], 0.0, 1.0)
 
         x = torch.max(torch.min(x, self.raw_max), self.raw_min)
         return x
@@ -249,20 +266,20 @@ class TabDDPM(nn.Module):
         Predict noise using denoising network
         
         Args:
-            x_t: (B, 5) - noisy data
+            x_t: (B, D) - noisy data
             t: (B,) - timesteps
             y: (B,) - labels
-            x_cond: (B, 2) - conditional features
+            x_cond: (B, len(cond_indices)) - conditional features
             
         Returns:
-            predicted_noise: (B, 5)
+            predicted_noise: (B, D)
         """
         # Normalize timestep
         t_norm = t.float() / self.timesteps
         
         # Concatenate inputs
         net_input = torch.cat([
-            x_t,  # (B, 5)
+            x_t,  # (B, D)
             t_norm.unsqueeze(-1),  # (B, 1)
             y.unsqueeze(-1).float(),  # (B, 1)
             x_cond  # (B, cond_dim)
@@ -296,9 +313,9 @@ class TabDDPM(nn.Module):
         
         2. 结构感知重建损失 (Structure-Aware Reconstruction Loss):
            L_recon = ||ε_pred[masked] - ε_true[masked]||²
-           - 随机mask依赖特征 (Length, IAT, Window)
+           - 随机mask依赖特征 (Length, IAT, BurstSize)
            - 强制模型学习特征间的依赖关系
-           - 例如: TCP握手包 Length小 → Window也小
+           - 例如: 短握手包通常对应较小的同向BurstSize
         
         3. 分类器自由引导训练 (CFG Training):
            - 80%时间: 模型看到标签 y (条件生成)
@@ -308,7 +325,7 @@ class TabDDPM(nn.Module):
         总损失: L_total = L_diff + λ * L_recon
         
         Args:
-            x_0: (B, 5) - clean data
+            x_0: (B, D) - clean data
             y: (B,) - labels
             mask_prob: float - probability of masking dependent features (default=0.5)
             mask_lambda: float - weight for reconstruction loss (default=0.1)
@@ -501,7 +518,7 @@ class TabDDPM(nn.Module):
         
         3. 条件生成机制:
            - 从高权重样本中采样条件特征 (Direction, Flags)
-           - 模型生成依赖特征 (Length, IAT, Window)
+           - 模型生成依赖特征 (Length, IAT, BurstSize)
            - 保证生成样本符合协议约束
         
         4. 类别平衡策略:
@@ -520,7 +537,7 @@ class TabDDPM(nn.Module):
         - 只用条件特征，依赖特征是学习分布生成的
         
         Args:
-            X_clean: (N, L, 5) - clean original samples (sequences)
+            X_clean: (N, L, D) - clean original samples (sequences)
             y_clean: (N,) - clean labels
             action_mask: (N,) - 0=keep, 1=flip, 2=drop, 3=reweight
             correction_weight: (N,) - lifecycle weights from Hybrid Court
@@ -550,28 +567,38 @@ class TabDDPM(nn.Module):
         # Flatten sequence to packet-level summary for conditioning
         X_flat = np.mean(X_keep, axis=1)  # (N, 5)
 
-        # 计算增强倍数（基于权重的分级策略）
-        def compute_augmentation_multiplier(weight):
-            """
-            根据样本权重计算增强倍数
-            
-            公式：
-                if weight >= 0.9:
-                    multiplier = 4
-                elif weight >= 0.4:
-                    multiplier = 2
-                else:
-                    multiplier = 0
-            """
-            if weight >= 0.9:
-                return 4
-            elif weight >= 0.4:
-                return 2
-            else:
-                return 0
+        # 计算增强倍数（支持两种模式）
+        augmentation_mode = getattr(self.config, 'AUGMENTATION_MODE', 'weighted')
         
-        # 向量化计算所有样本的增强倍数
-        multipliers = np.array([compute_augmentation_multiplier(w) for w in w_keep], dtype=int)
+        if augmentation_mode == 'fixed':
+            # 固定倍数模式：所有样本统一使用配置的倍数
+            fixed_multiplier = int(getattr(self.config, 'AUGMENTATION_RATIO_MIN', 1))
+            multipliers = np.full(len(w_keep), fixed_multiplier, dtype=int)
+            logger.info(f"Using fixed augmentation mode: {fixed_multiplier}x for all samples")
+        else:
+            # 权重自适应模式：根据样本权重计算增强倍数
+            def compute_augmentation_multiplier(weight):
+                """
+                根据样本权重计算增强倍数
+                
+                公式：
+                    if weight >= 0.9:
+                        multiplier = 4
+                    elif weight >= 0.4:
+                        multiplier = 2
+                    else:
+                        multiplier = 0
+                """
+                if weight >= 0.9:
+                    return 4
+                elif weight >= 0.4:
+                    return 2
+                else:
+                    return 0
+            
+            # 向量化计算所有样本的增强倍数
+            multipliers = np.array([compute_augmentation_multiplier(w) for w in w_keep], dtype=int)
+            logger.info(f"Using weighted augmentation mode")
         
         # 统计增强倍数分布
         unique_mults, counts = np.unique(multipliers, return_counts=True)
@@ -624,8 +651,12 @@ class TabDDPM(nn.Module):
             n_generate = templates.shape[0]
             logger.info(f"Generating {n_generate} synthetic samples for class {class_label} (guidance={guidance_scale})")
 
-            # Use template padding mask (real sequences are zero-padded)
-            pad_mask = np.any(templates != 0.0, axis=-1)  # (n_generate, L)
+            # Use ValidMask if available; otherwise fallback to non-zero rows
+            valid_mask_idx = getattr(self.config, 'VALID_MASK_INDEX', None)
+            if valid_mask_idx is not None and int(valid_mask_idx) >= 0 and int(valid_mask_idx) < self.input_dim:
+                pad_mask = templates[:, :, int(valid_mask_idx)] > 0.5
+            else:
+                pad_mask = np.any(templates != 0.0, axis=-1)  # (n_generate, L)
             cond_templates = templates[:, :, self.cond_indices]  # (n_generate, L, 2)
 
             cond_active = cond_templates[pad_mask]  # (n_active, 2)
@@ -655,7 +686,10 @@ class TabDDPM(nn.Module):
                 dep_idx = np.array(self.dep_indices, dtype=int)
                 cond_idx = np.array(self.cond_indices, dtype=int)
                 # Use all real sequences of this class (not only the sampled templates)
-                real_pad_mask = np.any(X_seq_class != 0.0, axis=-1)
+                if valid_mask_idx is not None and int(valid_mask_idx) >= 0 and int(valid_mask_idx) < self.input_dim:
+                    real_pad_mask = X_seq_class[:, :, int(valid_mask_idx)] > 0.5
+                else:
+                    real_pad_mask = np.any(X_seq_class != 0.0, axis=-1)
                 real_dep_all = X_seq_class[:, :, dep_idx][real_pad_mask]
 
                 # Active rows follow row-major order of (n_generate, L)

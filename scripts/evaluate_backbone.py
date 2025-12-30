@@ -4,6 +4,13 @@ Stage1 训练结束后，用真值标签评估特征空间质量
 决定是否需要 Stage 2.5 (SupCon 微调)
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to path
+project_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(project_root))
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -12,12 +19,15 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import accuracy_score, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
-from pathlib import Path
 import json
 from tqdm import tqdm
 
 from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone
 from MoudleCode.utils.config import Config
+from MoudleCode.utils.visualization import _configure_matplotlib_chinese_fonts
+
+# 配置matplotlib中文字体
+_configure_matplotlib_chinese_fonts()
 
 
 class BackboneEvaluator:
@@ -115,8 +125,8 @@ class BackboneEvaluator:
             s=20
         )
         ax.set_title('骨干网络特征空间 (真实标签)', fontsize=14, fontweight='bold')
-        ax.set_xlabel('t-SNE Dim 1')
-        ax.set_ylabel('t-SNE Dim 2')
+        ax.set_xlabel('t-SNE Dim 1', fontsize=12)
+        ax.set_ylabel('t-SNE Dim 2', fontsize=12)
         cbar = plt.colorbar(scatter, ax=ax)
         cbar.set_label('Label (0=benign, 1=malicious)', rotation=270, labelpad=20)
         

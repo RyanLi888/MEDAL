@@ -4,9 +4,11 @@ Evaluate trained model on test dataset
 """
 import sys
 import os
-# 添加项目根目录到路径
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
-sys.path.insert(0, project_root)
+from pathlib import Path
+
+# Ensure project root is on sys.path when running as a script
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
 
 import torch
 from torch.utils.data import TensorDataset, DataLoader
@@ -26,6 +28,7 @@ from MoudleCode.utils.visualization import (
 from MoudleCode.preprocessing.pcap_parser import load_dataset
 from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone
 from MoudleCode.classification.dual_stream import MEDAL_Classifier
+from MoudleCode.utils.checkpoint import load_state_dict_shape_safe
 
 # 导入预处理模块
 try:
@@ -34,55 +37,13 @@ try:
 except ImportError:
     PREPROCESS_AVAILABLE = False
 
-import logging
-
-
-def _load_state_dict_shape_safe(model, state_dict, logger, prefix="model"):
-    model_sd = model.state_dict()
-    filtered = {}
-    skipped_missing = []
-    skipped_shape = []
-    for k, v in state_dict.items():
-        if k not in model_sd:
-            skipped_missing.append(k)
-            continue
-        try:
-            if tuple(v.shape) != tuple(model_sd[k].shape):
-                skipped_shape.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
-                continue
-        except Exception:
-            skipped_shape.append((k, None, None))
-            continue
-        filtered[k] = v
-
-    missing, unexpected = model.load_state_dict(filtered, strict=False)
-
-    if skipped_shape:
-        logger.warning(f"⚠ {prefix} checkpoint contains shape-mismatched keys; they were skipped (showing up to 20):")
-        for k, src, dst in skipped_shape[:20]:
-            logger.warning(f"  - {k}: ckpt={src} model={dst}")
-    if skipped_missing:
-        logger.warning(f"⚠ {prefix} checkpoint contains unknown keys; they were skipped (showing up to 20):")
-        for k in skipped_missing[:20]:
-            logger.warning(f"  - {k}")
-    if missing:
-        logger.warning(f"⚠ {prefix} missing_keys after loading (showing up to 20): {missing[:20]}")
-    if unexpected:
-        logger.warning(f"⚠ {prefix} unexpected_keys after loading (showing up to 20): {unexpected[:20]}")
-
-    logger.info(
-        f"✓ {prefix} state_dict loaded (matched={len(filtered)}/{len(state_dict)}; "
-        f"skipped_shape={len(skipped_shape)} skipped_unknown={len(skipped_missing)})"
-    )
-
-
 def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
     """
     Test the model on test dataset
     
     Args:
         classifier: Trained MEDAL classifier
-        X_test: (N, L, 5) test sequences
+        X_test: (N, L, D) test sequences
         y_test: (N,) test labels
         config: configuration object
         logger: logger
@@ -95,7 +56,8 @@ def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
     logger.info("🔍 模型测试 Model Testing")
     logger.info("="*70)
     logger.info(f"测试样本数: {len(X_test)}")
-    logger.info(f"批次大小: 64")
+    test_batch_size = int(getattr(config, 'TEST_BATCH_SIZE', 256))
+    logger.info(f"批次大小: {test_batch_size}")
     
     # 记录配置中的参考阈值（用于对比与可视化）
     config_threshold = getattr(config, 'MALICIOUS_THRESHOLD', 0.5)
@@ -107,7 +69,7 @@ def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
     
     # Create DataLoader
     dataset = TensorDataset(torch.FloatTensor(X_test), torch.LongTensor(y_test))
-    test_loader = DataLoader(dataset, batch_size=64, shuffle=False)
+    test_loader = DataLoader(dataset, batch_size=test_batch_size, shuffle=False)
     total_batches = len(test_loader)
     
     # Collect probabilities / labels / features（先不使用阈值）
@@ -134,7 +96,7 @@ def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
             # 每10个批次或最后一个批次输出进度
             if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == total_batches:
                 progress = (batch_idx + 1) / total_batches * 100
-                processed = (batch_idx + 1) * 64
+                processed = min((batch_idx + 1) * test_batch_size, len(X_test))
                 logger.info(f"  推理进度: {batch_idx+1}/{total_batches} batches ({progress:.1f}%) | 已处理 {processed}/{len(X_test)} 个样本")
     
     # Concatenate results
@@ -250,6 +212,11 @@ def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
     
     logger.info(f"  ✓ 预测结果: {results_file}")
     logger.info(f"  ✓ 性能指标: {metrics_file}")
+    
+    # 添加标准化的键名以便对比
+    metrics['precision'] = metrics['precision_pos']
+    metrics['recall'] = metrics['recall_pos']
+    metrics['f1'] = metrics['f1_pos']
     
     return metrics
 
@@ -379,58 +346,176 @@ def main(args):
     except TypeError:
         backbone_state = torch.load(backbone_path, map_location=config.DEVICE)
 
-    _load_state_dict_shape_safe(backbone, backbone_state, logger, prefix="backbone")
+    load_state_dict_shape_safe(backbone, backbone_state, logger, prefix="backbone")
     backbone.freeze()
     logger.info(f"✓ 骨干网络加载完成")
     
-    # Load classifier from classification directory
-    classifier = MEDAL_Classifier(backbone, config)
-    classifier_path = None
-
-    if hasattr(args, 'classifier_path') and args.classifier_path:
-        classifier_path = args.classifier_path
-    else:
-        best_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_best_f1.pth")
-        final_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_final.pth")
-        classifier_path = best_path if os.path.exists(best_path) else final_path
+    # ========================
+    # Load classifiers (both best and final)
+    # ========================
+    best_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_best_f1.pth")
+    final_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_final.pth")
     
-    if not os.path.exists(classifier_path):
-        logger.error(f"❌ 分类器检查点未找到: {classifier_path}")
+    # 检查哪些模型存在
+    has_best = os.path.exists(best_path)
+    has_final = os.path.exists(final_path)
+    
+    if not has_best and not has_final:
+        logger.error(f"❌ 未找到任何分类器检查点!")
+        logger.error(f"  Best模型: {best_path}")
+        logger.error(f"  Final模型: {final_path}")
         logger.error("请先运行训练脚本!")
         return
     
-    logger.info("正在加载分类器...")
-    logger.info(f"  📥 输入模型: {classifier_path}")
-    try:
-        classifier_state = torch.load(classifier_path, map_location=config.DEVICE, weights_only=True)
-    except TypeError:
-        classifier_state = torch.load(classifier_path, map_location=config.DEVICE)
-    classifier.load_state_dict(classifier_state)
-    logger.info(f"✓ 分类器加载完成")
+    # 如果命令行指定了分类器路径，只测试指定的模型
+    if hasattr(args, 'classifier_path') and args.classifier_path:
+        logger.info("正在加载指定的分类器...")
+        logger.info(f"  📥 输入模型: {args.classifier_path}")
+        
+        classifier = MEDAL_Classifier(backbone, config)
+        try:
+            classifier_state = torch.load(args.classifier_path, map_location=config.DEVICE, weights_only=True)
+        except TypeError:
+            classifier_state = torch.load(args.classifier_path, map_location=config.DEVICE)
+        classifier.load_state_dict(classifier_state)
+        logger.info(f"✓ 分类器加载完成")
+        
+        # Count parameters
+        n_params = sum(p.numel() for p in classifier.parameters())
+        n_trainable = sum(p.numel() for p in classifier.parameters() if p.requires_grad)
+        logger.info("")
+        logger.info("📊 模型参数统计:")
+        logger.info(f"  总参数量: {n_params:,}")
+        logger.info(f"  可训练参数: {n_trainable:,} (骨干网络已冻结)")
+        logger.info("")
+        
+        # Test single model
+        metrics = test_model(classifier, X_test, y_test, config, logger)
+        
+        logger.info("")
+        logger.info("="*70)
+        logger.info("🎉 测试完成! Testing Complete!")
+        logger.info("="*70)
+        logger.info("")
+        logger.info("📁 输出文件路径:")
+        logger.info(f"  ✓ 预测结果: {os.path.join(config.RESULT_DIR, 'models', 'test_predictions.npz')}")
+        logger.info(f"  ✓ 性能指标: {os.path.join(config.RESULT_DIR, 'models', 'test_metrics.txt')}")
+        logger.info(f"  ✓ 可视化图表: {os.path.join(config.RESULT_DIR, 'figures')}")
+        logger.info("")
+        logger.info("="*70)
+        
+        return metrics
     
-    # Count parameters
-    n_params = sum(p.numel() for p in classifier.parameters())
-    n_trainable = sum(p.numel() for p in classifier.parameters() if p.requires_grad)
+    # 否则，测试所有可用的模型并对比
     logger.info("")
-    logger.info("📊 模型参数统计:")
-    logger.info(f"  总参数量: {n_params:,}")
-    logger.info(f"  可训练参数: {n_trainable:,} (骨干网络已冻结)")
+    logger.info("="*70)
+    logger.info("🔬 对比测试：Best F1 vs Final 模型")
+    logger.info("="*70)
+    logger.info(f"  Best F1模型: {'✓ 存在' if has_best else '✗ 不存在'}")
+    logger.info(f"  Final模型:   {'✓ 存在' if has_final else '✗ 不存在'}")
     logger.info("")
+    
+    models_to_test = []
+    if has_best:
+        models_to_test.append(("Best F1", best_path))
+    if has_final:
+        models_to_test.append(("Final", final_path))
+    
+    all_metrics = {}
+    
+    for model_name, model_path in models_to_test:
+        logger.info("="*70)
+        logger.info(f"📊 测试模型: {model_name}")
+        logger.info("="*70)
+        logger.info(f"正在加载分类器...")
+        logger.info(f"  📥 输入模型: {model_path}")
+        
+        classifier = MEDAL_Classifier(backbone, config)
+        try:
+            classifier_state = torch.load(model_path, map_location=config.DEVICE, weights_only=True)
+        except TypeError:
+            classifier_state = torch.load(model_path, map_location=config.DEVICE)
+        classifier.load_state_dict(classifier_state)
+        logger.info(f"✓ 分类器加载完成")
+        
+        if model_name == "Best F1":
+            # Count parameters only once
+            n_params = sum(p.numel() for p in classifier.parameters())
+            n_trainable = sum(p.numel() for p in classifier.parameters() if p.requires_grad)
+            logger.info("")
+            logger.info("📊 模型参数统计:")
+            logger.info(f"  总参数量: {n_params:,}")
+            logger.info(f"  可训练参数: {n_trainable:,} (骨干网络已冻结)")
+            logger.info("")
+        
+        # Test model with specific save prefix
+        save_prefix = "test_best" if model_name == "Best F1" else "test_final"
+        metrics = test_model(classifier, X_test, y_test, config, logger, save_prefix=save_prefix)
+        all_metrics[model_name] = metrics
+        
+        logger.info("")
     
     # ========================
-    # Test Model
+    # Compare Results
     # ========================
-    metrics = test_model(classifier, X_test, y_test, config, logger)
+    if len(all_metrics) > 1:
+        logger.info("="*70)
+        logger.info("📊 模型对比结果")
+        logger.info("="*70)
+        logger.info("")
+        
+        # 创建对比表格
+        logger.info(f"{'指标':<20} | {'Best F1':<12} | {'Final':<12} | {'差异':<12}")
+        logger.info("-"*70)
+        
+        metrics_to_compare = ['accuracy', 'precision', 'recall', 'f1', 'f1_macro', 'auc']
+        metric_names = {
+            'accuracy': 'Accuracy',
+            'precision': 'Precision (pos=1)',
+            'recall': 'Recall (pos=1)',
+            'f1': 'F1 (pos=1)',
+            'f1_macro': 'F1-Macro',
+            'auc': 'AUC'
+        }
+        
+        for metric_key in metrics_to_compare:
+            if metric_key in all_metrics.get("Best F1", {}) and metric_key in all_metrics.get("Final", {}):
+                best_val = all_metrics["Best F1"][metric_key]
+                final_val = all_metrics["Final"][metric_key]
+                diff = final_val - best_val
+                diff_str = f"{diff:+.4f}" if abs(diff) > 0.0001 else "0.0000"
+                
+                # 标记哪个更好
+                if abs(diff) > 0.001:
+                    if diff > 0:
+                        marker = " ← Final更好"
+                    else:
+                        marker = " ← Best更好"
+                else:
+                    marker = " (相近)"
+                
+                logger.info(f"{metric_names[metric_key]:<20} | {best_val:<12.4f} | {final_val:<12.4f} | {diff_str:<12}{marker}")
+        
+        logger.info("")
+        logger.info("💡 说明:")
+        logger.info("  - Best F1: 训练过程中验证集F1最高的模型")
+        logger.info("  - Final: 训练结束时的最终模型")
+        logger.info("  - 差异: Final - Best F1 (正值表示Final更好)")
+        logger.info("")
     
-    logger.info("")
     logger.info("="*70)
     logger.info("🎉 测试完成! Testing Complete!")
     logger.info("="*70)
     logger.info("")
     logger.info("📁 输出文件路径:")
-    logger.info(f"  ✓ 预测结果: {os.path.join(config.RESULT_DIR, 'models', 'test_predictions.npz')}")
-    logger.info(f"  ✓ 性能指标: {os.path.join(config.RESULT_DIR, 'models', 'test_metrics.txt')}")
-    logger.info(f"  ✓ 可视化图表: {os.path.join(config.RESULT_DIR, 'figures')}")
+    if has_best:
+        logger.info(f"  ✓ Best F1预测结果: {os.path.join(config.RESULT_DIR, 'models', 'test_best_predictions.npz')}")
+        logger.info(f"  ✓ Best F1性能指标: {os.path.join(config.RESULT_DIR, 'models', 'test_best_metrics.txt')}")
+        logger.info(f"  ✓ Best F1可视化: {os.path.join(config.RESULT_DIR, 'figures', 'test_best_*.png')}")
+    if has_final:
+        logger.info(f"  ✓ Final预测结果: {os.path.join(config.RESULT_DIR, 'models', 'test_final_predictions.npz')}")
+        logger.info(f"  ✓ Final性能指标: {os.path.join(config.RESULT_DIR, 'models', 'test_final_metrics.txt')}")
+        logger.info(f"  ✓ Final可视化: {os.path.join(config.RESULT_DIR, 'figures', 'test_final_*.png')}")
     logger.info("")
     logger.info("="*70)
     

@@ -20,18 +20,20 @@ MEDAL-Lite 数据预处理脚本
 
 预处理后的文件:
     output/preprocessed/
-    ├── train_X.npy      # 训练集特征 (N, 1024, 5)
+    ├── train_X.npy      # 训练集特征 (N, 1024, 6)
     ├── train_y.npy      # 训练集标签 (N,)
     ├── train_files.npy  # 训练集文件名
-    ├── test_X.npy       # 测试集特征 (M, 1024, 5)
+    ├── test_X.npy       # 测试集特征 (M, 1024, 6)
     ├── test_y.npy       # 测试集标签 (M,)
     └── test_files.npy   # 测试集文件名
 """
 import sys
 import os
-# 添加项目根目录到路径
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
-sys.path.insert(0, project_root)
+from pathlib import Path
+
+# Ensure project root is on sys.path when running as a script
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
 
 import numpy as np
 import argparse
@@ -39,17 +41,12 @@ import time
 from datetime import datetime
 
 from MoudleCode.utils.config import config
+from MoudleCode.utils.helpers import setup_logger
 from MoudleCode.preprocessing.pcap_parser import load_dataset
 
 import logging
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+logger = setup_logger(os.path.join(config.OUTPUT_ROOT, "logs"), name='preprocess')
 
 
 def get_preprocessed_dir():
@@ -91,7 +88,7 @@ def load_preprocessed(data_type='train'):
         data_type: 'train' 或 'test'
         
     Returns:
-        X: numpy array (N, L, 5)
+        X: numpy array (N, L, 6)
         y: numpy array (N,)
         files: list of filenames
     """
@@ -109,7 +106,7 @@ def save_preprocessed(X, y, files, data_type='train'):
     保存预处理后的数据
     
     Args:
-        X: numpy array (N, L, 5)
+        X: numpy array (N, L, 6)
         y: numpy array (N,)
         files: list of filenames
         data_type: 'train' 或 'test'

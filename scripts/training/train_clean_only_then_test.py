@@ -1,8 +1,10 @@
 import os
 import sys
-# 添加项目根目录到路径
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
-sys.path.insert(0, project_root)
+from pathlib import Path
+
+# Ensure project root is on sys.path when running as a script
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
 import json
 import shutil
 import argparse
@@ -81,6 +83,27 @@ def main():
     set_seed(args.seed)
     config.create_dirs()
     logger = setup_logger(os.path.join(config.OUTPUT_ROOT, 'logs'), name='clean_only_train_test')
+
+    # ----------------------------
+    # Pure focal-loss mode (for clean-only overfit/debug experiments)
+    # Keep gradients simple: no SoftF1 / no orthogonality / no consistency.
+    # ----------------------------
+    config.USE_FOCAL_LOSS = True
+    config.USE_SOFT_F1_LOSS = False
+    config.SOFT_F1_WEIGHT = 0.0
+    config.SOFT_ORTH_WEIGHT_START = 0.0
+    config.SOFT_ORTH_WEIGHT_END = 0.0
+    config.CONSISTENCY_WEIGHT_START = 0.0
+    config.CONSISTENCY_WEIGHT_END = 0.0
+
+    # Enable backbone finetuning in clean-only experiments (do not overwrite original backbone file).
+    config.FINETUNE_BACKBONE = True
+    tmp_scope = str(getattr(config, 'FINETUNE_BACKBONE_SCOPE', 'projection')).lower()
+    config.FINETUNE_BACKBONE_SCOPE = tmp_scope if tmp_scope in ('projection', 'all') else 'projection'
+
+    # Use full training data in this mode; allow early-stopping on train metric.
+    config.FINETUNE_VAL_SPLIT = 0.0
+    config.FINETUNE_ES_ALLOW_TRAIN_METRIC = True
 
     run_tag = args.run_tag.strip() or datetime.now().strftime('%Y%m%d_%H%M%S')
     run_dir = os.path.join(config.LABEL_CORRECTION_DIR, 'analysis', 'clean_only_runs', run_tag)
@@ -251,6 +274,7 @@ def main():
             config,
             logger,
             n_original=len(X_tr),
+            backbone_path=backbone_path,
         )
 
         classifier_final = os.path.join(config.CLASSIFICATION_DIR, 'models', 'classifier_final.pth')
@@ -266,8 +290,21 @@ def main():
         logger.info(f'  - 分类器: {classifier_best}')
         logger.info('')
         
+        # Prefer finetuned backbone if available (read from model metadata)
+        meta_path = os.path.join(config.CLASSIFICATION_DIR, 'models', 'model_metadata.json')
+        backbone_path_for_test = backbone_path
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                bp = meta.get('backbone_path', '')
+                if isinstance(bp, str) and bp.strip():
+                    backbone_path_for_test = bp
+            except Exception:
+                pass
+
         # 创建测试参数，传递骨干网络路径
-        test_args = argparse.Namespace(backbone_path=backbone_path, classifier_path=classifier_best)
+        test_args = argparse.Namespace(backbone_path=backbone_path_for_test, classifier_path=classifier_best)
         test_main(test_args)
 
         result_models_dir = os.path.join(config.RESULT_DIR, 'models')

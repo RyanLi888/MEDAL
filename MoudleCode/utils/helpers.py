@@ -8,6 +8,8 @@ import os
 import logging
 from datetime import datetime
 
+from MoudleCode.utils.logging_utils import setup_logger
+
 
 def set_seed(seed=42):
     """Set random seed for reproducibility"""
@@ -19,50 +21,6 @@ def set_seed(seed=42):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-
-
-def setup_logger(log_dir, name='medal'):
-    """
-    Setup logger
-    
-    Note: Only uses StreamHandler to avoid duplicate logs.
-    Log files are managed by the shell script (run_experiment.sh) via tee.
-    
-    Configures root logger to ensure all sub-module loggers (like hybrid_court)
-    can output their logs properly.
-    """
-    # Configure root logger to ensure all sub-module loggers can output
-    # Sub-modules like MoudleCode.label_correction.hybrid_court use 
-    # logging.getLogger(__name__), which will propagate to root logger
-    root_logger = logging.getLogger()
-    
-    # Only configure if not already configured (avoid duplicate handlers)
-    if not root_logger.handlers:
-        root_logger.setLevel(logging.INFO)
-        
-        # Only use StreamHandler - let shell script manage log files
-        # This avoids duplicate logs when shell script uses tee
-        stream_handler = logging.StreamHandler()
-        stream_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        stream_handler.setFormatter(formatter)
-        root_logger.addHandler(stream_handler)
-    else:
-        # Ensure root logger level is INFO
-        root_logger.setLevel(logging.INFO)
-    
-    # Get the specific logger (for backward compatibility)
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    
-    # Allow propagation so sub-module loggers can output
-    # This ensures logs from hybrid_court, tabddpm, etc. are visible
-    logger.propagate = True
-    
-    return logger
 
 
 def count_parameters(model):

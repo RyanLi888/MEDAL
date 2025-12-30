@@ -117,7 +117,7 @@ def extract_features_with_backbone(backbone, X_data, config, logger):
     
     Args:
         backbone: Pre-trained MicroBiMambaBackbone
-        X_data: (N, L, 5) input sequences
+        X_data: (N, L, D) input sequences
         config: configuration object
         logger: logger
         

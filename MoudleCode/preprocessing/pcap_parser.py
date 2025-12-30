@@ -1,6 +1,6 @@
 """
 PCAP Parser Module
-Extracts 5-dimensional features from PCAP files
+Extracts 6-dimensional features from PCAP files
 """
 import numpy as np
 import os
@@ -9,6 +9,11 @@ import re
 from scapy.all import rdpcap, IP, TCP
 from scapy.error import Scapy_Exception
 import logging
+
+try:
+    from MoudleCode.utils.config import config
+except Exception:
+    config = None
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +93,7 @@ class PCAPParser:
     
     def parse_pcap_file(self, pcap_path, extract_flows=True):
         """
-        Parse a single PCAP file and extract 5D features
+        Parse a single PCAP file and extract 6D features
         
         If extract_flows=True, extracts multiple flows from the PCAP file.
         Each flow is identified by 5-tuple (src_ip, dst_ip, src_port, dst_port, protocol).
@@ -130,9 +135,9 @@ class PCAPParser:
             logger.warning(f"No valid flows found in {pcap_path}")
             return []
         
-        logger.info(f"在 {os.path.basename(pcap_path)} 中发现 {len(flows)} 条流，开始提取5维特征...")
-        logger.info(f"  每个数据包提取: [Length, Log-IAT, Direction, Flags, Window]")
-        logger.info(f"  每个流转换为: 1024×5 的特征序列")
+        logger.info(f"在 {os.path.basename(pcap_path)} 中发现 {len(flows)} 条流，开始提取6维特征...")
+        logger.info(f"  每个数据包提取: [Length, Log-IAT, Direction, BurstSize, CumulativeLen, ValidMask]")
+        logger.info(f"  每个流转换为: 1024×6 的特征序列")
         logger.info("")
         
         # Extract features for each flow
@@ -147,25 +152,25 @@ class PCAPParser:
                 all_flow_features.append(flow_features)
                 # 每10条流或最后一条流输出详细日志
                 if flow_count % 10 == 0 or flow_count == len(flows):
-                    logger.info(f"  ✓ 完成 {flow_count}/{len(flows)} 条流 (当前流包含 {len(flow_packets)} 个数据包，已提取 {flow_features.shape[0]}×5 特征)")
+                    logger.info(f"  ✓ 完成 {flow_count}/{len(flows)} 条流 (当前流包含 {len(flow_packets)} 个数据包，已提取 {flow_features.shape[0]}×6 特征)")
             else:
                 logger.warning(f"  ✗ 流 {flow_count}/{len(flows)} 解析失败")
         
         logger.info("")
-        logger.info(f"✓ 成功提取 {len(all_flow_features)}/{len(flows)} 条流的5维特征序列")
+        logger.info(f"✓ 成功提取 {len(all_flow_features)}/{len(flows)} 条流的6维特征序列")
         
         return all_flow_features if len(all_flow_features) > 0 else []
     
     def _parse_single_flow(self, packets):
         """
-        Parse a single flow (list of packets) and extract 5D features
+        Parse a single flow (list of packets) and extract 6D features
         
         Args:
             packets: List of Scapy packets belonging to one flow
             
         Returns:
-            features: numpy array of shape (L, 5)
-                     [Length, Log-IAT, Direction, Flags, Window]
+            features: numpy array of shape (L, 6)
+                     [Length, Log-IAT, Direction, BurstSize, CumulativeLen, ValidMask]
         """
         if len(packets) == 0:
             return None
@@ -174,7 +179,11 @@ class PCAPParser:
         packets = sorted(packets, key=lambda p: float(p.time))
         
         # Extract features
-        features_list = []
+        length_norm_list = []
+        log_iat_list = []
+        direction_list = []
+        raw_length_list = []
+        raw_iat_list = []
         prev_time = None
         
         # Determine flow direction (use first packet with IP layer)
@@ -195,15 +204,17 @@ class PCAPParser:
             
             # Feature 0: Length (normalized by 1500)
             length = len(pkt)
+            raw_length_list.append(float(length))
             length_norm = min(length / 1500.0, 1.0)
             
             # Feature 1: Log-IAT (Inter-Arrival Time)
             if prev_time is None:
+                raw_iat = 0.0
                 log_iat = 0.0
                 prev_time = float(pkt.time)
             else:
-                iat = float(pkt.time) - prev_time
-                log_iat = np.log(iat + 1e-7)
+                raw_iat = float(pkt.time) - prev_time
+                log_iat = np.log1p(max(raw_iat, 0.0))
                 prev_time = float(pkt.time)
             
             # Feature 2: Direction (+1: client->server, -1: server->client)
@@ -212,30 +223,59 @@ class PCAPParser:
             else:
                 direction = -1.0
             
-            # Feature 3: Flags (TCP flags encoded)
-            flags_val = 0.0
-            if TCP in pkt:
-                tcp_flags = pkt[TCP].flags
-                syn = 1.0 if 'S' in str(tcp_flags) else 0.0
-                fin = 1.0 if 'F' in str(tcp_flags) else 0.0
-                rst = 1.0 if 'R' in str(tcp_flags) else 0.0
-                psh = 1.0 if 'P' in str(tcp_flags) else 0.0
-                ack = 1.0 if 'A' in str(tcp_flags) else 0.0
-                
-                flags_val = (syn * 16 + fin * 8 + rst * 4 + psh * 2 + ack) / 31.0
-            
-            # Feature 4: Window (TCP window size normalized)
-            window = 0.0
-            if TCP in pkt:
-                window = min(pkt[TCP].window / 65535.0, 1.0)
-            
-            features_list.append([length_norm, log_iat, direction, flags_val, window])
+            length_norm_list.append(float(length_norm))
+            log_iat_list.append(float(log_iat))
+            direction_list.append(float(direction))
+            raw_iat_list.append(float(raw_iat))
         
-        if len(features_list) == 0:
+        if len(length_norm_list) == 0:
             return None
-        
+
+        raw_lengths = np.asarray(raw_length_list, dtype=np.float32)
+        directions = np.asarray(direction_list, dtype=np.float32)
+        raw_iats = np.asarray(raw_iat_list, dtype=np.float32)
+
+        burst_iat_th = 0.1
+        try:
+            if config is not None and hasattr(config, 'BURST_IAT_THRESHOLD'):
+                burst_iat_th = float(getattr(config, 'BURST_IAT_THRESHOLD'))
+        except Exception:
+            burst_iat_th = 0.1
+
+        burst_size = np.zeros((raw_lengths.shape[0],), dtype=np.float32)
+        if raw_lengths.shape[0] > 0:
+            start_idx = 0
+            current_dir = directions[0]
+            current_sum = raw_lengths[0]
+            for i in range(1, raw_lengths.shape[0]):
+                new_burst = (directions[i] != current_dir) or (raw_iats[i] > burst_iat_th)
+                if new_burst:
+                    burst_size[start_idx:i] = current_sum
+                    start_idx = i
+                    current_dir = directions[i]
+                    current_sum = raw_lengths[i]
+                else:
+                    current_sum += raw_lengths[i]
+            burst_size[start_idx:] = current_sum
+        burst_size = np.log1p(burst_size).astype(np.float32)
+
+        total_len = float(raw_lengths.sum()) if raw_lengths.size > 0 else 0.0
+        if total_len > 0:
+            cumulative_len = (np.cumsum(raw_lengths) / total_len).astype(np.float32)
+        else:
+            cumulative_len = np.zeros((raw_lengths.shape[0],), dtype=np.float32)
+
+        valid_mask = np.ones((raw_lengths.shape[0],), dtype=np.float32)
+
         # Convert to numpy array
-        features = np.array(features_list, dtype=np.float32)
+        features = np.column_stack([
+            np.asarray(length_norm_list, dtype=np.float32),
+            np.asarray(log_iat_list, dtype=np.float32),
+            np.asarray(direction_list, dtype=np.float32),
+            burst_size,
+            cumulative_len,
+            valid_mask,
+        ]).astype(np.float32)
         
         # Sequence alignment (truncate or pad to L=1024)
         features = self._align_sequence(features)
@@ -247,10 +287,10 @@ class PCAPParser:
         Align sequence to fixed length L
         
         Args:
-            features: numpy array of shape (N, 5)
+            features: numpy array of shape (N, 6)
             
         Returns:
-            aligned_features: numpy array of shape (L, 5)
+            aligned_features: numpy array of shape (L, 6)
         """
         n_packets = features.shape[0]
         
@@ -259,7 +299,7 @@ class PCAPParser:
             return features[:self.sequence_length]
         else:
             # Pad: append zeros
-            padding = np.zeros((self.sequence_length - n_packets, 5), dtype=np.float32)
+            padding = np.zeros((self.sequence_length - n_packets, 6), dtype=np.float32)
             return np.vstack([features, padding])
     
     def parse_directory(self, directory, label, max_flows=None):
@@ -377,7 +417,7 @@ def load_dataset(benign_dir, malicious_dir, sequence_length=1024):
         sequence_length: Sequence length for feature extraction
         
     Returns:
-        X: numpy array of shape (N, L, 5)
+        X: numpy array of shape (N, L, 6)
         y: numpy array of shape (N,)
         filenames: list of filenames
     """

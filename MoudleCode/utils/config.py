@@ -37,8 +37,29 @@ class Config:
     PACKET_TIMEOUT = 60  # 流超时时间(秒)
     MAX_PACKETS_PER_FLOW = 1024  # 每个流最大包数
     
-    # 5维特征
-    FEATURE_NAMES = ['Length', 'Log-IAT', 'Direction', 'Flags', 'Window']
+    # 6维特征
+    FEATURE_NAMES = ['Length', 'Log-IAT', 'Direction', 'BurstSize', 'CumulativeLen', 'ValidMask']
+
+    LENGTH_INDEX = 0
+    IAT_INDEX = 1
+    DIRECTION_INDEX = 2
+    BURST_SIZE_INDEX = 3
+    CUMULATIVE_LEN_INDEX = 4
+    VALID_MASK_INDEX = 5
+
+    # Burst 检测阈值（秒）
+    # 用于判定突发边界：当包间隔 > 阈值时，认为是新的突发
+    # 
+    # 推荐值：
+    # - 0.1s (默认): 通用场景，适合大多数流量
+    # - 0.05s: 中等敏感度，能捕捉更细粒度的突发
+    # - 0.01s: 高敏感度，适合检测隧道流量（如 Iodine）的碎片化传输
+    # 
+    # 针对 DoHBrw 数据集（包含 Iodine/DNS2TCP 隧道）：
+    # - Iodine 会将数据切成大量小包快速发送（微秒级间隔）
+    # - 使用 0.01s 可以更好地捕捉这种"密集碎片"模式
+    # - 避免将碎片合并成一个大 Burst，丢失隧道特征
+    BURST_IAT_THRESHOLD = 0.01  # 从 0.1 降低到 0.01，更好地检测隧道碎片
     
     # 特征归一化参数
     MTU = 1500.0  # 最大传输单元
@@ -47,24 +68,24 @@ class Config:
     
     # ==================== Input & Embedding Parameters ====================
     SEQUENCE_LENGTH = 1024  # L: Maximum number of packets per flow
-    INPUT_FEATURE_DIM = 5   # [Length, Log-IAT, Direction, Flags, Window]
-    MODEL_DIM = 64          # d_model: Embedding dimension
-    OUTPUT_DIM = 64         # backbone最终输出维度（下游分类/对比学习使用）
+    INPUT_FEATURE_DIM = 6
+    MODEL_DIM = 32          # d_model: Embedding dimension (降低到32维)
+    OUTPUT_DIM = 32         # backbone最终输出维度（下游分类/对比学习使用）
     FEATURE_DIM = OUTPUT_DIM
     EMBEDDING_DROPOUT = 0.1
     POSITIONAL_ENCODING = "sinusoidal"  # 正弦位置编码
     
     # ==================== Micro-Bi-Mamba Backbone ====================
     MAMBA_LAYERS = 2
-    MAMBA_STATE_DIM = 16        # d_state: SSM internal memory capacity
+    MAMBA_STATE_DIM = 8         # d_state: SSM internal memory capacity (降低到8)
     MAMBA_EXPANSION_FACTOR = 2   # E: Expansion factor
     MAMBA_CONV_KERNEL = 4        # Local conv kernel size
     MAMBA_DROPOUT = 0.1
     MAMBA_FUSION_TYPE = "concat_project"  # "average" 或 "concat_project"
-    MAMBA_PROJECTION_DIM = 128   # Concat后的投影维度(64*2)
+    MAMBA_PROJECTION_DIM = 64    # Concat后的投影维度(32*2)
     
     # ==================== Pre-training (Stage 1) ====================
-    PRETRAIN_EPOCHS = 300  # 从 200 增加到 300，给 InfoNCE 更多收敛时间
+    PRETRAIN_EPOCHS = 500  # 给 Stage 1 充分收敛时间（默认上限）
     PRETRAIN_BATCH_SIZE = 64  # 降低批次大小以适应10.75GB显存 (从128降至64)
     PRETRAIN_BATCH_SIZE_NNCLR = 64  # NNCLR 专用批次大小（显存占用高，需要更小）
     PRETRAIN_GRADIENT_ACCUMULATION_STEPS = 2  # 梯度累积步数，有效批次 = 64 * 2 = 128
@@ -72,7 +93,7 @@ class Config:
     PRETRAIN_LR = 1e-3
     PRETRAIN_WEIGHT_DECAY = 1e-4
     PRETRAIN_MIN_LR = 1e-5
-    PRETRAIN_EARLY_STOPPING = True
+    PRETRAIN_EARLY_STOPPING = True  # 启用早停机制
     PRETRAIN_ES_WARMUP_EPOCHS = 50
     PRETRAIN_ES_PATIENCE = 30  # 从 20 增加到 30，更宽容的早停策略
     PRETRAIN_ES_MIN_DELTA = 0.005  # 从 0.01 降低到 0.005，更敏感的改进检测
@@ -111,12 +132,18 @@ class Config:
     TRAFFIC_AUG_JITTER_STD = 0.1  # 抖动标准差
     TRAFFIC_AUG_MASK_RATIO = 0.15  # 掩码比例
     
+    # Burst 抖动增强（针对隧道流量的鲁棒性）
+    # 模拟真实网络环境中的拥塞，导致突发大小和边界发生微小变化
+    # 防止模型死记硬背具体的 Burst 数值
+    TRAFFIC_AUG_BURST_JITTER_PROB = 0.5  # Burst 抖动概率
+    TRAFFIC_AUG_BURST_JITTER_STD = 0.05  # Burst 抖动标准差（±5%）
+    
     # ==================== Label Correction (Stage 2) ====================
     # CL (Confident Learning)
     CL_K_FOLD = 5
     
     # MADE (Density Estimation)
-    MADE_HIDDEN_DIMS = [128, 256, 128]
+    MADE_HIDDEN_DIMS = [64, 128, 64]  # 降低到32维系统对应的隐藏层维度
     MADE_DENSITY_THRESHOLD_PERCENTILE = 70  # Top 70% = Dense
     
     # KNN (Semantic Voting)
@@ -125,8 +152,13 @@ class Config:
     
     # ==================== Data Augmentation (Stage 2) ====================
     # TabDDPM parameters
+    DDPM_EPOCHS = 300
+    DDPM_EARLY_STOPPING = True
+    DDPM_ES_WARMUP_EPOCHS = 20
+    DDPM_ES_PATIENCE = 30
+    DDPM_ES_MIN_DELTA = 0.001
     DDPM_TIMESTEPS = 1000
-    DDPM_HIDDEN_DIMS = [128, 256, 128]
+    DDPM_HIDDEN_DIMS = [64, 128, 64]  # 降低到32维系统对应的隐藏层维度
     DDPM_SAMPLING_STEPS = 50  # DDIM sampling
     
     # Differential Guidance (Classifier-Free Guidance)
@@ -138,28 +170,35 @@ class Config:
     GUIDANCE_MALICIOUS = 1.2     # 恶意流量：适度强化（平衡质量与多样性）
     
     # Augmentation ratio
-    # ⚠️ 问题：过多的合成数据导致分布偏移，Benign 被推向 Malicious 区域
-    # 从 8x 降到 2x，减少合成数据的影响
-    AUGMENTATION_RATIO_MIN = 2
-    AUGMENTATION_RATIO_MAX = 2
+    # 生成倍数设置：
+    # - MIN/MAX = 1: 每个样本生成1倍合成数据（总数据量翻倍）
+    # - MIN/MAX = 2: 每个样本生成2倍合成数据（总数据量3倍）
+    # 双通道生成：正负样本分开训练和生成，避免交叉污染
+    AUGMENTATION_RATIO_MIN = 1
+    AUGMENTATION_RATIO_MAX = 1
+    
+    # 增强策略模式
+    # 'fixed': 固定倍数增强（所有样本统一使用 AUGMENTATION_RATIO_MIN）
+    # 'weighted': 权重自适应增强（高权重样本多生成，低权重样本少生成或不生成）
+    AUGMENTATION_MODE = 'fixed'  # 使用固定倍数模式
     
     # Structure-aware generation
     MASK_PROBABILITY = 0.5
     MASK_LAMBDA = 0.1
     
     # Feature indices for conditioning
-    COND_FEATURE_INDICES = [2, 3]  # Direction, Flags
-    DEP_FEATURE_INDICES = [0, 1, 4]  # Length, Log-IAT, Window
+    COND_FEATURE_INDICES = [2, 5]
+    DEP_FEATURE_INDICES = [0, 1, 3, 4]
 
     ENABLE_COVARIANCE_MATCHING = False
-    ENABLE_DISCRETE_QUANTIZATION = True
-    DISCRETE_QUANTIZE_INDICES = [4]
+    ENABLE_DISCRETE_QUANTIZATION = False
+    DISCRETE_QUANTIZE_INDICES = []
     DISCRETE_QUANTIZE_MAX_VALUES = 4096
     AUGMENT_USE_WEIGHTED_SAMPLING = True
     
     # ==================== Classification (Stage 3) ====================
     # Dual-Stream MLP
-    CLASSIFIER_HIDDEN_DIM = 64
+    CLASSIFIER_HIDDEN_DIM = 32  # 降低到32维
     CLASSIFIER_OUTPUT_DIM = 2  # Binary classification
     
     # ==================== 温室训练+战场校准策略 ====================
@@ -173,38 +212,100 @@ class Config:
     VALIDATION_SIZE_SYNTHETIC = 0.1     # 10% of synthetic data for validation
     
     # Fine-tuning parameters
-    # Increased from 50 to 80 to allow Focal Loss and Margin Loss to fully converge
-    # Further increased to 150 based on training curve analysis (2025-12-25):
-    #   - Loss still decreasing at epoch 80: 16.55→0.56 (not converged)
-    #   - F1 still improving: 0.7913@ep40 → 0.7946@ep56 → 0.8158@ep53
-    #   - No overfitting signs with 2500 augmented samples
-    FINETUNE_EPOCHS = 150
-    FINETUNE_BATCH_SIZE = 64
+    # 增加训练轮数，配合早停机制
+    FINETUNE_EPOCHS = 500  # 训练500轮（配合早停）
+    FINETUNE_BATCH_SIZE = 128
     FINETUNE_LR = 1e-4
     FINETUNE_MIN_LR = 1e-6  # Minimum learning rate for cosine annealing
+    TEST_BATCH_SIZE = 256
     
     # Stage 3: Early Stopping (智能训练终止)
+    # 针对无验证集场景优化的早停策略
     FINETUNE_EARLY_STOPPING = True  # 启用早停机制
-    FINETUNE_ES_WARMUP_EPOCHS = 30  # 前30轮不触发早停（让模型充分学习）
-    FINETUNE_ES_PATIENCE = 25       # 25轮F1不改善则停止（比Stage1更宽容）
-    FINETUNE_ES_MIN_DELTA = 0.002   # F1改善阈值：0.2%（避免微小波动触发早停）
+    FINETUNE_ES_WARMUP_EPOCHS = 100  # 前100轮不触发早停（让模型充分学习）
+    FINETUNE_ES_PATIENCE = 50       # 50轮不改善则停止（更宽容）
+    FINETUNE_ES_MIN_DELTA = 0.005   # F1改善阈值：0.5%（更敏感，适应波动）
     FINETUNE_ES_METRIC = 'f1_optimal'  # 监控指标：最优F1分数（自动阈值）
-    FINETUNE_ES_ALLOW_TRAIN_METRIC = False
+    FINETUNE_ES_ALLOW_TRAIN_METRIC = True  # 允许使用训练集指标（无验证集时）
 
     # Stage 3: Validation split for selecting best checkpoint (by val F1 pos=1 with auto-threshold)
-    FINETUNE_VAL_SPLIT = 0.0
+    FINETUNE_VAL_SPLIT = 0.0  # 去掉验证集
+
+    # Stage 3: Optional fixed validation set size per class (scheme A)
+    # If >0, overrides FINETUNE_VAL_SPLIT and will reserve exactly N samples per class for validation.
+    FINETUNE_VAL_PER_CLASS = 0
+    _env_val_per_class = os.environ.get('MEDAL_FINETUNE_VAL_PER_CLASS', '').strip()
+    if _env_val_per_class:
+        try:
+            FINETUNE_VAL_PER_CLASS = int(float(_env_val_per_class))
+        except ValueError:
+            pass
 
     MALICIOUS_THRESHOLD = 0.5
 
+    # Stage 3: Online representation augmentation (input-level, physics-safe)
+    STAGE3_ONLINE_AUGMENTATION = True
+    _env_stage3_aug = os.environ.get('MEDAL_STAGE3_ONLINE_AUGMENTATION', '').strip().lower()
+    if _env_stage3_aug in ('1', 'true', 'yes', 'y', 'on'):
+        STAGE3_ONLINE_AUGMENTATION = True
+    elif _env_stage3_aug in ('0', 'false', 'no', 'n', 'off'):
+        STAGE3_ONLINE_AUGMENTATION = False
+    
+    # Stage 3: ST-Mixup (Spatio-Temporal Mixup) 增强
+    # 渐进式类内混合，增强决策边界鲁棒性
+    STAGE3_USE_ST_MIXUP = False  # 关闭ST-Mixup
+    _env_st_mixup = os.environ.get('MEDAL_STAGE3_USE_ST_MIXUP', '').strip().lower()
+    if _env_st_mixup in ('1', 'true', 'yes', 'y', 'on'):
+        STAGE3_USE_ST_MIXUP = True
+    elif _env_st_mixup in ('0', 'false', 'no', 'n', 'off'):
+        STAGE3_USE_ST_MIXUP = False
+    
+    STAGE3_ST_MIXUP_MODE = 'intra_class'  # 'intra_class' 或 'selective'
+    STAGE3_ST_MIXUP_ALPHA = 0.2  # Beta分布参数（越小混合越极端）
+    STAGE3_ST_MIXUP_WARMUP_EPOCHS = 100  # 前100轮不启用（让模型先学基本边界）
+    STAGE3_ST_MIXUP_MAX_PROB = 0.3  # 最大混合概率（30%的样本会被混合）
+    STAGE3_ST_MIXUP_TIME_SHIFT_RATIO = 0.15  # 时间偏移比例（序列长度的15%）
+    STAGE3_ST_MIXUP_UNCERTAINTY_THRESHOLD = 0.3  # 困难样本阈值（仅selective模式）
+
+    STAGE3_HARD_MINING = False
+    _env_hm = os.environ.get('MEDAL_STAGE3_HARD_MINING', '').strip().lower()
+    if _env_hm in ('1', 'true', 'yes', 'y', 'on'):
+        STAGE3_HARD_MINING = True
+    elif _env_hm in ('0', 'false', 'no', 'n', 'off'):
+        STAGE3_HARD_MINING = False
+    STAGE3_HARD_MINING_WARMUP_EPOCHS = 5
+    STAGE3_HARD_MINING_FREQ_EPOCHS = 3
+    STAGE3_HARD_MINING_TOPK_RATIO = 0.2
+    STAGE3_HARD_MINING_MULTIPLIER = 3.0
+    STAGE3_HARD_MINING_POS_PROB_MAX = 0.70
+    STAGE3_HARD_MINING_NEG_PROB_MIN = 0.60
+
     # Stage 3: Optional backbone fine-tuning
     # Default keeps the original design (frozen backbone) for stability.
-    FINETUNE_BACKBONE = False
+    _env_ft = os.environ.get('MEDAL_FINETUNE_BACKBONE', '').strip().lower()
+    if _env_ft in ('1', 'true', 'yes', 'y', 'on'):
+        FINETUNE_BACKBONE = True
+    elif _env_ft in ('0', 'false', 'no', 'n', 'off'):
+        FINETUNE_BACKBONE = False
+    else:
+        FINETUNE_BACKBONE = False
     # Scope options:
     # - 'projection': only train the bidirectional projection head
     # - 'all': train the whole backbone
-    FINETUNE_BACKBONE_SCOPE = 'projection'
+    _env_scope = os.environ.get('MEDAL_FINETUNE_BACKBONE_SCOPE', '').strip().lower()
+    if _env_scope in ('projection', 'all'):
+        FINETUNE_BACKBONE_SCOPE = _env_scope
+    else:
+        FINETUNE_BACKBONE_SCOPE = 'projection'
     # Use a smaller LR for backbone to avoid catastrophic forgetting
-    FINETUNE_BACKBONE_LR = 1e-5
+    _env_lr = os.environ.get('MEDAL_FINETUNE_BACKBONE_LR', '').strip()
+    if _env_lr:
+        try:
+            FINETUNE_BACKBONE_LR = float(_env_lr)
+        except ValueError:
+            pass
+    else:
+        FINETUNE_BACKBONE_LR = 1e-5
 
     LABEL_SMOOTHING = 0.1
     CONSISTENCY_TEMPERATURE = 2.0
@@ -240,6 +341,12 @@ class Config:
     # 修改：alpha=0.5 表示两类平等，避免对恶意类过度偏好
     # 原 alpha=0.25 导致恶意类权重是良性类的 3 倍，造成过度分离
     FOCAL_ALPHA = 0.5              # Alpha for malicious class (改为 0.5，两类平等)
+    _env_focal_alpha = os.environ.get('MEDAL_FOCAL_ALPHA', '').strip()
+    if _env_focal_alpha:
+        try:
+            FOCAL_ALPHA = float(_env_focal_alpha)
+        except ValueError:
+            pass
     FOCAL_GAMMA = 2.0              # Gamma parameter (focus on hard examples)
     
     # Soft F1 Loss: 直接优化 Binary F1-Score
@@ -247,6 +354,27 @@ class Config:
     # 降低权重以减少对恶意类的过度偏好
     USE_SOFT_F1_LOSS = False        # 启用 Soft F1 Loss
     SOFT_F1_WEIGHT = 0.1           # 从 0.5 降到 0.3，减少 F1 Loss 的影响
+
+    USE_LOGIT_MARGIN = True
+    _env_logit_margin = os.environ.get('MEDAL_USE_LOGIT_MARGIN', '').strip().lower()
+    if _env_logit_margin in ('1', 'true', 'yes', 'y', 'on'):
+        USE_LOGIT_MARGIN = True
+    elif _env_logit_margin in ('0', 'false', 'no', 'n', 'off'):
+        USE_LOGIT_MARGIN = False
+    LOGIT_MARGIN_M = 0.25
+    _env_logit_m = os.environ.get('MEDAL_LOGIT_MARGIN_M', '').strip()
+    if _env_logit_m:
+        try:
+            LOGIT_MARGIN_M = float(_env_logit_m)
+        except ValueError:
+            pass
+    LOGIT_MARGIN_WARMUP_EPOCHS = 30
+    _env_logit_warm = os.environ.get('MEDAL_LOGIT_MARGIN_WARMUP_EPOCHS', '').strip()
+    if _env_logit_warm:
+        try:
+            LOGIT_MARGIN_WARMUP_EPOCHS = int(float(_env_logit_warm))
+        except ValueError:
+            pass
     
     # Margin Loss (ArcFace-style): adds margin between classes
     # Disabled initially to avoid probability distortion (can re-enable after model stabilizes)
@@ -344,7 +472,7 @@ class Config:
     AUGMENT_TEMPLATE_MIN_WEIGHT_HARD = 0.5  # 从 0.2 提高到 0.5，硬门槛也提高
     
     # ==================== Hardware & Training ====================
-    GPU_ID = 7  # 默认使用GPU 7
+    GPU_ID = int(os.environ.get('MEDAL_GPU_ID', '7'))  # 默认使用GPU 7
     if torch.cuda.is_available() and torch.cuda.device_count() > 0:
         # If CUDA_VISIBLE_DEVICES is set, device indices are remapped to 0..N-1.
         # Also guard against out-of-range GPU_ID to avoid "invalid device ordinal".

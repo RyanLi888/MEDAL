@@ -90,7 +90,7 @@ class ProjectionHead(nn.Module):
     - 训练完后，扔掉这个MLP，只保留Mamba
     """
     
-    def __init__(self, input_dim=32, hidden_dim=128, output_dim=32):
+    def __init__(self, input_dim=32, hidden_dim=64, output_dim=32):
         super().__init__()
         
         self.mlp = nn.Sequential(
@@ -196,8 +196,8 @@ class InstanceContrastiveLearning(nn.Module):
         前向传播
         
         Args:
-            x_view1: (B, L, 5) - 第一个视图
-            x_view2: (B, L, 5) - 第二个视图
+            x_view1: (B, L, D) - 第一个视图
+            x_view2: (B, L, D) - 第二个视图
             
         Returns:
             loss: scalar - InfoNCE损失
@@ -306,9 +306,9 @@ class HybridPretrainingLoss(nn.Module):
         
         Args:
             backbone: Micro-Bi-Mamba backbone
-            x_original: (B, L, 5) - 原始输入（用于SimMTM）
-            x_view1: (B, L, 5) - 第一个增强视图（用于InfoNCE）
-            x_view2: (B, L, 5) - 第二个增强视图（用于InfoNCE）
+            x_original: (B, L, D) - 原始输入（用于SimMTM）
+            x_view1: (B, L, D) - 第一个增强视图（用于InfoNCE）
+            x_view2: (B, L, D) - 第二个增强视图（用于InfoNCE）
             
         Returns:
             total_loss: scalar

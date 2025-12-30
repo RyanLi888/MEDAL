@@ -245,8 +245,38 @@ check_and_select_backbone() {
     echo "将从 Stage 2 开始运行（跳过骨干网络训练）"
 }
 
+configure_stage3_finetune_backbone() {
+    FT_ENV=""
+
+    echo ""
+    echo "Stage 3 骨干网络微调设置:"
+    echo "是否微调骨干网络? (y/n, 默认y): "
+    read -r finetune_backbone_choice
+    finetune_backbone_choice=${finetune_backbone_choice:-y}
+
+    if [ "$finetune_backbone_choice" = "y" ] || [ "$finetune_backbone_choice" = "Y" ]; then
+        echo -n "微调范围 scope (projection/all, 默认all): "
+        read -r finetune_scope_choice
+        finetune_scope_choice=${finetune_scope_choice:-all}
+        if [ "$finetune_scope_choice" != "projection" ] && [ "$finetune_scope_choice" != "all" ]; then
+            finetune_scope_choice="all"
+        fi
+
+        echo -n "骨干网络学习率 backbone_lr (默认1e-5): "
+        read -r finetune_lr_choice
+        finetune_lr_choice=${finetune_lr_choice:-1e-5}
+
+        FT_ENV="MEDAL_FINETUNE_BACKBONE=1 MEDAL_FINETUNE_BACKBONE_SCOPE=$finetune_scope_choice MEDAL_FINETUNE_BACKBONE_LR=$finetune_lr_choice"
+        echo -e "${GREEN}✓ 已启用骨干网络微调: scope=$finetune_scope_choice, lr=$finetune_lr_choice${NC}"
+    else
+        FT_ENV="MEDAL_FINETUNE_BACKBONE=0"
+        echo -e "${YELLOW}⚠ 骨干网络微调已关闭（仅训练分类器）${NC}"
+    fi
+}
+
 # 选择运行模式
 echo "请选择运行模式:"
+echo "0) 数据预处理 (生成 output/preprocessed/*.npy)"
 echo "1) 完整流程 (训练 + 测试)"
 echo "2) 仅训练"
 echo "3) 仅测试"
@@ -256,11 +286,53 @@ echo "6) 从指定阶段开始 (训练/测试)"
 echo "7) 消融实验 (特征提取 / 数据增强 / 标签矫正)"
 echo "8) 骨干网络训练 (仅训练骨干网络，可选对比学习)"
 echo ""
-echo -n "请输入选择 (1-8): "
+echo -n "请输入选择 (0-8): "
 read -r choice
 
 # 构建命令
 case $choice in
+    0)
+        echo ""
+        echo "数据预处理模式"
+        echo ""
+        echo "说明: 将PCAP预处理为 .npy 文件，保存到 output/preprocessed/"
+        echo "  - train_X.npy / train_y.npy / train_files.npy"
+        echo "  - test_X.npy  / test_y.npy  / test_files.npy"
+        echo ""
+        echo "请选择预处理范围:"
+        echo "1) 训练集 + 测试集 (all)"
+        echo "2) 仅训练集 (train_only)"
+        echo "3) 仅测试集 (test_only)"
+        echo ""
+        echo -n "请输入选择 (1-3, 默认1): "
+        read -r pp_choice
+        pp_choice=${pp_choice:-1}
+
+        echo -n "是否强制重新预处理(覆盖已有文件)? (y/n, 默认n): "
+        read -r pp_force
+        pp_force=${pp_force:-n}
+
+        FORCE_ARG=""
+        if [ "$pp_force" = "y" ] || [ "$pp_force" = "Y" ]; then
+            FORCE_ARG="--force"
+        fi
+
+        case $pp_choice in
+            2)
+                CMD="python scripts/utils/preprocess.py --train_only $FORCE_ARG"
+                MODE="数据预处理 (仅训练集)"
+                ;;
+            3)
+                CMD="python scripts/utils/preprocess.py --test_only $FORCE_ARG"
+                MODE="数据预处理 (仅测试集)"
+                ;;
+            *)
+                CMD="python scripts/utils/preprocess.py $FORCE_ARG"
+                MODE="数据预处理 (训练集+测试集)"
+                ;;
+        esac
+        LOG_PREFIX="preprocess"
+        ;;
     1)
         # 完整流程：询问是否使用已有backbone
         check_and_select_backbone true
@@ -305,16 +377,18 @@ case $choice in
         echo "  - 使用相同骨干网络进行测试"
         
         check_and_select_backbone true
+
+        configure_stage3_finetune_backbone
         
         if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
             echo ""
             echo "将使用已选择的骨干网络: $SELECTED_BACKBONE_NAME"
-            CMD="python scripts/training/train_clean_only_then_test.py --use_ground_truth --backbone_path $BACKBONE_PATH"
+            CMD="$FT_ENV python scripts/training/train_clean_only_then_test.py --use_ground_truth --backbone_path $BACKBONE_PATH"
             MODE="干净数据训练+测试 (使用已有backbone: $SELECTED_BACKBONE_NAME)"
         else
             echo ""
             echo "将先训练新的骨干网络（Stage 1），然后用干净数据训练分类器"
-            CMD="python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 && python scripts/training/train_clean_only_then_test.py --use_ground_truth"
+            CMD="python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 && $FT_ENV python scripts/training/train_clean_only_then_test.py --use_ground_truth"
             MODE="干净数据训练+测试 (训练新backbone)"
         fi
         LOG_PREFIX="clean_train_test"
@@ -403,6 +477,7 @@ case $choice in
                 LOG_PREFIX="train_stage${start_stage}"
             fi
         fi
+        echo ""
         ;;
     7)
         # 消融实验
@@ -413,8 +488,10 @@ case $choice in
         echo "1) 特征提取: 先训练特征提取器(Stage1)，用真实标签(权重1/无噪声)训练分类器，然后测试"
         echo "2) 数据增强: 用真实标签(权重1/无噪声)提取特征后直接增强(TabDDPM)，用真实+增强训练分类器，然后测试"
         echo "3) 标签矫正: 使用30%噪声提取特征->标签矫正->用矫正后的干净数据训练分类器，然后测试"
+        echo "4) 干净数据: 仅干净数据训练分类器（微调骨干网络）并测试"
+        echo "5) 干净+增强: 干净数据+TabDDPM增强训练分类器（微调骨干网络）并测试"
         echo ""
-        echo -n "请输入选择 (1-3): "
+        echo -n "请输入选择 (1-5): "
         read -r ab_choice
 
         case $ab_choice in
@@ -448,7 +525,7 @@ case $choice in
                 # 消融实验模式2：数据增强 - 需要backbone
                 echo ""
                 echo "[消融-数据增强]"
-                echo "说明: 使用真实标签(无噪声/权重=1)，直接增强(TabDDPM)，再训练分类器并测试"
+                echo "说明: 使用真实标签(无噪声/权重=1)，直接增强(TabDDPM)，再训练分类器，然后测试"
                 
                 check_and_select_backbone true
                 
@@ -478,25 +555,55 @@ case $choice in
                 CORR_NPZ="output/label_correction/analysis/noise_30pct/correction_results.npz"
                 
                 if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
-                    echo ""
-                    echo "将使用已选择的骨干网络: $SELECTED_BACKBONE_NAME"
-                    BACKBONE_ARG="--backbone_path $BACKBONE_PATH"
-                    CMD="python MoudleCode/label_correction/analysis/label_correction_analysis.py --noise_rate 0.30 $BACKBONE_ARG && python scripts/training/train_clean_only_then_test.py --correction_npz $CORR_NPZ $BACKBONE_ARG"
+                    BACKBONE_ARG="--backbone_path $BACKBONE_PATH --start_stage 2"
+                    CMD="python scripts/training/train.py --noise_rate 0.3 --end_stage 3 $BACKBONE_ARG && python scripts/testing/test.py"
                     MODE="消融-标签矫正 (使用已有backbone: $SELECTED_BACKBONE_NAME)"
                 else
-                    echo ""
-                    echo "将训练新的骨干网络"
-                    CMD="python MoudleCode/label_correction/analysis/label_correction_analysis.py --noise_rate 0.30 && python scripts/training/train_clean_only_then_test.py --correction_npz $CORR_NPZ"
+                    CMD="python scripts/training/train.py --noise_rate 0.3 --start_stage 1 --end_stage 3 && python scripts/testing/test.py"
                     MODE="消融-标签矫正 (训练新backbone)"
                 fi
                 LOG_PREFIX="ablation_label_correction"
+                ;;
+            4)
+                # 消融实验模式4：干净数据训练分类器 + 微调骨干网络
+                echo ""
+                echo "[消融-干净数据(微调骨干)]"
+                echo "说明: 仅干净数据训练 Stage 3 分类器，同时微调骨干网络，然后测试"
+                echo ""
+                check_and_select_backbone true
+                configure_stage3_finetune_backbone
+                if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
+                    CMD="$FT_ENV python scripts/training/train_clean_only_then_test.py --use_ground_truth --backbone_path $BACKBONE_PATH"
+                    MODE="消融-干净数据(微调骨干) (使用已有backbone: $SELECTED_BACKBONE_NAME)"
+                else
+                    CMD="python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 && $FT_ENV python scripts/training/train_clean_only_then_test.py --use_ground_truth"
+                    MODE="消融-干净数据(微调骨干) (训练新backbone)"
+                fi
+                LOG_PREFIX="ablation_clean_only_finetune_backbone"
+                ;;
+            5)
+                # 消融实验模式5：干净+增强训练分类器 + 微调骨干网络
+                echo ""
+                echo "[消融-干净+增强(微调骨干)]"
+                echo "说明: 使用真实标签(无噪声/权重=1)进行 TabDDPM 增强，再训练 Stage 3 分类器，同时微调骨干网络，然后测试"
+                echo ""
+                check_and_select_backbone true
+                configure_stage3_finetune_backbone
+                if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
+                    BACKBONE_ARG="--backbone_path $BACKBONE_PATH --start_stage 2"
+                    CMD="$FT_ENV python scripts/training/train.py --noise_rate 0.0 --end_stage 3 --stage2_mode clean_augment_only $BACKBONE_ARG && python scripts/testing/test.py"
+                    MODE="消融-干净+增强(微调骨干) (使用已有backbone: $SELECTED_BACKBONE_NAME)"
+                else
+                    CMD="$FT_ENV python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 3 --stage2_mode clean_augment_only && python scripts/testing/test.py"
+                    MODE="消融-干净+增强(微调骨干) (训练新backbone)"
+                fi
+                LOG_PREFIX="ablation_data_augmentation_finetune_backbone"
                 ;;
             *)
                 echo -e "${RED}无效选择${NC}"
                 exit 1
                 ;;
         esac
-        echo ""
         ;;
     8)
         # 骨干网络训练模式 - 目的是训练新backbone，不需要已有backbone

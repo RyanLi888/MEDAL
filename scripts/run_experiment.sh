@@ -8,6 +8,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# 常用路径（统一从项目根目录推导，避免硬编码相对路径）
+DATA_DIR="$PROJECT_ROOT/Datasets"
+OUTPUT_DIR="$PROJECT_ROOT/output"
+LOG_DIR="$OUTPUT_DIR/logs"
+PID_FILE="$OUTPUT_DIR/train.pid"
+BACKBONE_DIR="$OUTPUT_DIR/feature_extraction/models"
+PREPROCESSED_DIR="$OUTPUT_DIR/preprocessed"
+LABEL_CORR_ANALYSIS_DIR="$OUTPUT_DIR/label_correction/analysis"
+
 # 颜色定义
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -148,13 +157,13 @@ fi
 
 # 检查数据集
 echo "检查数据集..."
-if [ ! -d "Datasets/T1_train/benign" ] || [ ! -d "Datasets/T1_train/malicious" ]; then
+if [ ! -d "$DATA_DIR/T1_train/benign" ] || [ ! -d "$DATA_DIR/T1_train/malicious" ]; then
     echo -e "${RED}警告: 未找到训练数据集${NC}"
     echo "请确保数据集位于:"
-    echo "  - Datasets/T1_train/benign/"
-    echo "  - Datasets/T1_train/malicious/"
-    echo "  - Datasets/T2_test/benign/"
-    echo "  - Datasets/T2_test/malicious/"
+    echo "  - $DATA_DIR/T1_train/benign/"
+    echo "  - $DATA_DIR/T1_train/malicious/"
+    echo "  - $DATA_DIR/T2_test/benign/"
+    echo "  - $DATA_DIR/T2_test/malicious/"
     exit 1
 fi
 
@@ -180,7 +189,7 @@ check_and_select_backbone() {
     
     echo ""
     echo "检查已有的骨干网络模型..."
-    BACKBONE_DIR="output/feature_extraction/models"
+    BACKBONE_DIR="$BACKBONE_DIR"
     
     if [ ! -d "$BACKBONE_DIR" ]; then
         echo -e "${YELLOW}⚠ 骨干网络目录不存在，将训练新的骨干网络${NC}"
@@ -276,7 +285,7 @@ configure_stage3_finetune_backbone() {
 
 # 选择运行模式
 echo "请选择运行模式:"
-echo "0) 数据预处理 (生成 output/preprocessed/*.npy)"
+echo "0) 数据预处理 (生成 $PREPROCESSED_DIR/*.npy)"
 echo "1) 完整流程 (训练 + 测试)"
 echo "2) 仅训练"
 echo "3) 仅测试"
@@ -295,7 +304,8 @@ case $choice in
         echo ""
         echo "数据预处理模式"
         echo ""
-        echo "说明: 将PCAP预处理为 .npy 文件，保存到 output/preprocessed/"
+        echo "说明: 将PCAP预处理为 .npy 文件，保存到 $PREPROCESSED_DIR/"
+        echo "(实际目录: $PREPROCESSED_DIR/)"
         echo "  - train_X.npy / train_y.npy / train_files.npy"
         echo "  - test_X.npy  / test_y.npy  / test_files.npy"
         echo ""
@@ -552,7 +562,7 @@ case $choice in
                 
                 check_and_select_backbone true
                 
-                CORR_NPZ="output/label_correction/analysis/noise_30pct/correction_results.npz"
+                CORR_NPZ="$LABEL_CORR_ANALYSIS_DIR/noise_30pct/correction_results.npz"
                 
                 if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
                     BACKBONE_ARG="--backbone_path $BACKBONE_PATH --start_stage 2"
@@ -687,7 +697,6 @@ run_mode=${run_mode:-1}
 
 # 准备日志文件
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_DIR="output/logs"
 mkdir -p "$LOG_DIR"
 MAIN_LOG="$LOG_DIR/${LOG_PREFIX}_${TIMESTAMP}.log"
 LIVE_LOG="$LOG_DIR/live.log"
@@ -740,8 +749,8 @@ case $run_mode in
         echo ""
         
         # 检查是否有正在运行的训练
-        if [ -f "output/train.pid" ]; then
-            OLD_PID=$(cat output/train.pid)
+        if [ -f "$PID_FILE" ]; then
+            OLD_PID=$(cat "$PID_FILE")
             if ps -p $OLD_PID > /dev/null 2>&1; then
                 echo -e "${YELLOW}已有训练进程在运行 (PID: $OLD_PID)${NC}"
                 echo -n "是否停止当前训练并启动新的? (y/n): "
@@ -776,7 +785,7 @@ case $run_mode in
         # 后台运行并保存日志
         nohup bash -c "$CMD" >> "$MAIN_LOG" 2>&1 &
         PID=$!
-        echo $PID > output/train.pid
+        echo $PID > "$PID_FILE"
         
         echo -e "${GREEN}✓ 训练已在后台启动${NC}"
         echo ""
@@ -817,11 +826,11 @@ if [ $? -eq 0 ] || [ "$run_mode" == "2" ]; then
     echo -e "${BLUE}=========================================="
     echo "输出位置"
     echo -e "==========================================${NC}"
-    echo "  - 特征提取: output/feature_extraction/"
-    echo "  - 标签矫正: output/label_correction/"
-    echo "  - 数据增强: output/data_augmentation/"
-    echo "  - 分类器:   output/classification/"
-    echo "  - 测试结果: output/result/"
-    echo "  - 训练日志: output/logs/"
+    echo "  - 特征提取: $OUTPUT_DIR/feature_extraction/"
+    echo "  - 标签矫正: $OUTPUT_DIR/label_correction/"
+    echo "  - 数据增强: $OUTPUT_DIR/data_augmentation/"
+    echo "  - 分类器:   $OUTPUT_DIR/classification/"
+    echo "  - 测试结果: $OUTPUT_DIR/result/"
+    echo "  - 训练日志: $LOG_DIR/"
     echo ""
 fi

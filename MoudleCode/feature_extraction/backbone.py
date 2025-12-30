@@ -9,6 +9,36 @@ import math
 from .mamba_block import MambaLayer
 
 
+class TrafficHybridEmbedding(nn.Module):
+    def __init__(self, d_model: int, direction_index: int = 2, input_dim: int = 6):
+        super().__init__()
+        self.direction_index = int(direction_index)
+        self.input_dim = int(input_dim)
+
+        cont_indices = [i for i in range(self.input_dim) if i != self.direction_index]
+        self.register_buffer('_cont_indices', torch.tensor(cont_indices, dtype=torch.long), persistent=False)
+
+        self.cont_proj = nn.Sequential(
+            nn.Linear(len(cont_indices), d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+
+        self.dir_emb = nn.Embedding(num_embeddings=2, embedding_dim=d_model)
+        nn.init.normal_(self.dir_emb.weight, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_cont = x.index_select(dim=-1, index=self._cont_indices)
+
+        x_dir_raw = x[:, :, self.direction_index]
+        dir_indices = (x_dir_raw > 0).to(dtype=torch.long)
+
+        embed_cont = self.cont_proj(x_cont)
+        embed_dir = self.dir_emb(dir_indices)
+
+        return embed_cont + embed_dir
+
+
 class SinusoidalPositionalEncoding(nn.Module):
     """Sinusoidal positional encoding"""
     
@@ -51,7 +81,18 @@ class MicroBiMambaBackbone(nn.Module):
         self.output_dim = getattr(config, 'OUTPUT_DIM', getattr(config, 'FEATURE_DIM', config.MODEL_DIM))
         
         # Embedding layer
-        self.embedding = nn.Linear(config.INPUT_FEATURE_DIM, config.MODEL_DIM)
+        if int(getattr(config, 'INPUT_FEATURE_DIM', 0)) == 6:
+            direction_index = int(getattr(config, 'DIRECTION_INDEX', 2))
+            if 0 <= direction_index < 6:
+                self.embedding = TrafficHybridEmbedding(
+                    d_model=config.MODEL_DIM,
+                    direction_index=direction_index,
+                    input_dim=6,
+                )
+            else:
+                self.embedding = nn.Linear(config.INPUT_FEATURE_DIM, config.MODEL_DIM)
+        else:
+            self.embedding = nn.Linear(config.INPUT_FEATURE_DIM, config.MODEL_DIM)
         self.pos_encoding = SinusoidalPositionalEncoding(config.MODEL_DIM, max_len=config.SEQUENCE_LENGTH)
         self.embed_dropout = nn.Dropout(config.EMBEDDING_DROPOUT)
         

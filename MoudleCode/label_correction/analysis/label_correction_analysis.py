@@ -51,7 +51,7 @@ except ImportError:
 # 简化的预处理文件检测和加载
 def check_preprocessed_exists(split='train'):
     """检查预处理文件是否存在"""
-    preprocessed_dir = PROJECT_ROOT / 'output' / 'preprocessed'
+    preprocessed_dir = Path(config.OUTPUT_ROOT) / 'preprocessed'
     if not preprocessed_dir.exists():
         return False
     
@@ -63,7 +63,7 @@ def check_preprocessed_exists(split='train'):
 
 def load_preprocessed(split='train'):
     """加载预处理文件"""
-    preprocessed_dir = PROJECT_ROOT / 'output' / 'preprocessed'
+    preprocessed_dir = Path(config.OUTPUT_ROOT) / 'preprocessed'
     
     X = np.load(preprocessed_dir / f'{split}_X.npy')
     y = np.load(preprocessed_dir / f'{split}_y.npy')

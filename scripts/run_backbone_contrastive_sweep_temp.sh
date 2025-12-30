@@ -248,7 +248,7 @@ for method in "${METHODS[@]}"; do
   EVAL_DIR="$EVAL_ROOT/${method}_${TS}"
   mkdir -p "$EVAL_DIR"
 
-  python evaluate_backbone.py \
+  python scripts/evaluate_backbone.py \
     --backbone "$SAVED_BACKBONE" \
     --data_root "$DATA_ROOT" \
     --output "$EVAL_DIR" \

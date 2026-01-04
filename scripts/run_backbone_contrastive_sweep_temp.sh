@@ -10,10 +10,15 @@ cd "$PROJECT_ROOT"
 
 # Reuse a stable timestamp across daemon re-exec to avoid log/pid mismatch.
 TS="${MEDAL_SWEEP_TS:-$(date +"%Y%m%d_%H%M%S")}" 
-LOG_DIR="output/logs"
-MODEL_DIR="output/feature_extraction/models"
-EVAL_ROOT="output/backbone_eval"
-DATA_ROOT="output/preprocessed"
+OUTPUT_BASE="output"
+if [ -n "${MEDAL_DATASET_NAME:-}" ]; then
+  OUTPUT_BASE="output/${MEDAL_DATASET_NAME}"
+fi
+
+LOG_DIR="$OUTPUT_BASE/logs"
+MODEL_DIR="$OUTPUT_BASE/feature_extraction/models"
+EVAL_ROOT="$OUTPUT_BASE/backbone_eval"
+DATA_ROOT="$OUTPUT_BASE/preprocessed"
 DEVICE="cuda"
 
 mkdir -p "$LOG_DIR" "$MODEL_DIR" "$EVAL_ROOT"

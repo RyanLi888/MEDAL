@@ -30,7 +30,8 @@ class IntraClassSTMixup:
     """
     
     def __init__(self, alpha=0.2, warmup_epochs=100, max_prob=0.3, 
-                 time_shift_ratio=0.15, device='cuda'):
+                 time_shift_ratio=0.15, device='cuda',
+                 continuous_indices=None, discrete_indices=None, valid_mask_index=None):
         """
         Args:
             alpha: Beta分布参数（控制混合强度，越小越极端）
@@ -46,8 +47,13 @@ class IntraClassSTMixup:
         self.device = device
         
         # 特征索引
-        self.continuous_indices = [0, 1, 3, 4]  # Length, Log-IAT, BurstSize, CumulativeLen
-        self.discrete_indices = [2]             # Direction
+        if continuous_indices is None:
+            continuous_indices = [0, 2]
+        if discrete_indices is None:
+            discrete_indices = [1]
+        self.continuous_indices = list(continuous_indices)
+        self.discrete_indices = list(discrete_indices)
+        self.valid_mask_index = valid_mask_index
     
     def should_apply(self, epoch):
         """判断当前epoch是否应该应用ST-Mixup"""
@@ -151,28 +157,44 @@ class IntraClassSTMixup:
         # 3. 空间混合
         x_mixed = x1.clone()
 
-        # ValidMask（最后一维）不直接做插值混合。
-        # 混合后用两个序列（含时间偏移）的 mask 做 OR，并将 padding 位置强制归零，避免产生“无效位置有数值”的对抗噪声。
-        if x1.shape[-1] >= 6:
-            mask1 = x1[:, 5]
-            mask2 = x2_shifted[:, 5]
-            mixed_mask = torch.maximum(mask1, mask2)
-        else:
-            mixed_mask = None
+        mixed_mask = None
+        if self.valid_mask_index is not None:
+            try:
+                vm_idx = int(self.valid_mask_index)
+                if 0 <= vm_idx < x1.shape[-1]:
+                    mask1 = x1[:, vm_idx]
+                    mask2 = x2_shifted[:, vm_idx]
+                    mixed_mask = torch.maximum(mask1, mask2)
+            except Exception:
+                mixed_mask = None
         
         # 连续特征：线性插值
         for idx in self.continuous_indices:
-            x_mixed[:, idx] = lam * x1[:, idx] + (1 - lam) * x2_shifted[:, idx]
+            try:
+                j = int(idx)
+            except Exception:
+                continue
+            if j < 0 or j >= x1.shape[-1]:
+                continue
+            if self.valid_mask_index is not None and int(j) == int(self.valid_mask_index):
+                continue
+            x_mixed[:, j] = lam * x1[:, j] + (1 - lam) * x2_shifted[:, j]
         
         # 离散特征：随机选择（保持语义）
         for idx in self.discrete_indices:
+            try:
+                j = int(idx)
+            except Exception:
+                continue
+            if j < 0 or j >= x1.shape[-1]:
+                continue
             # 每个时间步独立随机选择
             mask = torch.rand(L, device=self.device) < lam
-            x_mixed[mask, idx] = x1[mask, idx]
-            x_mixed[~mask, idx] = x2_shifted[~mask, idx]
+            x_mixed[mask, j] = x1[mask, j]
+            x_mixed[~mask, j] = x2_shifted[~mask, j]
 
         if mixed_mask is not None:
-            x_mixed[:, 5] = mixed_mask
+            x_mixed[:, vm_idx] = mixed_mask
             pad = (mixed_mask <= 0.5)
             if pad.any():
                 x_mixed[pad] = 0.0
@@ -299,21 +321,71 @@ def create_st_mixup(config, mode='intra_class'):
         st_mixup: ST-Mixup增强器
     """
     if mode == 'intra_class':
+        length_idx = getattr(config, 'LENGTH_INDEX', None)
+        iat_idx = getattr(config, 'IAT_INDEX', None)
+        burst_idx = getattr(config, 'BURST_SIZE_INDEX', None)
+        cum_idx = getattr(config, 'CUMULATIVE_LEN_INDEX', None)
+        direction_idx = getattr(config, 'DIRECTION_INDEX', None)
+        valid_mask_idx = getattr(config, 'VALID_MASK_INDEX', None)
+
+        cont = []
+        for idx in [length_idx, iat_idx, burst_idx, cum_idx]:
+            if idx is None:
+                continue
+            try:
+                cont.append(int(idx))
+            except Exception:
+                continue
+        disc = []
+        if direction_idx is not None:
+            try:
+                disc = [int(direction_idx)]
+            except Exception:
+                disc = []
+
         return IntraClassSTMixup(
             alpha=config.STAGE3_ST_MIXUP_ALPHA,
             warmup_epochs=config.STAGE3_ST_MIXUP_WARMUP_EPOCHS,
             max_prob=config.STAGE3_ST_MIXUP_MAX_PROB,
             time_shift_ratio=config.STAGE3_ST_MIXUP_TIME_SHIFT_RATIO,
-            device=config.DEVICE
+            device=config.DEVICE,
+            continuous_indices=cont,
+            discrete_indices=disc,
+            valid_mask_index=valid_mask_idx,
         )
     elif mode == 'selective':
+        length_idx = getattr(config, 'LENGTH_INDEX', None)
+        iat_idx = getattr(config, 'IAT_INDEX', None)
+        burst_idx = getattr(config, 'BURST_SIZE_INDEX', None)
+        cum_idx = getattr(config, 'CUMULATIVE_LEN_INDEX', None)
+        direction_idx = getattr(config, 'DIRECTION_INDEX', None)
+        valid_mask_idx = getattr(config, 'VALID_MASK_INDEX', None)
+
+        cont = []
+        for idx in [length_idx, iat_idx, burst_idx, cum_idx]:
+            if idx is None:
+                continue
+            try:
+                cont.append(int(idx))
+            except Exception:
+                continue
+        disc = []
+        if direction_idx is not None:
+            try:
+                disc = [int(direction_idx)]
+            except Exception:
+                disc = []
+
         return SelectiveSTMixup(
             alpha=config.STAGE3_ST_MIXUP_ALPHA,
             warmup_epochs=config.STAGE3_ST_MIXUP_WARMUP_EPOCHS,
             max_prob=config.STAGE3_ST_MIXUP_MAX_PROB,
             uncertainty_threshold=config.STAGE3_ST_MIXUP_UNCERTAINTY_THRESHOLD,
             time_shift_ratio=config.STAGE3_ST_MIXUP_TIME_SHIFT_RATIO,
-            device=config.DEVICE
+            device=config.DEVICE,
+            continuous_indices=cont,
+            discrete_indices=disc,
+            valid_mask_index=valid_mask_idx,
         )
     else:
         raise ValueError(f"Unknown mode: {mode}")

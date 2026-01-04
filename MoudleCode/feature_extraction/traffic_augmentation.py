@@ -41,6 +41,13 @@ class TrafficAugmentation:
         
         # 掩码参数
         self.mask_ratio = float(getattr(config, 'AUG_CHANNEL_MASK_RATIO', 0.15))
+
+        self.length_index = getattr(config, 'LENGTH_INDEX', 0)
+        self.iat_index = getattr(config, 'IAT_INDEX', None)
+        self.direction_index = getattr(config, 'DIRECTION_INDEX', 2)
+        self.burst_index = getattr(config, 'BURST_SIZE_INDEX', 3)
+        self.cumulative_index = getattr(config, 'CUMULATIVE_LEN_INDEX', None)
+        self.valid_mask_index = getattr(config, 'VALID_MASK_INDEX', None)
         
     def __call__(self, x):
         """
@@ -129,14 +136,29 @@ class TrafficAugmentation:
         """
         x_jitter = x.clone()
         
-        # 只对Log-IAT维度（索引1）添加高斯噪声（仅对有效token）
-        noise = torch.randn_like(x[:, :, 1]) * self.jitter_std
-        if x.shape[-1] >= 6:
-            valid = x[:, :, 5] > 0.5
-            x_jitter[:, :, 1] = torch.where(valid, x[:, :, 1] + noise, x[:, :, 1])
-        else:
-            x_jitter[:, :, 1] = x[:, :, 1] + noise
-        
+        # 只对 Log-IAT 维度添加高斯噪声（仅对有效 token）
+        # lite4 特征集可能没有 IAT，直接跳过。
+        if self.iat_index is None:
+            return x_jitter
+        try:
+            iat_idx = int(self.iat_index)
+        except Exception:
+            return x_jitter
+        if iat_idx < 0 or iat_idx >= x.shape[-1]:
+            return x_jitter
+
+        noise = torch.randn_like(x[:, :, iat_idx]) * self.jitter_std
+        if self.valid_mask_index is not None:
+            try:
+                vm_idx = int(self.valid_mask_index)
+                if 0 <= vm_idx < x.shape[-1]:
+                    valid = x[:, :, vm_idx] > 0.5
+                    x_jitter[:, :, iat_idx] = torch.where(valid, x[:, :, iat_idx] + noise, x[:, :, iat_idx])
+                    return x_jitter
+            except Exception:
+                pass
+        x_jitter[:, :, iat_idx] = x[:, :, iat_idx] + noise
+
         return x_jitter
     
     def _channel_mask(self, x):
@@ -156,15 +178,29 @@ class TrafficAugmentation:
         x_mask = x.clone()
         B, L, D = x.shape
         
-        # 随机选择要掩码的维度（不掩码Direction/ValidMask，因为它们是结构性特征）
-        # 6维输入: [0: Length, 3: BurstSize, 4: CumulativeLen]
-        # 旧版输入(<=5维): 退化到原始策略
-        if D >= 6:
-            maskable_dims = [0, 3, 4]
-            valid = x[:, :, 5] > 0.5
-        else:
-            maskable_dims = [0, 3, 4]
-            valid = None
+        # 随机选择要掩码的维度（不掩码 Direction/ValidMask，因为它们是结构性特征）
+        maskable_dims = []
+        for idx in [self.length_index, self.burst_index, self.cumulative_index]:
+            if idx is None:
+                continue
+            try:
+                j = int(idx)
+            except Exception:
+                continue
+            if 0 <= j < D and j not in maskable_dims:
+                maskable_dims.append(j)
+
+        if len(maskable_dims) == 0:
+            return x_mask
+
+        valid = None
+        if self.valid_mask_index is not None:
+            try:
+                vm_idx = int(self.valid_mask_index)
+                if 0 <= vm_idx < D:
+                    valid = x[:, :, vm_idx] > 0.5
+            except Exception:
+                valid = None
         
         for b in range(B):
             # 每个样本随机选择一个维度掩码

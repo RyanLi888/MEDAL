@@ -31,7 +31,7 @@ from MoudleCode.utils.visualization import (
 )
 from MoudleCode.preprocessing.pcap_parser import load_dataset
 from MoudleCode.feature_extraction.backbone import (
-    MicroBiMambaBackbone, SimMTMLoss
+    MicroBiMambaBackbone, SimMTMLoss, build_backbone
 )
 from MoudleCode.feature_extraction.traffic_augmentation import DualViewAugmentation
 from MoudleCode.feature_extraction.instance_contrastive import (
@@ -732,25 +732,24 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
         logger.warning(f"⚠ 无法保存 real_kept_data.npz（Stage3 双流训练可能不可用）: {e}")
     
     stage2_use_tabddpm = bool(getattr(config, 'STAGE2_USE_TABDDPM', True))
-    stage2_tabddpm_space = str(getattr(config, 'STAGE2_TABDDPM_SPACE', 'raw')).lower()
-    if stage2_tabddpm_space not in ('raw', 'feature'):
-        stage2_tabddpm_space = 'raw'
+
+    Z_clean = features[keep_mask]
 
     if not stage2_use_tabddpm:
         logger.info("")
         logger.info("步骤 2.2: TabDDPM 数据增强（已跳过）")
-        logger.info("  说明: 当前配置已禁用 Stage2 TabDDPM，以避免 packet-level 生成破坏时序结构")
-        logger.info("  将直接使用标签矫正后的干净样本进入 Stage 3（可配合 ST-Mixup / 采样策略进行在线增强）")
+        logger.info("  说明: 当前配置已禁用 Stage2 TabDDPM（本工程仅支持 feature-space 流程）")
+        logger.info("  将直接使用骨干网络特征进入 Stage 3")
 
-        X_augmented = X_clean
+        Z_augmented = Z_clean
         y_augmented = y_clean
         sample_weights = weights_clean
-    elif stage2_tabddpm_space == 'feature':
+        n_train_original = int(Z_clean.shape[0])
+        return Z_augmented, y_augmented, sample_weights, correction_stats, None, n_train_original
+    else:
         logger.info("")
         logger.info("步骤 2.2: TabDDPM 数据增强 (Feature Space)")
         logger.info("  目标: 在骨干网络特征空间中训练/生成，避免破坏时序结构")
-
-        Z_clean = features[keep_mask]
 
         tabddpm = TabDDPM(
             config,
@@ -860,327 +859,7 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
         logger.info(f"  ✓ t-SNE对比图(Feature): {feature_cmp_path}")
 
         return Z_augmented, y_augmented, sample_weights, correction_stats, tabddpm, n_train_original
-    else:
-        # Data augmentation with TabDDPM
-        logger.info("")
-        logger.info("步骤 2.2: TabDDPM 数据增强模型训练")
-        logger.info(f"  目标: 学习流量特征分布，生成符合协议逻辑的合成样本")
-        ddpm_epochs = int(getattr(config, 'DDPM_EPOCHS', 100))
-        logger.info(f"  训练轮数: {ddpm_epochs} epochs")
-        logger.info(f"  引导策略: 恶意样本(w={config.GUIDANCE_MALICIOUS}), 良性样本(w={config.GUIDANCE_BENIGN})")
-        logger.info("  开始训练...")
-        
-        tabddpm = TabDDPM(config).to(config.DEVICE)
 
-        # Fit scaler on packet-level features (exclude zero-padding packets)
-        X_packets_all = X_clean.reshape(-1, X_clean.shape[-1])
-        vm_idx = getattr(config, 'VALID_MASK_INDEX', None)
-        if vm_idx is not None and int(vm_idx) >= 0 and int(vm_idx) < X_packets_all.shape[1]:
-            packet_mask = X_packets_all[:, int(vm_idx)] > 0.5
-        else:
-            packet_mask = np.any(X_packets_all != 0.0, axis=1)
-        X_packets_valid = X_packets_all[packet_mask]
-        if X_packets_valid.shape[0] == 0:
-            X_packets_valid = X_packets_all
-            packet_mask = None
-        tabddpm.fit_scaler(X_packets_valid)
-    
-        # Train TabDDPM
-        optimizer_ddpm = optim.AdamW(tabddpm.parameters(), lr=1e-4)
-        n_epochs_ddpm = ddpm_epochs
-	
-        ddpm_use_early_stopping = bool(getattr(config, 'DDPM_EARLY_STOPPING', True))
-        ddpm_es_warmup_epochs = int(getattr(config, 'DDPM_ES_WARMUP_EPOCHS', 20))
-        ddpm_es_patience = int(getattr(config, 'DDPM_ES_PATIENCE', 30))
-        ddpm_es_min_delta = float(getattr(config, 'DDPM_ES_MIN_DELTA', 0.001))
-	
-        ddpm_best_loss = float('inf')
-        ddpm_best_epoch = -1
-        ddpm_best_state = None
-        ddpm_no_improve = 0
-    
-        # 使用 packet-level 数据训练 TabDDPM（避免只看第一个包导致分布偏移）
-        # 同时过滤掉 padding=0 的无效包，避免模型学到大量“全零包”导致 Length/IAT/BurstSize 分布漂移
-        X_packets = X_packets_valid  # (n_valid, D)
-        y_packets_all = np.repeat(y_clean, X_clean.shape[1])    # (N*L,)
-        y_packets = y_packets_all[packet_mask] if packet_mask is not None else y_packets_all
-        dataset_ddpm = TensorDataset(
-            torch.FloatTensor(X_packets),
-            torch.LongTensor(y_packets)
-        )
-        loader_ddpm = DataLoader(dataset_ddpm, batch_size=2048, shuffle=True)
-    
-        tabddpm.train()
-        for epoch in range(n_epochs_ddpm):
-            epoch_loss = 0.0
-            for X_batch, y_batch in loader_ddpm:
-                x_0 = X_batch.to(config.DEVICE)  # (B, D)
-                y_batch = y_batch.to(config.DEVICE)
-                
-                optimizer_ddpm.zero_grad()
-                loss = tabddpm.compute_loss(
-                    x_0, y_batch,
-                    mask_prob=config.MASK_PROBABILITY,
-                    mask_lambda=config.MASK_LAMBDA,
-                    p_uncond=0.2  # Classifier-free guidance training
-                )
-                loss.backward()
-                optimizer_ddpm.step()
-                
-                epoch_loss += loss.item()
-            
-            # 每个epoch输出
-            avg_loss = epoch_loss / len(loader_ddpm)
-            progress = (epoch + 1) / n_epochs_ddpm * 100
-            logger.info(f"[TabDDPM] Epoch [{epoch+1}/{n_epochs_ddpm}] ({progress:.1f}%) | Loss: {avg_loss:.4f}")
-	
-            improved = (ddpm_best_loss - float(avg_loss)) > ddpm_es_min_delta
-            if improved:
-                ddpm_best_loss = float(avg_loss)
-                ddpm_best_epoch = int(epoch + 1)
-                ddpm_best_state = {k: v.detach().cpu().clone() for k, v in tabddpm.state_dict().items()}
-                ddpm_no_improve = 0
-            else:
-                ddpm_no_improve += 1
-	
-            if ddpm_use_early_stopping and (epoch + 1) >= ddpm_es_warmup_epochs and ddpm_no_improve >= ddpm_es_patience:
-                logger.info(
-                    f"[TabDDPM] EarlyStopping triggered at epoch {epoch+1}: "
-                    f"best_loss={ddpm_best_loss:.4f} (epoch {ddpm_best_epoch}), "
-                    f"no_improve={ddpm_no_improve}, min_delta={ddpm_es_min_delta}"
-                )
-                break
-
-        if ddpm_best_state is not None:
-            tabddpm.load_state_dict(ddpm_best_state)
-            tabddpm.to(config.DEVICE)
-    
-        # Generate augmented samples (增强全部干净样本)
-        logger.info("-"*70)
-        logger.info("✓ TabDDPM 训练完成")
-        if ddpm_best_epoch > 0:
-            logger.info(f"  最佳TabDDPM损失: {ddpm_best_loss:.4f} (epoch {ddpm_best_epoch})")
-        logger.info("")
-        logger.info("步骤 2.3: 生成增强样本")
-        logger.info(f"  训练集样本数: {len(X_clean)}")
-        multipliers = np.ceil(weights_clean.astype(np.float32) * 10.0).astype(int)
-        multipliers = np.maximum(multipliers, 2)
-        expected_synthetic = int(multipliers.sum())
-        logger.info("  增强策略: per-sample 倍数 = max(2, ceil(sample_weight*10))")
-        logger.info(f"  倍数统计: min={multipliers.min()}, max={multipliers.max()}, mean={multipliers.mean():.2f}")
-        logger.info(f"  预期生成: ~{expected_synthetic} 个合成样本")
-        logger.info("  开始生成...")
-        
-        X_augmented, y_augmented, sample_weights = tabddpm.augment_dataset(
-            X_clean, y_clean, action_clean, weights_clean,
-            density_clean, cl_conf_clean, knn_conf_clean,
-            augmentation_ratio=config.AUGMENTATION_RATIO_MIN
-        )
-    
-    n_train_original = len(X_clean)
-    n_synthetic = len(X_augmented) - n_train_original
-    
-    logger.info(f"✓ 数据增强完成: 从 {n_train_original} 个训练样本增强到 {len(X_augmented)} 个样本")
-    logger.info(f"  原始训练数据: {n_train_original} 个样本")
-    logger.info(f"  合成数据: {n_synthetic} 个样本")
-    logger.info("")
-    
-    # ========================
-    # 步骤 2.4: 生成质量诊断
-    # ========================
-    logger.info("步骤 2.4: 生成质量诊断 (Generation Quality Assessment)")
-    logger.info("-"*70)
-    logger.info("评估维度: 1) Fidelity (真实性) 2) Protocol Validity (协议有效性)")
-    logger.info("")
-    
-    # 分离原始数据和合成数据
-    X_train_original = X_augmented[:n_train_original]
-    X_train_synthetic = X_augmented[n_train_original:]
-    y_train_original = y_augmented[:n_train_original]
-    y_train_synthetic = y_augmented[n_train_original:]
-    
-    # 1. Fidelity: 特征分布对比（均值/方差）
-    logger.info("1️⃣  Fidelity 检查: 特征分布对比")
-    feature_names = ['Length', 'Log-IAT', 'Direction', 'BurstSize', 'CumulativeLen', 'ValidMask']
-    logger.info(f"{'特征':<12} | {'真实均值':<12} | {'合成均值':<12} | {'差异%':<10} | {'真实标准差':<12} | {'合成标准差':<12}")
-    logger.info("-"*85)
-
-    if vm_idx is not None and int(vm_idx) >= 0 and int(vm_idx) < X_train_original.shape[-1]:
-        pad_mask_real = X_train_original[:, :, int(vm_idx)] > 0.5
-        pad_mask_syn = X_train_synthetic[:, :, int(vm_idx)] > 0.5
-    else:
-        pad_mask_real = np.any(X_train_original != 0.0, axis=-1)
-        pad_mask_syn = np.any(X_train_synthetic != 0.0, axis=-1)
-
-    diff_pcts = []
-    for i, name in enumerate(feature_names):
-        real_data = X_train_original[:, :, i][pad_mask_real]
-        syn_data = X_train_synthetic[:, :, i][pad_mask_syn]
-        
-        real_mean = real_data.mean() if real_data.size > 0 else np.nan
-        syn_mean = syn_data.mean() if syn_data.size > 0 else np.nan
-        real_std = real_data.std() if real_data.size > 0 else np.nan
-        syn_std = syn_data.std() if syn_data.size > 0 else np.nan
-        
-        # 计算相对差异百分比
-        if np.isfinite(real_mean) and np.isfinite(syn_mean) and np.isfinite(real_std):
-            denom = max(abs(real_mean), float(real_std), 1e-8)
-            diff_pct = abs(real_mean - syn_mean) / denom * 100
-        else:
-            diff_pct = np.nan
-        diff_pcts.append(float(diff_pct))
-        
-        # 判断质量（差异<10%为优秀，<20%为良好，>20%为需关注）
-        quality_marker = "✓" if diff_pct < 10 else ("⚠" if diff_pct < 20 else "❌")
-        
-        logger.info(f"{name:<12} | {real_mean:>11.4f} | {syn_mean:>11.4f} | {diff_pct:>8.2f}% {quality_marker} | "
-                   f"{real_std:>11.4f} | {syn_std:>11.4f}")
-    
-    logger.info("")
-
-
-    # 1.1 Quantiles: P50/P90/P99 (helps diagnose tail drift, esp. for skewed features like BurstSize)
-    logger.info("1️⃣ 1️⃣  Quantile 检查: P50/P90/P99 (真实 vs 合成)")
-    logger.info(f"{'特征':<12} | {'真实P50':<10} | {'合成P50':<10} | {'真实P90':<10} | {'合成P90':<10} | {'真实P99':<10} | {'合成P99':<10}")
-    logger.info("-"*92)
-    for i, name in enumerate(feature_names):
-        real_data = X_train_original[:, :, i][pad_mask_real]
-        syn_data = X_train_synthetic[:, :, i][pad_mask_syn]
-
-        if real_data.size > 0:
-            real_p50, real_p90, real_p99 = np.percentile(real_data, [50, 90, 99])
-        else:
-            real_p50, real_p90, real_p99 = np.nan, np.nan, np.nan
-
-        if syn_data.size > 0:
-            syn_p50, syn_p90, syn_p99 = np.percentile(syn_data, [50, 90, 99])
-        else:
-            syn_p50, syn_p90, syn_p99 = np.nan, np.nan, np.nan
-
-        logger.info(
-            f"{name:<12} | {real_p50:>9.4f} | {syn_p50:>9.4f} | {real_p90:>9.4f} | {syn_p90:>9.4f} | {real_p99:>9.4f} | {syn_p99:>9.4f}"
-        )
-
-    logger.info("")
-
-    max_diff_pct = float(np.nanmax(diff_pcts)) if len(diff_pcts) > 0 else float('nan')
-    if np.isnan(max_diff_pct):
-        fidelity_level = '未知'
-    elif max_diff_pct < 10:
-        fidelity_level = '优秀'
-    elif max_diff_pct < 20:
-        fidelity_level = '良好'
-    else:
-        fidelity_level = '需关注'
-    
-    # 2. Protocol Validity: 协议约束检查
-    logger.info("2️⃣  Protocol Validity 检查: 物理约束验证")
-    logger.info("检查项: 负数包长、负数突发大小、异常IAT、异常方向、异常累积长度/掩码")
-    logger.info("")
-    
-    # 检查各种违规情况
-    invalid_length = (X_train_synthetic[:, :, 0] < 0).sum()
-    invalid_iat = (np.isnan(X_train_synthetic[:, :, 1]) | np.isinf(X_train_synthetic[:, :, 1]) | (X_train_synthetic[:, :, 1] < 0)).sum()
-    invalid_direction = ((X_train_synthetic[:, :, 2] < -1) | (X_train_synthetic[:, :, 2] > 1)).sum()
-    invalid_burst = (X_train_synthetic[:, :, 3] < 0).sum()
-    invalid_cum = ((X_train_synthetic[:, :, 4] < 0) | (X_train_synthetic[:, :, 4] > 1)).sum()
-    invalid_mask = ((X_train_synthetic[:, :, 5] < 0) | (X_train_synthetic[:, :, 5] > 1)).sum()
-    
-    total_synthetic_values = X_train_synthetic.size
-    invalid_total = invalid_length + invalid_burst + invalid_iat + invalid_direction + invalid_cum + invalid_mask
-    validity_rate = (1 - invalid_total / total_synthetic_values) * 100
-    
-    logger.info(f"  ❌ 负数包长 (Length < 0):     {invalid_length:>6} 个值")
-    logger.info(f"  ❌ 负数突发大小 (BurstSize < 0): {invalid_burst:>6} 个值")
-    logger.info(f"  ❌ 异常IAT (NaN/Inf):         {invalid_iat:>6} 个值")
-    logger.info(f"  ❌ 异常方向 (Direction ∉[-1,1]): {invalid_direction:>6} 个值")
-    logger.info(f"  ❌ 异常累积长度 (CumulativeLen ∉[0,1]): {invalid_cum:>6} 个值")
-    logger.info(f"  ❌ 异常掩码 (ValidMask ∉[0,1]): {invalid_mask:>6} 个值")
-    logger.info(f"  ✓ 总有效率: {validity_rate:.2f}% ({total_synthetic_values - invalid_total}/{total_synthetic_values})")
-    logger.info("")
-    
-    # 3. Class-wise 分布检查
-    logger.info("3️⃣  Class-wise 分布检查: 类别平衡性")
-    logger.info(f"  原始数据 - 正常: {(y_train_original==0).sum()}, 恶意: {(y_train_original==1).sum()}")
-    logger.info(f"  合成数据 - 正常: {(y_train_synthetic==0).sum()}, 恶意: {(y_train_synthetic==1).sum()}")
-    logger.info(f"  增强后   - 正常: {(y_augmented==0).sum()}, 恶意: {(y_augmented==1).sum()}")
-    logger.info("")
-    
-    # 4. 结构感知检查：依赖特征的协方差
-    logger.info("4️⃣  Structure-Aware 检查: 依赖特征协方差")
-    logger.info("检查 Length-IAT-BurstSize 之间的相关性是否保持")
-    
-    # 提取依赖特征（索引 0, 1, 4）
-    dep_indices = [0, 1, 3]  # Length, Log-IAT, BurstSize
-    real_dep = X_train_original[:, :, dep_indices][pad_mask_real].reshape(-1, 3)
-    syn_dep = X_train_synthetic[:, :, dep_indices][pad_mask_syn].reshape(-1, 3)
-    
-    # 计算相关系数矩阵
-    real_corr = np.corrcoef(real_dep.T) if real_dep.shape[0] > 1 else np.full((3, 3), np.nan)
-    syn_corr = np.corrcoef(syn_dep.T) if syn_dep.shape[0] > 1 else np.full((3, 3), np.nan)
-    
-    logger.info("  真实数据相关系数矩阵:")
-    logger.info(f"    Length-IAT:    {real_corr[0, 1]:>7.4f}")
-    logger.info(f"    Length-Burst:  {real_corr[0, 2]:>7.4f}")
-    logger.info(f"    IAT-Burst:     {real_corr[1, 2]:>7.4f}")
-    logger.info("  合成数据相关系数矩阵:")
-    logger.info(f"    Length-IAT:    {syn_corr[0, 1]:>7.4f}")
-    logger.info(f"    Length-Burst:  {syn_corr[0, 2]:>7.4f}")
-    logger.info(f"    IAT-Burst:     {syn_corr[1, 2]:>7.4f}")
-    
-    # 计算相关性差异
-    corr_diff = np.nanmean(np.abs(real_corr - syn_corr))
-    logger.info(f"  平均相关性差异: {corr_diff:.4f} {'✓' if corr_diff < 0.1 else '⚠'}")
-    logger.info("")
-    
-    logger.info("-"*70)
-    logger.info("✓ 生成质量诊断完成")
-    logger.info(f"  总体评估: Fidelity={fidelity_level}, "
-               f"Validity={validity_rate:.1f}%, "
-               f"Structure={'保持' if corr_diff < 0.1 else '部分保持'}")
-    logger.info("")
-    
-    # 5. 可视化: Real vs Synthetic 对比图 (t-SNE)
-    logger.info("5️⃣  可视化: Real vs Synthetic 特征空间对比 (t-SNE)")
-    from MoudleCode.utils.visualization import plot_real_vs_synthetic_comparison
-    
-    comparison_save_path = os.path.join(config.DATA_AUGMENTATION_DIR, "figures", "real_vs_synthetic_tsne.png")
-    plot_real_vs_synthetic_comparison(
-        X_train_original, X_train_synthetic,
-        y_train_original, y_train_synthetic,
-        comparison_save_path,
-        title='TabDDPM Generation Quality: Real vs Synthetic',
-        method='tsne'
-    )
-    logger.info(f"  ✓ t-SNE对比图: {comparison_save_path}")
-    logger.info("    (蓝色=真实良性, 红色=真实恶意, 浅色=合成样本)")
-    logger.info("    理想结果: 合成样本应覆盖在真实样本之上")
-    logger.info("")
-    logger.info("📁 输出文件路径:")
-    # Save TabDDPM model
-    tabddpm_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "tabddpm.pth")
-    torch.save(tabddpm.state_dict(), tabddpm_path)
-    logger.info(f"  ✓ TabDDPM模型: {tabddpm_path}")
-    
-    # Save augmented data with metadata
-    augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_data.npz")
-    # Create mask to identify original vs synthetic samples
-    is_original_mask = np.zeros(len(X_augmented), dtype=bool)
-    is_original_mask[:n_train_original] = True
-    
-    np.savez(augmented_data_path,
-             X_augmented=X_augmented,
-             y_augmented=y_augmented,
-             is_original=is_original_mask,
-             n_original=n_train_original,
-             sample_weights=sample_weights)
-    logger.info(f"  ✓ 增强数据: {augmented_data_path}")
-    logger.info(f"    (包含原始/合成数据标记)")
-    
-    logger.info(f"Augmented dataset: {len(X_augmented)} samples (training)")
-    logger.info("Stage 2 complete: Labels corrected and data augmented")
-    
-    return X_augmented, y_augmented, sample_weights, correction_stats, tabddpm, n_train_original
 
 
 def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, config, logger, n_original=None, backbone_path=None):
@@ -1215,8 +894,8 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     logger.info(f"损失组件: 加权监督 + 软正交约束 + 一致性损失")
     logger.info("")
     logger.info("📥 输入数据路径:")
-    augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_data.npz")
-    logger.info(f"  ✓ 增强数据: {augmented_data_path}")
+    augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_features.npz")
+    logger.info(f"  ✓ 增强特征: {augmented_data_path}")
 
     input_is_features = bool(getattr(config, 'CLASSIFIER_INPUT_IS_FEATURES', False))
     try:
@@ -2173,7 +1852,7 @@ def main(args):
     # ========================
     # Stage 1: Pre-train Backbone (unsupervised, no labels needed)
     # ========================
-    backbone = MicroBiMambaBackbone(config)
+    backbone = build_backbone(config, logger=logger)
     
     if start_stage <= 1:
         # 根据对比学习方法选择批次大小
@@ -2257,29 +1936,33 @@ def main(args):
         # 跳过Stage 2：
         # - 如果是 Stage 3-only(start_stage==3)，按决策直接使用原始干净数据（不加载任何离线增强数据）
         # - 否则：兼容旧流程（如果存在 augmented_data.npz 则加载）
-        augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_data.npz")
+        augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_features.npz")
         if int(start_stage) == 3 and X_train is not None:
             logger.info("\n" + "="*70)
             logger.info("✅ Stage 3-only: 已跳过 Stage 2（不使用 TabDDPM 离线增强数据）")
             logger.info("="*70)
             logger.info("")
-            X_augmented = X_train
+            X_train_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
+            with torch.no_grad():
+                Z_clean = backbone(X_train_tensor, return_sequence=False).detach().cpu().numpy().astype(np.float32)
+
+            X_augmented = Z_clean
             y_augmented = y_train_clean
-            sample_weights = np.ones(len(X_train))
-            n_original = len(X_train)
-            logger.info(f"✓ 使用原始干净数据: {len(X_train)} 个样本")
+            sample_weights = np.ones(len(Z_clean), dtype=np.float32)
+            n_original = len(Z_clean)
+            logger.info(f"✓ 使用原始干净数据(特征): {len(Z_clean)} 个样本")
             if os.path.exists(augmented_data_path):
                 logger.info(f"  (已忽略离线增强文件: {augmented_data_path})")
         elif os.path.exists(augmented_data_path):
             # 加载已有的增强数据（兼容旧流程）
             logger.info("📥 输入数据路径:")
-            logger.info(f"  ✓ 增强数据: {augmented_data_path}")
+            logger.info(f"  ✓ 增强特征: {augmented_data_path}")
             backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
             logger.info(f"  ✓ 骨干网络模型: {backbone_path}")
             logger.info("")
-            logger.info(f"✓ 加载已有增强数据: {augmented_data_path}")
+            logger.info(f"✓ 加载已有增强特征: {augmented_data_path}")
             data = np.load(augmented_data_path)
-            X_augmented = data['X_augmented']
+            X_augmented = data['Z_augmented']
             y_augmented = data['y_augmented']
             sample_weights = data['sample_weights'] if 'sample_weights' in data else np.ones(len(X_augmented))
             # Get n_original from saved data
@@ -2304,12 +1987,16 @@ def main(args):
                 logger.info(f"  原始标签分布: 正常={(y_train_clean==0).sum()}, 恶意={(y_train_clean==1).sum()}")
                 logger.info(f"  噪声标签分布: 正常={(y_train_noisy==0).sum()}, 恶意={(y_train_noisy==1).sum()}")
             
-            X_augmented = X_train
+            X_train_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
+            with torch.no_grad():
+                Z_clean = backbone(X_train_tensor, return_sequence=False).detach().cpu().numpy().astype(np.float32)
+
+            X_augmented = Z_clean
             y_augmented = y_train_noisy
-            sample_weights = np.ones(len(X_train))
-            n_original = len(X_train)
+            sample_weights = np.ones(len(Z_clean), dtype=np.float32)
+            n_original = len(Z_clean)
             
-            logger.info(f"✓ 使用原始数据: {len(X_train)} 个样本")
+            logger.info(f"✓ 使用原始数据(特征): {len(Z_clean)} 个样本")
             logger.info("  ⚠️  注意：未进行标签矫正和数据增强，可能影响性能")
         else:
             logger.error(f"❌ 找不到增强数据: {augmented_data_path}")
@@ -2362,8 +2049,8 @@ def main(args):
     logger.info(f"  ✓ 标签矫正: {config.LABEL_CORRECTION_DIR}")
     logger.info(f"    - 矫正结果: {os.path.join(config.LABEL_CORRECTION_DIR, 'models', 'correction_results.npz')}")
     logger.info(f"  ✓ 数据增强: {config.DATA_AUGMENTATION_DIR}")
-    logger.info(f"    - TabDDPM模型: {os.path.join(config.DATA_AUGMENTATION_DIR, 'models', 'tabddpm.pth')}")
-    logger.info(f"    - 增强数据: {os.path.join(config.DATA_AUGMENTATION_DIR, 'models', 'augmented_data.npz')}")
+    logger.info(f"    - TabDDPM模型: {os.path.join(config.DATA_AUGMENTATION_DIR, 'models', 'tabddpm_feature.pth')}")
+    logger.info(f"    - 增强特征: {os.path.join(config.DATA_AUGMENTATION_DIR, 'models', 'augmented_features.npz')}")
     logger.info(f"  ✓ 分类器:   {config.CLASSIFICATION_DIR}")
     logger.info(f"    - 分类器模型: {os.path.join(config.CLASSIFICATION_DIR, 'models', 'classifier_final.pth')}")
     logger.info(f"    - 训练历史: {os.path.join(config.CLASSIFICATION_DIR, 'models', 'training_history.npz')}")

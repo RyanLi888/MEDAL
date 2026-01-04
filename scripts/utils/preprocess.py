@@ -20,10 +20,10 @@ MEDAL-Lite 数据预处理脚本
 
 预处理后的文件:
     output/preprocessed/
-    ├── train_X.npy      # 训练集特征 (N, 1024, 6)
+    ├── train_X.npy      # 训练集特征 (N, 1024, 4)
     ├── train_y.npy      # 训练集标签 (N,)
     ├── train_files.npy  # 训练集文件名
-    ├── test_X.npy       # 测试集特征 (M, 1024, 6)
+    ├── test_X.npy       # 测试集特征 (M, 1024, 4)
     ├── test_y.npy       # 测试集标签 (M,)
     └── test_files.npy   # 测试集文件名
 """
@@ -88,7 +88,7 @@ def load_preprocessed(data_type='train'):
         data_type: 'train' 或 'test'
         
     Returns:
-        X: numpy array (N, L, 6)
+        X: numpy array (N, L, 4)
         y: numpy array (N,)
         files: list of filenames
     """
@@ -106,7 +106,7 @@ def save_preprocessed(X, y, files, data_type='train'):
     保存预处理后的数据
     
     Args:
-        X: numpy array (N, L, 6)
+        X: numpy array (N, L, 4)
         y: numpy array (N,)
         files: list of filenames
         data_type: 'train' 或 'test'

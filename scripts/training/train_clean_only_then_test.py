@@ -16,7 +16,7 @@ import torch
 from MoudleCode.utils.config import config
 from MoudleCode.utils.helpers import set_seed, setup_logger
 from MoudleCode.preprocessing.pcap_parser import load_dataset
-from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone
+from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone, build_backbone
 
 try:
     from scripts.utils.preprocess import check_preprocessed_exists, load_preprocessed
@@ -209,7 +209,7 @@ def main():
         logger.info('')
         logger.info('🔧 骨干网络:')
         
-        backbone = MicroBiMambaBackbone(config)
+        backbone = build_backbone(config, logger=logger)
         
         # 确定backbone路径：优先使用命令行参数，否则使用默认路径
         if args.backbone_path:

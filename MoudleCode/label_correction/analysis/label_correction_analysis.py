@@ -34,7 +34,7 @@ from MoudleCode.utils.helpers import (
     set_seed, setup_logger, inject_label_noise
 )
 from MoudleCode.preprocessing.pcap_parser import load_dataset
-from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone
+from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone, build_backbone
 from MoudleCode.label_correction.hybrid_court import HybridCourt
 
 import logging
@@ -1523,7 +1523,7 @@ def main(args):
     logger.info("Step 3: 提取特征")
     logger.info("="*70)
     
-    backbone = MicroBiMambaBackbone(config)
+    backbone = build_backbone(config)
     
     # 确定backbone路径：优先使用命令行参数，否则使用默认路径
     if args.backbone_path:

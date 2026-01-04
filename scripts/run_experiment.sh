@@ -10,7 +10,14 @@ cd "$PROJECT_ROOT"
 
 # 常用路径（统一从项目根目录推导，避免硬编码相对路径）
 DATA_DIR="$PROJECT_ROOT/Datasets"
+if [ -n "${MEDAL_DATASET_SUBDIR:-}" ]; then
+    DATA_DIR="$PROJECT_ROOT/Datasets/${MEDAL_DATASET_SUBDIR}"
+fi
+
 OUTPUT_DIR="$PROJECT_ROOT/output"
+if [ -n "${MEDAL_DATASET_NAME:-}" ]; then
+    OUTPUT_DIR="$PROJECT_ROOT/output/${MEDAL_DATASET_NAME}"
+fi
 LOG_DIR="$OUTPUT_DIR/logs"
 PID_FILE="$OUTPUT_DIR/train.pid"
 BACKBONE_DIR="$OUTPUT_DIR/feature_extraction/models"

@@ -28,7 +28,7 @@ from MoudleCode.utils.visualization import (
     plot_feature_space, plot_confusion_matrix, plot_roc_curve, plot_probability_distribution
 )
 from MoudleCode.preprocessing.pcap_parser import load_dataset
-from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone
+from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone, build_backbone
 from MoudleCode.classification.dual_stream import MEDAL_Classifier
 from MoudleCode.utils.checkpoint import load_state_dict_shape_safe
 
@@ -38,6 +38,27 @@ try:
     PREPROCESS_AVAILABLE = True
 except ImportError:
     PREPROCESS_AVAILABLE = False
+
+
+def _load_classifier_checkpoint(classifier, state_dict, logger=None):
+    """Load classifier checkpoint saved either as full classifier.state_dict or as classifier.dual_mlp.state_dict."""
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Expected state_dict to be a dict, got {type(state_dict)}")
+
+    try:
+        classifier.load_state_dict(state_dict, strict=True)
+        return
+    except Exception as e:
+        if logger is not None:
+            logger.warning(f"⚠ 整模型加载失败，将尝试仅加载分类头(dual_mlp): {e}")
+
+    keys = list(state_dict.keys())
+    if keys and all(isinstance(k, str) and k.startswith('dual_mlp.') for k in keys):
+        stripped = {k[len('dual_mlp.'):]: v for k, v in state_dict.items()}
+        classifier.dual_mlp.load_state_dict(stripped, strict=True)
+        return
+
+    classifier.dual_mlp.load_state_dict(state_dict, strict=True)
 
 def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
     """
@@ -386,7 +407,7 @@ def main(args):
             logger.warning(f"⚠ 无法读取模型元数据: {e}")
     
     # Load backbone from feature_extraction directory
-    backbone = MicroBiMambaBackbone(config)
+    backbone = build_backbone(config, logger=logger)
     
     # 确定骨干网络路径
     # 优先级：1. 命令行参数 2. 元数据 3. 默认路径
@@ -454,7 +475,7 @@ def main(args):
             classifier_state = torch.load(args.classifier_path, map_location=config.DEVICE, weights_only=True)
         except TypeError:
             classifier_state = torch.load(args.classifier_path, map_location=config.DEVICE)
-        classifier.load_state_dict(classifier_state)
+        _load_classifier_checkpoint(classifier, classifier_state, logger=logger)
         logger.info(f"✓ 分类器加载完成")
         
         # Count parameters
@@ -521,7 +542,7 @@ def main(args):
             classifier_state = torch.load(model_path, map_location=config.DEVICE, weights_only=True)
         except TypeError:
             classifier_state = torch.load(model_path, map_location=config.DEVICE)
-        classifier.load_state_dict(classifier_state)
+        _load_classifier_checkpoint(classifier, classifier_state, logger=logger)
         logger.info(f"✓ 分类器加载完成")
         
         if model_name == "Best F1":

@@ -81,16 +81,20 @@ class MicroBiMambaBackbone(nn.Module):
         self.output_dim = getattr(config, 'OUTPUT_DIM', getattr(config, 'FEATURE_DIM', config.MODEL_DIM))
         
         # Embedding layer
-        if int(getattr(config, 'INPUT_FEATURE_DIM', 0)) == 6:
-            direction_index = int(getattr(config, 'DIRECTION_INDEX', 2))
-            if 0 <= direction_index < 6:
-                self.embedding = TrafficHybridEmbedding(
-                    d_model=config.MODEL_DIM,
-                    direction_index=direction_index,
-                    input_dim=6,
-                )
-            else:
-                self.embedding = nn.Linear(config.INPUT_FEATURE_DIM, config.MODEL_DIM)
+        input_dim = int(getattr(config, 'INPUT_FEATURE_DIM', 0))
+        direction_index = getattr(config, 'DIRECTION_INDEX', None)
+        if direction_index is not None:
+            try:
+                direction_index = int(direction_index)
+            except Exception:
+                direction_index = None
+
+        if input_dim > 0 and direction_index is not None and 0 <= int(direction_index) < input_dim:
+            self.embedding = TrafficHybridEmbedding(
+                d_model=config.MODEL_DIM,
+                direction_index=int(direction_index),
+                input_dim=input_dim,
+            )
         else:
             self.embedding = nn.Linear(config.INPUT_FEATURE_DIM, config.MODEL_DIM)
         self.pos_encoding = SinusoidalPositionalEncoding(config.MODEL_DIM, max_len=config.SEQUENCE_LENGTH)
@@ -205,6 +209,209 @@ class MicroBiMambaBackbone(nn.Module):
         for param in self.parameters():
             param.requires_grad = True
         self.frozen = False
+
+
+class _DualStreamHybridEmbedding(nn.Module):
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.cont_proj = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+        self.dir_emb = nn.Embedding(num_embeddings=2, embedding_dim=d_model)
+        nn.init.normal_(self.dir_emb.weight, std=0.02)
+
+    def forward(self, x_dir: torch.Tensor, x_cont: torch.Tensor) -> torch.Tensor:
+        dir_indices = (x_dir > 0).to(dtype=torch.long)
+        embed_cont = self.cont_proj(x_cont)
+        embed_dir = self.dir_emb(dir_indices)
+        return embed_cont + embed_dir
+
+
+class DualStreamBiMambaBackbone(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.output_dim = getattr(config, 'OUTPUT_DIM', getattr(config, 'FEATURE_DIM', config.MODEL_DIM))
+
+        model_dim = int(getattr(config, 'MODEL_DIM', 32))
+        d_len = max(1, model_dim // 2)
+        d_struct = max(1, model_dim - d_len)
+
+        self._d_len = int(d_len)
+        self._d_struct = int(d_struct)
+
+        self.length_index = getattr(config, 'LENGTH_INDEX', 0)
+        self.direction_index = getattr(config, 'DIRECTION_INDEX', None)
+        self.burst_index = getattr(config, 'BURST_SIZE_INDEX', None)
+        self.valid_mask_index = getattr(config, 'VALID_MASK_INDEX', None)
+
+        self.len_embed = nn.Sequential(
+            nn.Linear(1, self._d_len),
+            nn.LayerNorm(self._d_len),
+            nn.GELU(),
+        )
+        self.len_pos = SinusoidalPositionalEncoding(self._d_len, max_len=config.SEQUENCE_LENGTH)
+        self.len_dropout = nn.Dropout(config.EMBEDDING_DROPOUT)
+
+        self.struct_embed = _DualStreamHybridEmbedding(self._d_struct)
+        self.struct_pos = SinusoidalPositionalEncoding(self._d_struct, max_len=config.SEQUENCE_LENGTH)
+        self.struct_dropout = nn.Dropout(config.EMBEDDING_DROPOUT)
+
+        self.len_forward_layers = nn.ModuleList([
+            MambaLayer(
+                d_model=self._d_len,
+                d_state=config.MAMBA_STATE_DIM,
+                d_conv=config.MAMBA_CONV_KERNEL,
+                expand=config.MAMBA_EXPANSION_FACTOR,
+                dropout=config.MAMBA_DROPOUT,
+            )
+            for _ in range(config.MAMBA_LAYERS)
+        ])
+        self.len_backward_layers = nn.ModuleList([
+            MambaLayer(
+                d_model=self._d_len,
+                d_state=config.MAMBA_STATE_DIM,
+                d_conv=config.MAMBA_CONV_KERNEL,
+                expand=config.MAMBA_EXPANSION_FACTOR,
+                dropout=config.MAMBA_DROPOUT,
+            )
+            for _ in range(config.MAMBA_LAYERS)
+        ])
+        self.len_proj = nn.Linear(self._d_len * 2, self._d_len)
+
+        self.struct_forward_layers = nn.ModuleList([
+            MambaLayer(
+                d_model=self._d_struct,
+                d_state=config.MAMBA_STATE_DIM,
+                d_conv=config.MAMBA_CONV_KERNEL,
+                expand=config.MAMBA_EXPANSION_FACTOR,
+                dropout=config.MAMBA_DROPOUT,
+            )
+            for _ in range(config.MAMBA_LAYERS)
+        ])
+        self.struct_backward_layers = nn.ModuleList([
+            MambaLayer(
+                d_model=self._d_struct,
+                d_state=config.MAMBA_STATE_DIM,
+                d_conv=config.MAMBA_CONV_KERNEL,
+                expand=config.MAMBA_EXPANSION_FACTOR,
+                dropout=config.MAMBA_DROPOUT,
+            )
+            for _ in range(config.MAMBA_LAYERS)
+        ])
+        self.struct_proj = nn.Linear(self._d_struct * 2, self._d_struct)
+
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(model_dim, model_dim),
+            nn.Sigmoid(),
+        )
+        self.fusion_proj = nn.Linear(model_dim, model_dim)
+        self.projection = nn.Linear(model_dim, self.output_dim)
+
+        use_mlp_decoder = bool(getattr(config, 'SIMMTM_DECODER_USE_MLP', False))
+        decoder_hidden_dim = int(getattr(config, 'SIMMTM_DECODER_HIDDEN_DIM', 64))
+        if use_mlp_decoder:
+            self.decoder = nn.Sequential(
+                nn.Linear(self.output_dim, decoder_hidden_dim),
+                nn.GELU(),
+                nn.Linear(decoder_hidden_dim, config.INPUT_FEATURE_DIM),
+            )
+        else:
+            self.decoder = nn.Linear(self.output_dim, config.INPUT_FEATURE_DIM)
+
+        self.frozen = False
+
+    def forward(self, x, return_sequence=False):
+        valid_mask = None
+        if self.valid_mask_index is not None:
+            try:
+                if int(self.valid_mask_index) >= 0 and int(self.valid_mask_index) < x.shape[-1]:
+                    valid_mask = x[:, :, int(self.valid_mask_index)]
+            except Exception:
+                valid_mask = None
+
+        length_index = int(self.length_index) if self.length_index is not None else 0
+        x_len = x[:, :, length_index:length_index + 1]
+        x_len = self.len_embed(x_len)
+        x_len = self.len_pos(x_len)
+        x_len = self.len_dropout(x_len)
+
+        x_dir = None
+        x_burst = None
+        if self.direction_index is not None:
+            try:
+                di = int(self.direction_index)
+                if 0 <= di < x.shape[-1]:
+                    x_dir = x[:, :, di]
+            except Exception:
+                x_dir = None
+        if self.burst_index is not None:
+            try:
+                bi = int(self.burst_index)
+                if 0 <= bi < x.shape[-1]:
+                    x_burst = x[:, :, bi:bi + 1]
+            except Exception:
+                x_burst = None
+
+        if x_dir is None:
+            x_dir = torch.zeros(x.shape[0], x.shape[1], device=x.device, dtype=x.dtype)
+        if x_burst is None:
+            x_burst = torch.zeros(x.shape[0], x.shape[1], 1, device=x.device, dtype=x.dtype)
+
+        x_struct = self.struct_embed(x_dir, x_burst)
+        x_struct = self.struct_pos(x_struct)
+        x_struct = self.struct_dropout(x_struct)
+
+        x_len_fwd = x_len
+        for layer in self.len_forward_layers:
+            x_len_fwd = layer(x_len_fwd)
+        x_len_bwd = torch.flip(x_len, dims=[1])
+        for layer in self.len_backward_layers:
+            x_len_bwd = layer(x_len_bwd)
+        x_len_bwd = torch.flip(x_len_bwd, dims=[1])
+        h_len = self.len_proj(torch.cat([x_len_fwd, x_len_bwd], dim=-1))
+
+        x_struct_fwd = x_struct
+        for layer in self.struct_forward_layers:
+            x_struct_fwd = layer(x_struct_fwd)
+        x_struct_bwd = torch.flip(x_struct, dims=[1])
+        for layer in self.struct_backward_layers:
+            x_struct_bwd = layer(x_struct_bwd)
+        x_struct_bwd = torch.flip(x_struct_bwd, dims=[1])
+        h_struct = self.struct_proj(torch.cat([x_struct_fwd, x_struct_bwd], dim=-1))
+
+        h = torch.cat([h_len, h_struct], dim=-1)
+        gate = self.fusion_gate(h)
+        h = gate * h + (1.0 - gate) * self.fusion_proj(h)
+
+        if return_sequence:
+            return self.projection(h)
+
+        if valid_mask is not None:
+            m = (valid_mask > 0.5).to(dtype=h.dtype, device=h.device).unsqueeze(-1)
+            denom = m.sum(dim=1).clamp_min(1e-6)
+            pooled = (h * m).sum(dim=1) / denom
+        else:
+            pooled = torch.mean(h, dim=1)
+        return self.projection(pooled)
+
+    def freeze(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        self.frozen = True
+
+    def unfreeze(self):
+        for param in self.parameters():
+            param.requires_grad = True
+        self.frozen = False
+
+
+def build_backbone(config, logger=None):
+    if logger is not None:
+        logger.info("🧠 Backbone arch: DualStreamBiMambaBackbone (fixed)")
+    return DualStreamBiMambaBackbone(config)
 
 
 class SimMTMLoss(nn.Module):

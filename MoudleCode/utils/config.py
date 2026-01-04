@@ -15,8 +15,17 @@ class Config:
     # ==================== Paths ====================
     # 使用动态路径，自动定位项目根目录
     PROJECT_ROOT = str(Path(__file__).parent.parent.parent.absolute())
-    DATA_ROOT = os.path.join(PROJECT_ROOT, "Datasets")
-    OUTPUT_ROOT = os.path.join(PROJECT_ROOT, "output")
+    DATASET_SUBDIR = os.environ.get('MEDAL_DATASET_SUBDIR', '').strip()
+    if DATASET_SUBDIR:
+        DATA_ROOT = os.path.join(PROJECT_ROOT, "Datasets", DATASET_SUBDIR)
+    else:
+        DATA_ROOT = os.path.join(PROJECT_ROOT, "Datasets")
+
+    DATASET_NAME = os.environ.get('MEDAL_DATASET_NAME', '').strip()
+    if DATASET_NAME:
+        OUTPUT_ROOT = os.path.join(PROJECT_ROOT, "output", DATASET_NAME)
+    else:
+        OUTPUT_ROOT = os.path.join(PROJECT_ROOT, "output")
     
     # Fixed paths - read all pcap files from these directories
     BENIGN_TRAIN = os.path.join(DATA_ROOT, "T1_train", "benign")
@@ -36,16 +45,19 @@ class Config:
     # PCAP解析参数
     PACKET_TIMEOUT = 60  # 流超时时间(秒)
     MAX_PACKETS_PER_FLOW = 1024  # 每个流最大包数
-    
-    # 6维特征
-    FEATURE_NAMES = ['Length', 'Log-IAT', 'Direction', 'BurstSize', 'CumulativeLen', 'ValidMask']
 
+    # -------------------- Fixed Feature Interface (New Design) --------------------
+    # The project is standardized to a 4D feature set:
+    # [Length, Direction, BurstSize, ValidMask]
+    FEATURE_SET = 'lite4'
+
+    FEATURE_NAMES = ['Length', 'Direction', 'BurstSize', 'ValidMask']
     LENGTH_INDEX = 0
-    IAT_INDEX = 1
-    DIRECTION_INDEX = 2
-    BURST_SIZE_INDEX = 3
-    CUMULATIVE_LEN_INDEX = 4
-    VALID_MASK_INDEX = 5
+    IAT_INDEX = None
+    DIRECTION_INDEX = 1
+    BURST_SIZE_INDEX = 2
+    CUMULATIVE_LEN_INDEX = None
+    VALID_MASK_INDEX = 3
 
     # Burst 检测阈值（秒）
     # 用于判定突发边界：当包间隔 > 阈值时，认为是新的突发
@@ -68,7 +80,7 @@ class Config:
     
     # ==================== Input & Embedding Parameters ====================
     SEQUENCE_LENGTH = 1024  # L: Maximum number of packets per flow
-    INPUT_FEATURE_DIM = 6
+    INPUT_FEATURE_DIM = 4
     MODEL_DIM = 32          # d_model: Embedding dimension (降低到32维)
     OUTPUT_DIM = 32         # backbone最终输出维度（下游分类/对比学习使用）
     FEATURE_DIM = OUTPUT_DIM
@@ -76,6 +88,8 @@ class Config:
     POSITIONAL_ENCODING = "sinusoidal"  # 正弦位置编码
     
     # ==================== Micro-Bi-Mamba Backbone ====================
+    BACKBONE_ARCH = 'dual_stream'
+
     MAMBA_LAYERS = 2
     MAMBA_STATE_DIM = 8         # d_state: SSM internal memory capacity (降低到8)
     MAMBA_EXPANSION_FACTOR = 2   # E: Expansion factor
@@ -170,10 +184,7 @@ class Config:
     elif _env_stage2_tabddpm in ('1', 'true', 'yes', 'y', 'on'):
         STAGE2_USE_TABDDPM = True
 
-    # TabDDPM training space: 'raw' (sequence/packet-level, legacy) or 'feature' (backbone feature space)
-    STAGE2_TABDDPM_SPACE = str(os.environ.get('MEDAL_STAGE2_TABDDPM_SPACE', 'raw')).strip().lower()
-    if STAGE2_TABDDPM_SPACE not in ('raw', 'feature'):
-        STAGE2_TABDDPM_SPACE = 'raw'
+    STAGE2_TABDDPM_SPACE = 'feature'
 
     STAGE2_FEATURE_AUG_MULTIPLIER = 5
     _env_stage2_feat_mult = os.environ.get('MEDAL_STAGE2_FEATURE_AUG_MULTIPLIER', '').strip()

@@ -8,6 +8,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+OUTPUT_BASE="$PROJECT_ROOT/output"
+if [ -n "${MEDAL_DATASET_NAME:-}" ]; then
+    OUTPUT_BASE="$PROJECT_ROOT/output/${MEDAL_DATASET_NAME}"
+fi
+
 # Default values
 NOISE_RATES=""
 RETRAIN_BACKBONE=""
@@ -107,7 +112,7 @@ fi
 
 # Check for existing backbone models
 echo "检查已有的骨干网络模型..."
-BACKBONE_DIR="$PROJECT_ROOT/output/feature_extraction/models"
+BACKBONE_DIR="$OUTPUT_BASE/feature_extraction/models"
 USE_EXISTING_BACKBONE="false"
 BACKBONE_PATH=""
 
@@ -217,7 +222,7 @@ if [[ ! $REPLY =~ ^[Yy]$ ]] && [[ ! -z $REPLY ]]; then
 fi
 
 # Create log directory
-LOG_DIR="$PROJECT_ROOT/output/logs"
+LOG_DIR="$OUTPUT_BASE/logs"
 mkdir -p "$LOG_DIR"
 
 # Track results
@@ -290,8 +295,13 @@ fi
 
 echo ""
 print_message "$YELLOW" "📁 输出目录:"
-echo "  分析结果: output/label_correction/analysis/noise_*pct/"
-echo "  日志文件: output/logs/noise_*pct_analysis_*.log"
+if [ -n "${MEDAL_DATASET_NAME:-}" ]; then
+  echo "  分析结果: output/${MEDAL_DATASET_NAME}/label_correction/analysis/noise_*pct/"
+  echo "  日志文件: output/${MEDAL_DATASET_NAME}/logs/noise_*pct_analysis_*.log"
+else
+  echo "  分析结果: output/label_correction/analysis/noise_*pct/"
+  echo "  日志文件: output/logs/noise_*pct_analysis_*.log"
+fi
 echo ""
 
 if [ $FAILED -gt 0 ]; then

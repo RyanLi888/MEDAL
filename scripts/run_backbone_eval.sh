@@ -7,9 +7,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-MODEL_DIR="output/feature_extraction/models"
-DATA_ROOT="output/preprocessed"
-EVAL_ROOT="output/backbone_eval"
+OUTPUT_BASE="output"
+if [ -n "${MEDAL_DATASET_NAME:-}" ]; then
+  OUTPUT_BASE="output/${MEDAL_DATASET_NAME}"
+fi
+
+MODEL_DIR="$OUTPUT_BASE/feature_extraction/models"
+DATA_ROOT="$OUTPUT_BASE/preprocessed"
+EVAL_ROOT="$OUTPUT_BASE/backbone_eval"
 
 if ! command -v python >/dev/null 2>&1; then
   echo "❌ 未找到 python"

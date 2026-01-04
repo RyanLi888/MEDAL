@@ -22,7 +22,7 @@ import seaborn as sns
 import json
 from tqdm import tqdm
 
-from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone
+from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone, build_backbone
 from MoudleCode.utils.config import Config
 from MoudleCode.utils.visualization import _configure_matplotlib_chinese_fonts
 
@@ -48,7 +48,7 @@ class BackboneEvaluator:
         
         # 加载骨干网络
         print(f"[加载] 骨干网络: {backbone_path}")
-        self.backbone = MicroBiMambaBackbone(config)
+        self.backbone = build_backbone(config)
 
         load_location = 'cpu' if str(device) != 'cpu' else 'cpu'
         try:

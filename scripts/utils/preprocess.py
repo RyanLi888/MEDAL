@@ -101,6 +101,33 @@ def load_preprocessed(data_type='train'):
     return X, y, files.tolist()
 
 
+def normalize_burstsize_inplace(X: np.ndarray) -> np.ndarray:
+    try:
+        enabled = bool(getattr(config, 'BURSTSIZE_NORMALIZE', False))
+    except Exception:
+        enabled = False
+    if not enabled:
+        return X
+
+    try:
+        burst_idx = int(getattr(config, 'BURST_SIZE_INDEX', 2))
+        vm_idx = int(getattr(config, 'VALID_MASK_INDEX', 3))
+        denom = float(getattr(config, 'BURSTSIZE_NORM_DENOM', 1.0))
+    except Exception:
+        return X
+
+    if denom <= 0:
+        return X
+    if X is None or getattr(X, 'ndim', 0) != 3:
+        return X
+    if burst_idx < 0 or burst_idx >= X.shape[-1] or vm_idx < 0 or vm_idx >= X.shape[-1]:
+        return X
+
+    mask = X[:, :, vm_idx] > 0.5
+    X[:, :, burst_idx][mask] = X[:, :, burst_idx][mask] / denom
+    return X
+
+
 def save_preprocessed(X, y, files, data_type='train'):
     """
     保存预处理后的数据

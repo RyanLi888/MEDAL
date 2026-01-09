@@ -58,7 +58,6 @@ def extract_flow_statistics(X, y):
     
     # 特征索引
     LENGTH_IDX = config.LENGTH_INDEX
-    IAT_IDX = config.IAT_INDEX
     DIRECTION_IDX = config.DIRECTION_INDEX
     BURST_IDX = config.BURST_SIZE_INDEX
     CUMULATIVE_IDX = config.CUMULATIVE_LEN_INDEX
@@ -67,10 +66,14 @@ def extract_flow_statistics(X, y):
     # 提取有效包（ValidMask > 0.5）
     valid_mask = X[:, :, VALID_IDX] > 0.5  # (N, L)
     
+    has_cumulative = CUMULATIVE_IDX is not None
     stats = {
-        'benign': {'burst_mean': [], 'length_mean': [], 'packet_count': [], 'cumulative_final': []},
-        'malicious': {'burst_mean': [], 'length_mean': [], 'packet_count': [], 'cumulative_final': []}
+        'benign': {'burst_mean': [], 'length_mean': [], 'packet_count': []},
+        'malicious': {'burst_mean': [], 'length_mean': [], 'packet_count': []}
     }
+    if has_cumulative:
+        stats['benign']['cumulative_final'] = []
+        stats['malicious']['cumulative_final'] = []
     
     for i in range(N):
         label = 'benign' if y[i] == 0 else 'malicious'
@@ -83,13 +86,16 @@ def extract_flow_statistics(X, y):
         # 提取有效包的特征
         burst_values = X[i, valid_packets, BURST_IDX]
         length_values = X[i, valid_packets, LENGTH_IDX]
-        cumulative_values = X[i, valid_packets, CUMULATIVE_IDX]
+        cumulative_values = None
+        if has_cumulative:
+            cumulative_values = X[i, valid_packets, CUMULATIVE_IDX]
         
         # 统计特征
         stats[label]['burst_mean'].append(np.mean(burst_values))
         stats[label]['length_mean'].append(np.mean(length_values))
         stats[label]['packet_count'].append(n_valid)
-        stats[label]['cumulative_final'].append(cumulative_values[-1] if len(cumulative_values) > 0 else 0.0)
+        if has_cumulative:
+            stats[label]['cumulative_final'].append(cumulative_values[-1] if len(cumulative_values) > 0 else 0.0)
     
     # 转换为 numpy 数组
     for label in ['benign', 'malicious']:
@@ -134,6 +140,10 @@ def plot_cumulative_length_curves(X, y, output_dir, n_samples=100):
     """
     CUMULATIVE_IDX = config.CUMULATIVE_LEN_INDEX
     VALID_IDX = config.VALID_MASK_INDEX
+    
+    if CUMULATIVE_IDX is None:
+        logger.warning("CUMULATIVE_LEN_INDEX is None. Skip cumulative-length curves.")
+        return
     
     # 随机采样
     benign_idx = np.where(y == 0)[0]

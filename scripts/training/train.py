@@ -42,6 +42,7 @@ from MoudleCode.utils.checkpoint import load_state_dict_shape_safe
 # 导入预处理模块
 try:
     from scripts.utils.preprocess import check_preprocessed_exists, load_preprocessed, preprocess_train
+    from scripts.utils.preprocess import normalize_burstsize_inplace
     PREPROCESS_AVAILABLE = True
 except ImportError:
     PREPROCESS_AVAILABLE = False
@@ -112,7 +113,11 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
         # 实例对比学习模式
         augmentation = DualViewAugmentation(config)
         instance_contrastive = InstanceContrastiveLearning(backbone, config).to(config.DEVICE)
-        simmtm_loss_fn = SimMTMLoss(mask_rate=config.SIMMTM_MASK_RATE)
+        simmtm_loss_fn = SimMTMLoss(
+            config,
+            mask_rate=config.SIMMTM_MASK_RATE,
+            noise_std=getattr(config, 'PRETRAIN_NOISE_STD', 0.05)
+        )
         hybrid_loss_fn = HybridPretrainingLoss(
             simmtm_loss=simmtm_loss_fn,
             instance_contrastive=instance_contrastive,
@@ -128,7 +133,11 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
         )
     else:
         # 原始SimMTM模式
-        simmtm_loss_fn = SimMTMLoss(mask_rate=config.SIMMTM_MASK_RATE)
+        simmtm_loss_fn = SimMTMLoss(
+            config,
+            mask_rate=config.SIMMTM_MASK_RATE,
+            noise_std=getattr(config, 'PRETRAIN_NOISE_STD', 0.05)
+        )
         logger.info(f"✓ 损失函数初始化完成 (SimMTM掩码率: {config.SIMMTM_MASK_RATE})")
         
         optimizer = optim.AdamW(
@@ -197,6 +206,7 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
         epoch_loss = 0.0
         epoch_simmtm = 0.0
         epoch_infonce = 0.0
+        epoch_stream_consistency = 0.0
         
         for batch_idx, batch_data in enumerate(train_loader):
             # TensorDataset with single tensor returns the tensor directly
@@ -254,6 +264,18 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
         if use_instance_contrastive:
             epoch_infonce /= n_batches
             history['infonce'].append(epoch_infonce)
+            try:
+                if epoch in (0, 1) and hasattr(simmtm_loss_fn, 'last_loss_dict') and isinstance(simmtm_loss_fn.last_loss_dict, dict):
+                    ld = simmtm_loss_fn.last_loss_dict
+                    logger.info(
+                        f"[Stage 1] SimMTM components | "
+                        f"len={float(ld.get('length', 0.0)):.4f} | "
+                        f"burst={float(ld.get('burst', 0.0)):.4f} | "
+                        f"dir={float(ld.get('direction', 0.0)):.4f} | "
+                        f"vm={float(ld.get('validmask', 0.0)):.4f}"
+                    )
+            except Exception:
+                pass
         
         # 每个epoch都输出日志（便于监控）
         progress = (epoch + 1) / config.PRETRAIN_EPOCHS * 100
@@ -891,7 +913,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     logger.info(f"批次大小: {config.FINETUNE_BATCH_SIZE}")
     logger.info(f"学习率: {config.FINETUNE_LR}")
     logger.info(f"训练样本数: {len(X_train)} (包含增强样本)")
-    logger.info(f"损失组件: 加权监督 + 软正交约束 + 一致性损失")
+    logger.info(f"损失组件: 加权监督")
     logger.info("")
     logger.info("📥 输入数据路径:")
     augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_features.npz")
@@ -904,11 +926,12 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     except Exception:
         pass
 
-    finetune_backbone = bool(getattr(config, 'FINETUNE_BACKBONE', False))
+    finetune_backbone_requested = bool(getattr(config, 'FINETUNE_BACKBONE', False))
     if input_is_features:
-        finetune_backbone = False
+        finetune_backbone_requested = False
     finetune_scope = str(getattr(config, 'FINETUNE_BACKBONE_SCOPE', 'projection')).lower()
     finetune_backbone_lr = float(getattr(config, 'FINETUNE_BACKBONE_LR', 1e-5))
+    finetune_backbone_warmup_epochs = int(getattr(config, 'FINETUNE_BACKBONE_WARMUP_EPOCHS', 0))
     
     # 使用传入的backbone_path参数，如果没有则使用默认路径
     if backbone_path is None:
@@ -933,107 +956,111 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     logger.info("✓ 损失函数初始化完成")
 
     logger.info(
-        f"🔧 LogitMargin: enabled={bool(getattr(config, 'USE_LOGIT_MARGIN', False))} "
-        f"m={float(getattr(config, 'LOGIT_MARGIN_M', 0.0))} "
-        f"warmup_epochs={int(getattr(config, 'LOGIT_MARGIN_WARMUP_EPOCHS', 0))}"
-    )
-    logger.info(
-        f"🔧 MarginLoss: enabled={bool(getattr(config, 'USE_MARGIN_LOSS', False))} "
-        f"m={float(getattr(config, 'MARGIN_M', 0.0))} "
-        f"s={float(getattr(config, 'MARGIN_S', 1.0))} "
-        f"w={float(getattr(config, 'MARGIN_LOSS_WEIGHT', 0.0))}"
+        f"🔧 FocalLoss: alpha={float(getattr(config, 'FOCAL_ALPHA', 0.5))} "
+        f"gamma={float(getattr(config, 'FOCAL_GAMMA', 2.0))}"
     )
 
-    # Stage 3 online augmentation (input-level)
-    use_stage3_online_aug = bool(getattr(config, 'STAGE3_ONLINE_AUGMENTATION', False))
-    if input_is_features:
-        use_stage3_online_aug = False
     augmentor = None
-    if use_stage3_online_aug:
-        from MoudleCode.feature_extraction.traffic_augmentation import TrafficAugmentation
-        augmentor = TrafficAugmentation(config)
-        logger.info("✓ Stage 3 在线表征增强已启用 (TrafficAugmentation)")
-    else:
-        logger.info("✓ Stage 3 在线表征增强未启用")
-    
-    # Stage 3 ST-Mixup (Spatio-Temporal Mixup)
-    use_st_mixup = bool(getattr(config, 'STAGE3_USE_ST_MIXUP', False))
-    if input_is_features:
-        use_st_mixup = False
     st_mixup = None
-    if use_st_mixup:
-        from MoudleCode.feature_extraction.st_mixup import create_st_mixup
-        st_mixup_mode = str(getattr(config, 'STAGE3_ST_MIXUP_MODE', 'intra_class'))
-        st_mixup = create_st_mixup(config, mode=st_mixup_mode)
-        logger.info(f"✓ Stage 3 ST-Mixup已启用 (mode={st_mixup_mode})")
-        logger.info(f"  - Alpha: {config.STAGE3_ST_MIXUP_ALPHA} (混合强度)")
-        logger.info(f"  - Warmup: {config.STAGE3_ST_MIXUP_WARMUP_EPOCHS} epochs (渐进式启用)")
-        logger.info(f"  - Max Prob: {config.STAGE3_ST_MIXUP_MAX_PROB} (最大混合概率)")
-        logger.info(f"  - Time Shift: {config.STAGE3_ST_MIXUP_TIME_SHIFT_RATIO} (时间偏移比例)")
-        if st_mixup_mode == 'intra_class':
-            logger.info(f"  - 策略: 类内混合（只混合同类样本，避免语义冲突）")
-        elif st_mixup_mode == 'selective':
-            logger.info(f"  - 策略: 选择性混合（只混合困难样本）")
-            logger.info(f"  - Uncertainty Threshold: {config.STAGE3_ST_MIXUP_UNCERTAINTY_THRESHOLD}")
-    else:
-        logger.info("✓ Stage 3 ST-Mixup未启用")
     
     # -------------------- Backbone finetuning policy --------------------
-    if finetune_backbone:
-        # Default: freeze everything first
+    backbone_param_candidates = []
+    if finetune_backbone_requested:
+        if finetune_scope == 'all':
+            backbone_param_candidates = list(backbone.parameters())
+        elif finetune_scope == 'projection':
+            if hasattr(backbone, 'projection'):
+                backbone_param_candidates = list(backbone.projection.parameters())
+            else:
+                logger.warning("⚠️  FINETUNE_BACKBONE_SCOPE='projection' but backbone has no attribute 'projection'. Falling back to frozen backbone.")
+                finetune_backbone_requested = False
+        else:
+            logger.warning(f"⚠️  Unknown FINETUNE_BACKBONE_SCOPE='{finetune_scope}'. Falling back to frozen backbone.")
+            finetune_backbone_requested = False
+
+    if finetune_backbone_warmup_epochs < 0:
+        finetune_backbone_warmup_epochs = 0
+
+    backbone_finetune_active = False
+    backbone_finetune_started = False
+
+    def _set_backbone_trainable(enable: bool) -> None:
+        nonlocal backbone_finetune_active, backbone_finetune_started, finetune_backbone_requested
         backbone.freeze()
+        if not enable or not finetune_backbone_requested:
+            backbone.eval()
+            backbone_finetune_active = False
+            return
+
         if finetune_scope == 'all':
             backbone.unfreeze()
-            logger.info("🔥 Stage 3: Backbone finetuning enabled (scope=all)")
         elif finetune_scope == 'projection':
-            # Only train the bidirectional projection head
             if hasattr(backbone, 'projection'):
                 for p in backbone.projection.parameters():
                     p.requires_grad = True
-                logger.info("🔥 Stage 3: Backbone finetuning enabled (scope=projection)")
             else:
                 logger.warning("⚠️  FINETUNE_BACKBONE_SCOPE='projection' but backbone has no attribute 'projection'. Falling back to frozen backbone.")
-                finetune_backbone = False
+                finetune_backbone_requested = False
+                backbone.eval()
+                backbone_finetune_active = False
+                return
         else:
             logger.warning(f"⚠️  Unknown FINETUNE_BACKBONE_SCOPE='{finetune_scope}'. Falling back to frozen backbone.")
-            finetune_backbone = False
-    else:
-        backbone.freeze()
+            finetune_backbone_requested = False
+            backbone.eval()
+            backbone_finetune_active = False
+            return
 
-    # Set backbone mode
-    if finetune_backbone:
         backbone.train()
+        backbone_finetune_active = True
+        backbone_finetune_started = True
+
+    if finetune_backbone_requested and finetune_backbone_warmup_epochs > 0:
+        _set_backbone_trainable(False)
+        logger.info(
+            f"🧊 Stage 3: Backbone frozen for first {finetune_backbone_warmup_epochs} epochs, "
+            f"then finetune (scope={finetune_scope}, lr={finetune_backbone_lr})"
+        )
+    elif finetune_backbone_requested:
+        _set_backbone_trainable(True)
+        logger.info(f"🔥 Stage 3: Backbone finetuning enabled (scope={finetune_scope})")
     else:
-        backbone.eval()
+        _set_backbone_trainable(False)
 
     # -------------------- Optimizer (classifier + optional backbone) --------------------
     param_groups = [
         {'params': classifier.dual_mlp.parameters(), 'lr': float(config.FINETUNE_LR)}
     ]
-    if finetune_backbone:
-        backbone_params = [p for p in backbone.parameters() if p.requires_grad]
-        if len(backbone_params) == 0:
+    if finetune_backbone_requested:
+        if len(backbone_param_candidates) == 0:
             logger.warning("⚠️  FINETUNE_BACKBONE=True but no trainable backbone params found; backbone will remain frozen.")
-            finetune_backbone = False
-            backbone.eval()
+            finetune_backbone_requested = False
+            _set_backbone_trainable(False)
         else:
-            param_groups.append({'params': backbone_params, 'lr': finetune_backbone_lr})
-            logger.info(f"✓ 优化器包含骨干网络可训练参数: {len(backbone_params)} | backbone_lr={finetune_backbone_lr}")
+            param_groups.append({'params': backbone_param_candidates, 'lr': finetune_backbone_lr})
+            logger.info(f"✓ 优化器包含骨干网络可训练参数: {len(backbone_param_candidates)} | backbone_lr={finetune_backbone_lr}")
 
     optimizer = optim.AdamW(
         param_groups,
         weight_decay=config.PRETRAIN_WEIGHT_DECAY
     )
-    if finetune_backbone:
-        logger.info("✓ 优化器初始化完成 (分类器 + 骨干网络微调)")
+    if finetune_backbone_requested:
+        if finetune_backbone_warmup_epochs > 0:
+            logger.info("✓ 优化器初始化完成 (分类器 + 骨干网络计划微调)")
+        else:
+            logger.info("✓ 优化器初始化完成 (分类器 + 骨干网络微调)")
     else:
         logger.info("✓ 优化器初始化完成 (仅优化分类器参数，骨干网络已冻结)")
     
     logger.info("")
     logger.info("💡 训练流程说明:")
-    if finetune_backbone:
-        logger.info("  每个batch: 原始数据 → 骨干网络(可训练) → 特征 → 分类器(训练) → 损失")
-        logger.info("  骨干网络参数会随分类器一起更新")
+    if finetune_backbone_requested:
+        if finetune_backbone_warmup_epochs > 0:
+            logger.info(f"  前{finetune_backbone_warmup_epochs}轮: 骨干网络冻结，仅训练分类器")
+            logger.info("  后续阶段: 骨干网络小LR微调 + 分类器联合训练")
+        else:
+            logger.info("  每个batch: 原始数据 → 骨干网络(可训练) → 特征 → 分类器(训练) → 损失")
+            logger.info("  骨干网络参数会随分类器一起更新")
     else:
         logger.info("  每个batch: 原始数据 → 骨干网络(冻结) → 特征 → 分类器(训练) → 损失")
         logger.info("  骨干网络实时提取特征，但参数不更新")
@@ -1105,13 +1132,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     
     # ==================== 温室训练策略：强制1:1平衡采样 ====================
     use_balanced_sampling = getattr(config, 'USE_BALANCED_SAMPLING', True)
-    use_hard_mining = bool(getattr(config, 'STAGE3_HARD_MINING', False))
-    hard_mining_warmup_epochs = int(getattr(config, 'STAGE3_HARD_MINING_WARMUP_EPOCHS', 5))
-    hard_mining_freq_epochs = int(getattr(config, 'STAGE3_HARD_MINING_FREQ_EPOCHS', 3))
-    hard_mining_topk_ratio = float(getattr(config, 'STAGE3_HARD_MINING_TOPK_RATIO', 0.2))
-    hard_mining_multiplier = float(getattr(config, 'STAGE3_HARD_MINING_MULTIPLIER', 3.0))
-    hard_mining_pos_prob_max = float(getattr(config, 'STAGE3_HARD_MINING_POS_PROB_MAX', 0.70))
-    hard_mining_neg_prob_min = float(getattr(config, 'STAGE3_HARD_MINING_NEG_PROB_MIN', 0.60))
+    use_hard_mining = False
     
     # Dataset is created once; sampler may be rebuilt during training when hard mining is enabled.
     train_dataset = TensorDataset(
@@ -1133,168 +1154,68 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             sampler=sampler
         )
 
-    def _compute_sampling_weights_from_model():
-        classifier.eval()
-        if finetune_backbone:
-            backbone.eval()
-        probs_list = []
-        labels_list = []
-        with torch.no_grad():
-            eval_loader = DataLoader(train_dataset, batch_size=getattr(config, 'TEST_BATCH_SIZE', 256), shuffle=False)
-            for X_b, y_b, _w_b in eval_loader:
-                X_b = X_b.to(config.DEVICE)
-                if input_is_features:
-                    z_b = X_b
-                else:
-                    z_b = backbone(X_b, return_sequence=False)
-                logits_a, logits_b = classifier.dual_mlp(z_b, return_separate=True)
-                logits_avg = (logits_a + logits_b) / 2.0
-                p = torch.softmax(logits_avg, dim=1)[:, 1]
-                probs_list.append(p.detach().cpu().numpy())
-                labels_list.append(y_b.detach().cpu().numpy())
-
-        classifier.train()
-        if finetune_backbone:
-            backbone.train()
-
-        probs = np.concatenate(probs_list, axis=0)
-        labels = np.concatenate(labels_list, axis=0).astype(int)
-
-        if use_balanced_sampling:
-            class_counts = np.bincount(labels)
-            class_weights = 1.0 / np.maximum(class_counts, 1)
-            base_w = class_weights[labels]
-        else:
-            base_w = np.ones_like(probs, dtype=np.float64)
-
-        hard_pos = (labels == 1) & (probs < hard_mining_pos_prob_max)
-        hard_neg = (labels == 0) & (probs > hard_mining_neg_prob_min)
-        hard_mask = hard_pos | hard_neg
-
-        k_ratio = float(np.clip(hard_mining_topk_ratio, 0.0, 1.0))
-        k = int(max(0, round(len(probs) * k_ratio)))
-        if k > 0:
-            difficulty = np.where(labels == 1, 1.0 - probs, probs)
-            topk_idx = np.argpartition(-difficulty, k - 1)[:k]
-            hard_mask[topk_idx] = True
-
-        weights = base_w.astype(np.float64)
-        weights[hard_mask] = weights[hard_mask] * hard_mining_multiplier
-        return weights, {
-            'n_hard_total': int(np.sum(hard_mask)),
-            'n_hard_pos': int(np.sum(hard_pos)),
-            'n_hard_neg': int(np.sum(hard_neg)),
-            'pos_prob_max': float(hard_mining_pos_prob_max),
-            'neg_prob_min': float(hard_mining_neg_prob_min),
-            'topk_ratio': float(hard_mining_topk_ratio),
-            'multiplier': float(hard_mining_multiplier),
-        }
-
     if use_balanced_sampling:
         logger.info("🌡️  温室训练策略：启用加权平衡采样")
-        logger.info("  目标：正常:恶意 = 1.5:1 (恶意样本权重更高)")
+        target_ratio = float(getattr(config, 'BALANCED_SAMPLING_RATIO', 1.0))
+        if not np.isfinite(target_ratio) or target_ratio <= 0.0:
+            target_ratio = 1.0
+        logger.info(f"  目标：正常:恶意 = {target_ratio:.2f}:1")
         logger.info("")
         
         class_counts = np.bincount(y_train_split)
         logger.info(f"  原始分布: 正常={class_counts[0]}, 恶意={class_counts[1]}")
         logger.info(f"  原始比例: {class_counts[0]}:{class_counts[1]} ≈ {class_counts[0]/class_counts[1]:.1f}:1")
         
-        # 设置采样权重以达到 正常:恶意 = 1.5:1
+        # 设置采样权重以达到 正常:恶意 = target_ratio:1
         # 如果正常类有N个样本，恶意类有M个样本
-        # 我们希望采样后的期望比例是 1.5:1
+        # 我们希望采样后的期望比例是 target_ratio:1
         # 设正常类权重为w0，恶意类权重为w1
-        # 则 (N*w0) : (M*w1) = 1.5 : 1
-        # 即：w0 = 1.5 * M / N * w1
-        # 设w1 = 1，则 w0 = 1.5 * M / N
+        # 则 (N*w0) : (M*w1) = target_ratio : 1
+        # 即：w0 = target_ratio * M / N * w1
+        # 设w1 = 1，则 w0 = target_ratio * M / N
         
         n_benign = class_counts[0]
         n_malicious = class_counts[1]
         
-        # 计算类别权重：正常类权重 = 1.5 * (恶意数量 / 正常数量)
-        weight_benign = 1.5 * n_malicious / n_benign
+        # 计算类别权重：正常类权重 = target_ratio * (恶意数量 / 正常数量)
+        weight_benign = target_ratio * n_malicious / max(n_benign, 1)
         weight_malicious = 1.0
         
         class_weights = np.array([weight_benign, weight_malicious])
         sample_sampling_weights = class_weights[y_train_split]
-        
+        if weight_benign > weight_malicious:
+            weight_note = "正常样本权重更高"
+        elif weight_benign < weight_malicious:
+            weight_note = "恶意样本权重更高"
+        else:
+            weight_note = "权重相同"
         logger.info(f"  采样权重: 正常类={weight_benign:.4f}, 恶意类={weight_malicious:.4f}")
-        logger.info(f"  期望采样比例: 1.5:1 (正常:恶意)")
+        logger.info(f"  权重倾向: {weight_note}")
+        logger.info(f"  期望采样比例: {target_ratio:.2f}:1 (正常:恶意)")
 
         train_loader = _build_train_loader_with_sampler(sample_sampling_weights)
         logger.info(f"  ✓ 平衡采样器创建完成")
-        logger.info(f"  ✓ 每个batch期望比例: 1.5:1 (正常:恶意)")
+        logger.info(f"  ✓ 每个batch期望比例: {target_ratio:.2f}:1 (正常:恶意)")
     else:
         logger.info("⚠️  使用原始分布训练（未启用平衡采样）")
-        if use_hard_mining:
-            train_loader = _build_train_loader_with_sampler(np.ones(len(y_train_split), dtype=np.float64))
-        else:
-            train_loader = DataLoader(train_dataset, batch_size=config.FINETUNE_BATCH_SIZE, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=config.FINETUNE_BATCH_SIZE, shuffle=True)
     
     logger.info(f"✓ 数据加载器准备完成 ({len(train_loader)} 个批次)")
     logger.info("")
     logger.info("开始训练...")
     logger.info("-"*70)
 
-    use_mixed_stream = bool(getattr(config, 'STAGE3_MIXED_STREAM', False))
-    # Mixed-stream requires feature-space synthetic inputs.
-    if use_mixed_stream and not input_is_features:
-        use_mixed_stream = False
-        logger.warning("⚠ STAGE3_MIXED_STREAM=True 但当前输入不是特征向量，将回退到单流训练")
-
-    real_loader = None
-    syn_loader = None
-    real_loss_scale = 1.0
-    if use_mixed_stream:
-        real_kept_path = os.path.join(config.DATA_AUGMENTATION_DIR, 'models', 'real_kept_data.npz')
-        if not os.path.exists(real_kept_path):
-            logger.warning(f"⚠ 未找到真实序列缓存文件: {real_kept_path}，将回退到单流特征训练")
-            use_mixed_stream = False
-        else:
-            try:
-                real_npz = np.load(real_kept_path, allow_pickle=True)
-                X_real_all = real_npz['X_real']
-                y_real_all = real_npz['y_real']
-                w_real_all = real_npz['sample_weights_real']
-            except Exception as e:
-                logger.warning(f"⚠ 加载真实序列缓存失败，将回退到单流特征训练: {e}")
-                use_mixed_stream = False
-
-    if use_mixed_stream:
-        if n_original is None:
-            n_original = int(len(X_real_all))
-        n_original = int(min(int(n_original), int(len(X_train))))
-        Z_syn = X_train[n_original:]
-        y_syn = y_train[n_original:]
-        w_syn = sample_weights[n_original:]
-
-        real_bs = int(getattr(config, 'STAGE3_MIXED_REAL_BATCH_SIZE', 32))
-        syn_bs = int(getattr(config, 'STAGE3_MIXED_SYN_BATCH_SIZE', 256))
-        real_loss_scale = float(getattr(config, 'STAGE3_MIXED_REAL_LOSS_SCALE', 1.0))
-
-        real_dataset = TensorDataset(
-            torch.FloatTensor(X_real_all),
-            torch.LongTensor(y_real_all),
-            torch.FloatTensor(w_real_all)
-        )
-        real_loader = DataLoader(real_dataset, batch_size=real_bs, shuffle=True, drop_last=True)
-
-        if len(Z_syn) > 0:
-            syn_dataset = TensorDataset(
-                torch.FloatTensor(Z_syn),
-                torch.LongTensor(y_syn),
-                torch.FloatTensor(w_syn)
-            )
-            syn_loader = DataLoader(syn_dataset, batch_size=syn_bs, shuffle=True, drop_last=True)
-        else:
-            syn_loader = None
-            logger.warning("⚠ Mixed-Stream: 未检测到合成特征样本（Z_syn为空），将仅使用真实序列流训练")
+    use_mixed_stream = False
     
     # Training loop
     history = {
-        'train_loss': [], 'supervision': [], 'soft_f1_loss': [], 'orthogonality': [],
-        'consistency': [], 'margin': [], 'lambda_orth': [],
-        'lambda_con': [], 'lambda_margin': [], 'train_f1': [], 'val_f1': [], 'val_threshold': [],
-        'train_f1_star': [], 'train_threshold_star': []
+        'train_loss': [],
+        'supervision': [],
+        'train_f1': [],
+        'val_f1': [],
+        'val_threshold': [],
+        'train_f1_star': [],
+        'train_threshold_star': []
     }
     
     classifier.train()
@@ -1326,189 +1247,52 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         logger.info("")
     
     for epoch in range(config.FINETUNE_EPOCHS):
-        if use_hard_mining and (epoch + 1) >= hard_mining_warmup_epochs:
-            if hard_mining_freq_epochs <= 0:
-                hard_mining_freq_epochs = 1
-            if ((epoch + 1 - hard_mining_warmup_epochs) % hard_mining_freq_epochs) == 0:
-                try:
-                    new_weights, hm_stats = _compute_sampling_weights_from_model()
-                    train_loader = _build_train_loader_with_sampler(new_weights)
-                    logger.info(
-                        f"🧲 Stage 3 Hard Mining: updated sampler | "
-                        f"hard_total={hm_stats['n_hard_total']} "
-                        f"(pos={hm_stats['n_hard_pos']}, neg={hm_stats['n_hard_neg']}) | "
-                        f"topk_ratio={hm_stats['topk_ratio']:.2f} "
-                        f"mult={hm_stats['multiplier']:.2f} "
-                        f"pos_prob_max={hm_stats['pos_prob_max']:.2f} "
-                        f"neg_prob_min={hm_stats['neg_prob_min']:.2f}"
-                    )
-                except Exception as e:
-                    logger.warning(f"⚠️  Stage 3 Hard Mining skipped due to error: {e}")
-
+        if finetune_backbone_requested and (not backbone_finetune_active) and (epoch >= finetune_backbone_warmup_epochs):
+            _set_backbone_trainable(True)
+            logger.info(
+                f"🔥 Stage 3: Backbone finetuning activated at epoch {epoch + 1} "
+                f"(scope={finetune_scope}, lr={finetune_backbone_lr})"
+            )
         epoch_loss = 0.0
         epoch_losses = {
-            'supervision': 0.0, 'soft_f1': 0.0, 'orthogonality': 0.0, 
-            'consistency': 0.0, 'margin': 0.0,
-            'logit_margin_scale': 0.0
+            'supervision': 0.0,
         }
         
         # 收集训练集预测用于计算 F1
         all_train_probs = []
         all_train_labels = []
         
-        if use_mixed_stream:
-            iter_real = iter(real_loader)
-            iter_syn = iter(syn_loader) if syn_loader is not None else None
-            n_steps = len(syn_loader) if syn_loader is not None else len(real_loader)
+        for X_batch, y_batch, w_batch in train_loader:
+            X_batch = X_batch.to(config.DEVICE)
+            y_batch = y_batch.to(config.DEVICE)
+            w_batch = w_batch.to(config.DEVICE)
 
-            for _step in range(int(max(n_steps, 1))):
-                try:
-                    Xb_real, yb_real, wb_real = next(iter_real)
-                except StopIteration:
-                    iter_real = iter(real_loader)
-                    Xb_real, yb_real, wb_real = next(iter_real)
+            optimizer.zero_grad()
 
-                if iter_syn is not None:
-                    try:
-                        zb_syn, yb_syn, wb_syn = next(iter_syn)
-                    except StopIteration:
-                        iter_syn = iter(syn_loader)
-                        zb_syn, yb_syn, wb_syn = next(iter_syn)
-                else:
-                    zb_syn = None
-                    yb_syn = None
-                    wb_syn = None
-
-                Xb_real = Xb_real.to(config.DEVICE)
-                yb_real = yb_real.to(config.DEVICE)
-                wb_real = wb_real.to(config.DEVICE, dtype=torch.float32) * float(real_loss_scale)
-
-                if zb_syn is not None:
-                    zb_syn = zb_syn.to(config.DEVICE)
-                    yb_syn = yb_syn.to(config.DEVICE)
-                    wb_syn = wb_syn.to(config.DEVICE, dtype=torch.float32)
-
-                optimizer.zero_grad()
-
-                # Stream A: Real sequences -> optional online aug -> backbone
-                if augmentor is not None:
-                    Xb_real, _ = augmentor(Xb_real)
-
-                if finetune_backbone:
-                    z_real = backbone(Xb_real, return_sequence=False)
+            if input_is_features:
+                z = X_batch
+            else:
+                if backbone_finetune_active:
+                    z = backbone(X_batch, return_sequence=False)
                 else:
                     with torch.no_grad():
-                        z_real = backbone(Xb_real, return_sequence=False)
-
-                # Stream B: Synthetic features passthrough
-                if zb_syn is not None:
-                    z_total = torch.cat([z_real, zb_syn], dim=0)
-                    y_total = torch.cat([yb_real, yb_syn], dim=0)
-                    w_total = torch.cat([wb_real, wb_syn], dim=0)
-                else:
-                    z_total = z_real
-                    y_total = yb_real
-                    w_total = wb_real
-
-                loss, loss_dict = criterion(
-                    classifier.dual_mlp,
-                    z_total,
-                    y_total,
-                    w_total,
-                    epoch,
-                    config.FINETUNE_EPOCHS
-                )
-                loss.backward()
-                optimizer.step()
-
-                epoch_loss += loss_dict['total']
-                epoch_losses['supervision'] += loss_dict['supervision']
-                epoch_losses['soft_f1'] += loss_dict.get('soft_f1', 0.0)
-                epoch_losses['orthogonality'] += loss_dict['orthogonality']
-                epoch_losses['consistency'] += loss_dict['consistency']
-                if 'margin' in loss_dict:
-                    epoch_losses['margin'] = epoch_losses.get('margin', 0.0) + loss_dict['margin']
-                if 'logit_margin_scale' in loss_dict:
-                    epoch_losses['logit_margin_scale'] = epoch_losses.get('logit_margin_scale', 0.0) + float(loss_dict['logit_margin_scale'])
-
-                with torch.no_grad():
-                    logits_a, logits_b = classifier.dual_mlp(z_total, return_separate=True)
-                    logits_avg = (logits_a + logits_b) / 2.0
-                    probs = torch.softmax(logits_avg, dim=1)
-                    all_train_probs.append(probs.cpu().numpy())
-                    all_train_labels.append(y_total.cpu().numpy())
-        else:
-            for X_batch, y_batch, w_batch in train_loader:
-                X_batch = X_batch.to(config.DEVICE)
-                y_batch = y_batch.to(config.DEVICE)
-                w_batch = w_batch.to(config.DEVICE)
-
-                optimizer.zero_grad()
-
-                if input_is_features:
-                    z = X_batch
-                else:
-                    # Online augmentation (training only)
-                    # Step 1: TrafficAugmentation (物理感知的单样本增强)
-                    if augmentor is not None:
-                        X_batch, _ = augmentor(X_batch)
-
-                    # Step 2: ST-Mixup (类内时空混合，渐进式启用)
-                    if st_mixup is not None:
-                        if st_mixup_mode == 'selective':
-                            # 选择性模式：需要传入模型
-                            X_batch, y_batch = st_mixup(
-                                X_batch, y_batch,
-                                epoch=epoch,
-                                total_epochs=config.FINETUNE_EPOCHS,
-                                classifier=classifier,
-                                backbone=backbone
-                            )
-                        else:
-                            # 类内模式：不需要模型
-                            X_batch, y_batch = st_mixup(
-                                X_batch, y_batch,
-                                epoch=epoch,
-                                total_epochs=config.FINETUNE_EPOCHS
-                            )
-
-                    # Extract features
-                    if finetune_backbone:
                         z = backbone(X_batch, return_sequence=False)
-                    else:
-                        with torch.no_grad():
-                            z = backbone(X_batch, return_sequence=False)
 
-                # Compute loss (weight-aware)
-                loss, loss_dict = criterion(classifier.dual_mlp, z, y_batch, w_batch, epoch, config.FINETUNE_EPOCHS)
-            
-                loss.backward()
-                optimizer.step()
+            loss, loss_dict = criterion(classifier.dual_mlp, z, y_batch, w_batch, epoch, config.FINETUNE_EPOCHS)
+            loss.backward()
+            optimizer.step()
 
-                epoch_loss += loss_dict['total']
-                epoch_losses['supervision'] += loss_dict['supervision']
-                epoch_losses['soft_f1'] += loss_dict.get('soft_f1', 0.0)
-                epoch_losses['orthogonality'] += loss_dict['orthogonality']
-                epoch_losses['consistency'] += loss_dict['consistency']
-                if 'margin' in loss_dict:
-                    epoch_losses['margin'] = epoch_losses.get('margin', 0.0) + loss_dict['margin']
-                if 'logit_margin_scale' in loss_dict:
-                    epoch_losses['logit_margin_scale'] = epoch_losses.get('logit_margin_scale', 0.0) + float(loss_dict['logit_margin_scale'])
+            epoch_loss += loss_dict['total']
+            epoch_losses['supervision'] += loss_dict['supervision']
 
-                # 收集预测概率用于计算 F1
-                with torch.no_grad():
-                    logits_a, logits_b = classifier.dual_mlp(z, return_separate=True)
-                    logits_avg = (logits_a + logits_b) / 2.0
-                    probs = torch.softmax(logits_avg, dim=1)
-                    all_train_probs.append(probs.cpu().numpy())
-                    all_train_labels.append(y_batch.cpu().numpy())
+            with torch.no_grad():
+                logits_a, logits_b = classifier.dual_mlp(z, return_separate=True)
+                logits_avg = (logits_a + logits_b) / 2.0
+                probs = torch.softmax(logits_avg, dim=1)
+                all_train_probs.append(probs.cpu().numpy())
+                all_train_labels.append(y_batch.cpu().numpy())
         
         n_batches = int(max(len(train_loader), 1))
-        if use_mixed_stream:
-            if syn_loader is not None:
-                n_batches = int(max(len(syn_loader), 1))
-            else:
-                n_batches = int(max(len(real_loader), 1))
         epoch_loss /= n_batches
         for key in epoch_losses:
             epoch_losses[key] /= n_batches
@@ -1584,13 +1368,6 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         # 保存历史
         history['train_loss'].append(epoch_loss)
         history['supervision'].append(epoch_losses['supervision'])
-        history['soft_f1_loss'].append(epoch_losses['soft_f1'])
-        history['orthogonality'].append(epoch_losses['orthogonality'])
-        history['consistency'].append(epoch_losses['consistency'])
-        history['margin'].append(epoch_losses.get('margin', 0.0))
-        history['lambda_orth'].append(loss_dict['lambda_orth'])
-        history['lambda_con'].append(loss_dict['lambda_con'])
-        history['lambda_margin'].append(loss_dict.get('lambda_margin', 0.0))
         history['train_f1'].append(train_f1)
         history['val_f1'].append(val_f1 if val_f1 is not None else np.nan)
         history['val_threshold'].append(val_threshold if val_threshold is not None else np.nan)
@@ -1624,16 +1401,13 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         
         # 每个epoch都输出详细日志
         progress = (epoch + 1) / config.FINETUNE_EPOCHS * 100
-        soft_f1_str = f" | F1Loss: {epoch_losses['soft_f1']:.4f}" if epoch_losses['soft_f1'] > 0 else ""
-        logit_margin_scale = float(epoch_losses.get('logit_margin_scale', 0.0))
-        logit_margin_str = f" | LogitM: {logit_margin_scale:.2f}" if logit_margin_scale > 0 else ""
+        sup_str = f" | Sup: {epoch_losses['supervision']:.4f}"
         if val_f1 is not None:
             logger.info(f"[Stage 3] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
                       f"TrLoss: {epoch_loss:.4f} | "
                       f"TrF1@0.5: {train_f1:.4f} | "
                       f"ValF1*: {val_f1:.4f} | "
-                      f"ValTh*: {float(val_threshold):.4f} | "
-                      f"Sup: {epoch_losses['supervision']:.4f}{soft_f1_str}{logit_margin_str}")
+                      f"ValTh*: {float(val_threshold):.4f}{sup_str}")
         else:
             train_f1_star_disp = float(train_f1_star) if train_f1_star is not None else float('nan')
             train_th_star_disp = float(train_threshold_star) if train_threshold_star is not None else float('nan')
@@ -1641,8 +1415,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
                       f"TrLoss: {epoch_loss:.4f} | "
                       f"TrF1@0.5: {train_f1:.4f} | "
                       f"TrF1*: {train_f1_star_disp:.4f} | "
-                      f"TrTh*: {train_th_star_disp:.4f} | "
-                      f"Sup: {epoch_losses['supervision']:.4f}{soft_f1_str}{logit_margin_str}")
+                      f"TrTh*: {train_th_star_disp:.4f}{sup_str}")
     
     logger.info("-"*70)
     logger.info("✓ Stage 3 完成: 分类器微调完成")
@@ -1663,7 +1436,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     logger.info("  提取训练集特征用于可视化...")
     
     classifier.eval()
-    if finetune_backbone:
+    if backbone_finetune_active:
         backbone.eval()
     with torch.no_grad():
         if input_is_features:
@@ -1690,7 +1463,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     logger.info("📁 输出文件路径:")
 
     # Save finetuned backbone (never overwrite original backbone checkpoint)
-    if finetune_backbone:
+    if backbone_finetune_started:
         finetuned_backbone_path = os.path.join(config.CLASSIFICATION_DIR, "models", "backbone_finetuned.pth")
         torch.save(backbone.state_dict(), finetuned_backbone_path)
         logger.info(f"  ✓ 微调后的骨干网络: {finetuned_backbone_path}")
@@ -1726,12 +1499,16 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         'n_samples': len(X_train),
         'n_original': n_original if n_original is not None else len(X_train),
         'finetune_epochs': config.FINETUNE_EPOCHS,
+        'input_is_features': input_is_features,  # Critical: record whether input was features or sequences
+        'feature_dim': int(getattr(config, 'OUTPUT_DIM', config.MODEL_DIM)),  # Backbone output dimension
     }
     import json
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
     logger.info(f"  ✓ 模型元数据: {metadata_path}")
     logger.info(f"    (记录了使用的骨干网络: {os.path.basename(backbone_path)})")
+    if input_is_features:
+        logger.info(f"    (记录了输入类型: 特征向量, 维度={metadata['feature_dim']})")
     
     return classifier, history, optimal_threshold
 
@@ -1743,9 +1520,36 @@ def main(args):
     config.create_dirs()
     logger = setup_logger(os.path.join(config.OUTPUT_ROOT, "logs"), name='train')
     
+    # ==================== 强制启用最优配置 ====================
+    # 基于实验结果（clean_train_test: F1=0.7735 vs stage3_only: F1=0.7350）
+    # 强制启用骨干网络微调以获得最佳性能
+    config.FINETUNE_BACKBONE = True
+    config.FINETUNE_BACKBONE_SCOPE = 'projection'
+    config.FINETUNE_BACKBONE_LR = 2e-5
+    config.FINETUNE_BACKBONE_WARMUP_EPOCHS = 30
+    
+    # 锁定最优损失配置
+    config.USE_FOCAL_LOSS = True
+    config.FOCAL_ALPHA = 0.5
+    config.FOCAL_GAMMA = 2.0
+    config.USE_MARGIN_LOSS = False
+    config.USE_SOFT_F1_LOSS = False
+    config.SOFT_ORTH_WEIGHT_START = 0.0
+    config.SOFT_ORTH_WEIGHT_END = 0.0
+    config.CONSISTENCY_WEIGHT_START = 0.0
+    config.CONSISTENCY_WEIGHT_END = 0.0
+    config.STAGE3_ONLINE_AUGMENTATION = False
+    config.STAGE3_USE_ST_MIXUP = False
+    # ==================== 最优配置锁定完成 ====================
+    
     logger.info("="*70)
     logger.info("MEDAL-Lite Training Pipeline")
     logger.info("="*70)
+    logger.info("✅ 已锁定最优配置:")
+    logger.info(f"  - 骨干微调: {config.FINETUNE_BACKBONE} (scope={config.FINETUNE_BACKBONE_SCOPE}, lr={config.FINETUNE_BACKBONE_LR}, warmup={config.FINETUNE_BACKBONE_WARMUP_EPOCHS})")
+    logger.info(f"  - FocalLoss: alpha={config.FOCAL_ALPHA}, gamma={config.FOCAL_GAMMA}")
+    logger.info(f"  - 其他损失: 全部关闭")
+    logger.info("")
     
     # GPU信息
     if torch.cuda.is_available():
@@ -1805,6 +1609,7 @@ def main(args):
         if PREPROCESS_AVAILABLE and check_preprocessed_exists('train'):
             logger.info("✓ 发现预处理文件，直接加载...")
             X_train, y_train_clean, train_files = load_preprocessed('train')
+            X_train = normalize_burstsize_inplace(X_train)
             logger.info(f"  从预处理文件加载: {X_train.shape[0]} 个样本")
         else:
             # 从PCAP文件加载
@@ -1815,6 +1620,7 @@ def main(args):
                 malicious_dir=config.MALICIOUS_TRAIN,
                 sequence_length=config.SEQUENCE_LENGTH
             )
+            X_train = normalize_burstsize_inplace(X_train)
         
         if X_train is None:
             logger.error("❌ 训练数据集加载失败!")
@@ -1830,16 +1636,19 @@ def main(args):
         # 注意：Stage 1 (特征提取) 不需要标签，是无监督学习
         # 只有 Stage 2 (标签矫正) 和 Stage 3 (分类) 才需要标签
         # 因此，标签噪声注入延迟到需要时再进行
-        if start_stage >= 2:
-            # Inject label noise (only needed for Stage 2+)
+        if start_stage >= 2 and start_stage != 3:
+            # Inject label noise (only needed for Stage 2, NOT for Stage 3-only)
             logger.info(f"🔀 注入标签噪声 ({config.LABEL_NOISE_RATE*100:.0f}%)...")
             y_train_noisy, noise_mask = inject_label_noise(y_train_clean, config.LABEL_NOISE_RATE)
             logger.info(f"✓ 噪声标签创建完成: {noise_mask.sum()} 个标签被翻转")
             logger.info(f"  原始标签分布: 正常={(y_train_clean==0).sum()}, 恶意={(y_train_clean==1).sum()}")
             logger.info(f"  噪声标签分布: 正常={(y_train_noisy==0).sum()}, 恶意={(y_train_noisy==1).sum()}")
         else:
-            # Stage 1 不需要标签
-            logger.info("💡 Stage 1 (特征提取) 是无监督学习，不使用标签")
+            # Stage 1 不需要标签，Stage 3-only 不需要噪声标签
+            if start_stage == 1:
+                logger.info("💡 Stage 1 (特征提取) 是无监督学习，不使用标签")
+            elif start_stage == 3:
+                logger.info("💡 Stage 3-only: 使用干净标签（不注入噪声）")
             y_train_noisy = None
             noise_mask = None
     else:
@@ -1853,17 +1662,22 @@ def main(args):
     # Stage 1: Pre-train Backbone (unsupervised, no labels needed)
     # ========================
     backbone = build_backbone(config, logger=logger)
+    backbone = backbone.to(config.DEVICE)  # Ensure all layers are on correct device
     
     if start_stage <= 1:
         # 根据对比学习方法选择批次大小
         use_instance_contrastive = getattr(config, 'USE_INSTANCE_CONTRASTIVE', False)
         contrastive_method = getattr(config, 'CONTRASTIVE_METHOD', 'infonce')
         
-        if use_instance_contrastive and str(contrastive_method).lower() == 'nnclr':
+        method_lower = str(contrastive_method).lower()
+        if use_instance_contrastive and method_lower == 'nnclr':
             # NNCLR 需要更小的批次以避免显存溢出
             batch_size = getattr(config, 'PRETRAIN_BATCH_SIZE_NNCLR', 64)
             logger.info(f"✓ 检测到 NNCLR 方法，使用专用批次大小: {batch_size}")
             logger.info(f"  (NNCLR 显存占用高，需要减小批次)")
+        elif use_instance_contrastive and method_lower == 'simsiam':
+            batch_size = getattr(config, 'PRETRAIN_BATCH_SIZE_SIMSIAM', config.PRETRAIN_BATCH_SIZE)
+            logger.info(f"✓ 检测到 SimSiam 方法，使用专用批次大小: {batch_size}")
         else:
             # SimMTM 或 InfoNCE 使用默认批次大小
             batch_size = config.PRETRAIN_BATCH_SIZE
@@ -1934,23 +1748,41 @@ def main(args):
             return backbone
     elif end_stage >= 3:
         # 跳过Stage 2：
-        # - 如果是 Stage 3-only(start_stage==3)，按决策直接使用原始干净数据（不加载任何离线增强数据）
+        # - 如果是 Stage 3-only(start_stage==3)，根据 FINETUNE_BACKBONE 配置决定使用原始序列还是特征
         # - 否则：兼容旧流程（如果存在 augmented_data.npz 则加载）
         augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_features.npz")
+        
+        # 检查是否启用骨干网络微调
+        finetune_backbone_enabled = bool(getattr(config, 'FINETUNE_BACKBONE', False))
+        logger.info(f"🔍 调试信息: FINETUNE_BACKBONE = {finetune_backbone_enabled}")
+        
         if int(start_stage) == 3 and X_train is not None:
             logger.info("\n" + "="*70)
             logger.info("✅ Stage 3-only: 已跳过 Stage 2（不使用 TabDDPM 离线增强数据）")
             logger.info("="*70)
             logger.info("")
-            X_train_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
-            with torch.no_grad():
-                Z_clean = backbone(X_train_tensor, return_sequence=False).detach().cpu().numpy().astype(np.float32)
+            
+            if finetune_backbone_enabled:
+                # 使用原始序列以支持骨干网络微调
+                X_augmented = X_train  # 保持原始序列格式 (N, L, D)
+                y_augmented = y_train_clean  # Use clean labels for Stage 3-only
+                sample_weights = np.ones(len(X_train), dtype=np.float32)
+                n_original = len(X_train)
+                logger.info(f"✓ 使用原始序列数据: {len(X_train)} 个样本 (支持骨干网络微调)")
+                logger.info(f"  数据形状: {X_train.shape} (样本数×序列长度×特征维度)")
+            else:
+                # 提取特征向量（原有逻辑）
+                X_train_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
+                with torch.no_grad():
+                    backbone = backbone.to(config.DEVICE)  # Ensure backbone is on correct device
+                    Z_clean = backbone(X_train_tensor, return_sequence=False).detach().cpu().numpy().astype(np.float32)
 
-            X_augmented = Z_clean
-            y_augmented = y_train_clean
-            sample_weights = np.ones(len(Z_clean), dtype=np.float32)
-            n_original = len(Z_clean)
-            logger.info(f"✓ 使用原始干净数据(特征): {len(Z_clean)} 个样本")
+                X_augmented = Z_clean
+                y_augmented = y_train_clean  # Use clean labels for Stage 3-only
+                sample_weights = np.ones(len(Z_clean), dtype=np.float32)
+                n_original = len(Z_clean)
+                logger.info(f"✓ 使用原始干净数据(特征): {len(Z_clean)} 个样本")
+            
             if os.path.exists(augmented_data_path):
                 logger.info(f"  (已忽略离线增强文件: {augmented_data_path})")
         elif os.path.exists(augmented_data_path):
@@ -1974,13 +1806,14 @@ def main(args):
                 logger.warning("⚠️  未找到原始数据数量标记，假设所有数据均为原始数据")
         elif X_train is not None:
             # 使用原始数据（不做增强和矫正）
+            # 注意：这个分支不应该在 Stage 3-only 时执行（已在上面处理）
             logger.info("\n" + "="*70)
             logger.info("⚠️  跳过 Stage 2，使用原始数据（带噪声标签）")
             logger.info("="*70)
             logger.info("")
             
-            # 如果还没有注入噪声，现在注入
-            if y_train_noisy is None:
+            # 如果还没有注入噪声，现在注入（但 Stage 3-only 不会走到这里）
+            if y_train_noisy is None and start_stage != 3:
                 logger.info(f"🔀 注入标签噪声 ({config.LABEL_NOISE_RATE*100:.0f}%)...")
                 y_train_noisy, noise_mask = inject_label_noise(y_train_clean, config.LABEL_NOISE_RATE)
                 logger.info(f"✓ 噪声标签创建完成: {noise_mask.sum()} 个标签被翻转")
@@ -1989,10 +1822,11 @@ def main(args):
             
             X_train_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
             with torch.no_grad():
+                backbone = backbone.to(config.DEVICE)  # Ensure backbone is on correct device
                 Z_clean = backbone(X_train_tensor, return_sequence=False).detach().cpu().numpy().astype(np.float32)
 
             X_augmented = Z_clean
-            y_augmented = y_train_noisy
+            y_augmented = y_train_noisy if y_train_noisy is not None else y_train_clean
             sample_weights = np.ones(len(Z_clean), dtype=np.float32)
             n_original = len(Z_clean)
             
@@ -2081,4 +1915,3 @@ if __name__ == "__main__":
         config.LABEL_NOISE_RATE = args.noise_rate
     
     main(args)
-

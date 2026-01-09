@@ -17,6 +17,7 @@ import numpy as np
 from sklearn.manifold import TSNE
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
 import json
@@ -161,6 +162,35 @@ class BackboneEvaluator:
             print(f"  K={k:2d}: 准确率 = {acc*100:.2f}%")
         
         return results
+
+    def knn_split_test(self, k_values=[5, 10, 20, 50], test_size=0.3, random_state=42):
+        X = np.asarray(self.features)
+        y = np.asarray(self.clean_labels_array)
+
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X,
+            y,
+            test_size=float(test_size),
+            random_state=int(random_state),
+            stratify=y if len(np.unique(y)) > 1 else None,
+        )
+
+        results = {}
+        for k in k_values:
+            knn = KNeighborsClassifier(n_neighbors=k, metric='cosine')
+            knn.fit(X_tr, y_tr)
+            pred = knn.predict(X_te)
+            acc = accuracy_score(y_te, pred)
+            cm = confusion_matrix(y_te, pred)
+            results[k] = {
+                'accuracy': acc,
+                'confusion_matrix': cm.tolist(),
+                'test_size': float(test_size),
+                'random_state': int(random_state),
+                'n_train': int(len(y_tr)),
+                'n_test': int(len(y_te)),
+            }
+        return results
     
     def make_decision(self, knn_results):
         """根据 KNN 结果给出决策建议"""
@@ -207,7 +237,7 @@ class BackboneEvaluator:
             'action': action
         }
     
-    def generate_report(self, knn_results, decision, save_dir='./output/backbone_eval'):
+    def generate_report(self, knn_results, decision, save_dir='./output/backbone_eval', knn_split_results=None):
         """生成完整的评估报告"""
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -224,6 +254,16 @@ class BackboneEvaluator:
                     'accuracy': float(v['accuracy']),
                     'confusion_matrix': v['confusion_matrix']
                 } for k, v in knn_results.items()
+            },
+            'knn_split_results': {
+                str(k): {
+                    'accuracy': float(v['accuracy']),
+                    'confusion_matrix': v['confusion_matrix'],
+                    'test_size': float(v.get('test_size', 0.0)),
+                    'random_state': int(v.get('random_state', 0)),
+                    'n_train': int(v.get('n_train', 0)),
+                    'n_test': int(v.get('n_test', 0)),
+                } for k, v in (knn_split_results or {}).items()
             },
             'decision': {
                 'grade': decision['grade'],
@@ -273,6 +313,23 @@ class BackboneEvaluator:
                 f.write(f"  真实benign      {cm[0,0]:4d}        {cm[0,1]:4d}\n")
                 f.write(f"  真实malicious   {cm[1,0]:4d}        {cm[1,1]:4d}\n")
             f.write("\n")
+
+            if knn_split_results:
+                f.write("-"*80 + "\n")
+                f.write("KNN Split 测试结果 (train/test split)\n")
+                f.write("-"*80 + "\n")
+                for k, result in knn_split_results.items():
+                    acc = result['accuracy']
+                    cm = np.array(result['confusion_matrix'])
+                    f.write(f"\nK = {k}:\n")
+                    f.write(f"  测试集准确率: {acc*100:.2f}%\n")
+                    f.write(f"  split: test_size={result.get('test_size', 0.0)}, random_state={result.get('random_state', 0)}\n")
+                    f.write(f"  n_train={result.get('n_train', 0)}, n_test={result.get('n_test', 0)}\n")
+                    f.write(f"  混淆矩阵:\n")
+                    f.write(f"              预测benign  预测malicious\n")
+                    f.write(f"  真实benign      {cm[0,0]:4d}        {cm[0,1]:4d}\n")
+                    f.write(f"  真实malicious   {cm[1,0]:4d}        {cm[1,1]:4d}\n")
+                f.write("\n")
             
             f.write("="*80 + "\n")
             f.write("决策建议\n")
@@ -295,7 +352,7 @@ class BackboneEvaluator:
         
         return report
     
-    def run_full_evaluation(self, save_dir='./output/backbone_eval'):
+    def run_full_evaluation(self, save_dir='./output/backbone_eval', knn_test_size=0.3, knn_random_state=42):
         """运行完整的评估流程"""
         print("\n" + "="*70)
         print("骨干网络「上帝视角」评估 - 开始")
@@ -307,14 +364,21 @@ class BackboneEvaluator:
         # 2. t-SNE 可视化
         self.visualize_tsne(save_dir)
         
-        # 3. KNN 纯净度测试
+        # 3. KNN 纯净度测试（训练集自测，容易虚高，用于观察簇结构）
         knn_results = self.knn_purity_test()
+
+        # 3b. KNN split 测试（更接近泛化能力）
+        print("\n[评估] KNN Split 测试 (train/test split)...")
+        knn_split_results = self.knn_split_test(test_size=knn_test_size, random_state=knn_random_state)
+        for k in sorted(knn_split_results.keys()):
+            acc = knn_split_results[k]['accuracy']
+            print(f"  K={k:2d}: 测试集准确率 = {acc*100:.2f}%")
         
-        # 4. 决策
+        # 4. 决策（仍然沿用 KNN-20 自测作为原决策矩阵的核心指标，split 用于辅助判断）
         decision = self.make_decision(knn_results)
         
         # 5. 生成报告
-        report = self.generate_report(knn_results, decision, save_dir)
+        report = self.generate_report(knn_results, decision, save_dir, knn_split_results=knn_split_results)
         
         print("\n" + "="*70)
         print("评估完成！")
@@ -336,6 +400,10 @@ def main():
                         help='评估结果保存目录')
     parser.add_argument('--device', type=str, default='cuda',
                         help='计算设备')
+    parser.add_argument('--knn_test_size', type=float, default=0.3,
+                        help='KNN split 测试的测试集比例')
+    parser.add_argument('--knn_random_state', type=int, default=42,
+                        help='KNN split 测试的随机种子')
     
     args = parser.parse_args()
     
@@ -347,7 +415,7 @@ def main():
     )
     
     # 运行完整评估
-    report = evaluator.run_full_evaluation(save_dir=args.output)
+    report = evaluator.run_full_evaluation(save_dir=args.output, knn_test_size=args.knn_test_size, knn_random_state=args.knn_random_state)
     
     # 打印最终建议
     if report['decision']['need_supcon']:

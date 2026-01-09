@@ -13,7 +13,7 @@ __pycache__/
 # 输出和日志文件
 output/
 *.log
-*.out
+out
 
 # 虚拟环境
 venv/

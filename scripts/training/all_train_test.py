@@ -166,10 +166,56 @@ if __name__ == "__main__":
     parser.add_argument("--backbone_path", type=str, default=None,
                        help="Path to specific backbone model (e.g., backbone_SimCLR_500.pth)")
     
+    # Backbone finetuning arguments (Stage 3)
+    parser.add_argument("--finetune_backbone", action="store_true",
+                       help="Enable backbone finetuning in Stage 3 (default: False)")
+    parser.add_argument("--finetune_backbone_lr", type=float, default=None,
+                       help="Learning rate for backbone finetuning (default: 2e-5)")
+    parser.add_argument("--finetune_backbone_warmup", type=int, default=None,
+                       help="Warmup epochs before backbone finetuning (default: 30)")
+    parser.add_argument("--finetune_backbone_scope", type=str, default=None,
+                       choices=["projection", "all"],
+                       help="Scope of backbone finetuning: projection or all (default: projection)")
+    
     args = parser.parse_args()
     
     # Override config with arguments
     config.LABEL_NOISE_RATE = args.noise_rate
+    
+    # Apply backbone finetuning settings from command line or environment variables
+    # Priority: command line args > environment variables > config defaults
+    if args.finetune_backbone or os.environ.get('MEDAL_FINETUNE_BACKBONE', '').strip().lower() in ('1', 'true', 'yes', 'y', 'on'):
+        config.FINETUNE_BACKBONE = True
+        
+        # Set learning rate
+        if args.finetune_backbone_lr is not None:
+            config.FINETUNE_BACKBONE_LR = args.finetune_backbone_lr
+        elif os.environ.get('MEDAL_FINETUNE_BACKBONE_LR', '').strip():
+            try:
+                config.FINETUNE_BACKBONE_LR = float(os.environ.get('MEDAL_FINETUNE_BACKBONE_LR'))
+            except ValueError:
+                pass
+        else:
+            config.FINETUNE_BACKBONE_LR = 2e-5  # Default value
+        
+        # Set warmup epochs
+        if args.finetune_backbone_warmup is not None:
+            config.FINETUNE_BACKBONE_WARMUP_EPOCHS = args.finetune_backbone_warmup
+        elif os.environ.get('MEDAL_FINETUNE_BACKBONE_WARMUP_EPOCHS', '').strip():
+            try:
+                config.FINETUNE_BACKBONE_WARMUP_EPOCHS = int(float(os.environ.get('MEDAL_FINETUNE_BACKBONE_WARMUP_EPOCHS')))
+            except ValueError:
+                pass
+        else:
+            config.FINETUNE_BACKBONE_WARMUP_EPOCHS = 30  # Default value
+        
+        # Set scope
+        if args.finetune_backbone_scope is not None:
+            config.FINETUNE_BACKBONE_SCOPE = args.finetune_backbone_scope
+        elif os.environ.get('MEDAL_FINETUNE_BACKBONE_SCOPE', '').strip().lower() in ('projection', 'all'):
+            config.FINETUNE_BACKBONE_SCOPE = os.environ.get('MEDAL_FINETUNE_BACKBONE_SCOPE').strip().lower()
+        else:
+            config.FINETUNE_BACKBONE_SCOPE = 'projection'  # Default value
     
     main(args)
 

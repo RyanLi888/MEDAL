@@ -14,8 +14,8 @@ For structure-aware data augmentation
    - 引导强度: w=1.5 (恶意), w=1.2 (良性) - 控制类别特征强度
    
 3. 条件-依赖解耦 (Condition-Dependence Decoupling)
-   - 条件特征 (固定): Direction, Flags - 协议约束
-   - 依赖特征 (生成): Length, IAT, BurstSize - 学习分布
+   - 条件特征 (固定): Direction, ValidMask - 协议约束
+   - 依赖特征 (生成): Length, BurstSize - 学习分布
    - 训练时随机mask依赖特征，强制模型学习特征间依赖关系
 
 训练目标：
@@ -161,22 +161,32 @@ class TabDDPM(nn.Module):
 
         # Protocol-aligned hard ranges (keep others by percentile)
         if self.enable_protocol_constraints:
-            if self.input_dim >= 1:
-                raw_min[0] = 0.0
-                raw_max[0] = 1.0
-            if self.input_dim >= 2:
-                raw_min[1] = max(float(raw_min[1]), 0.0)
-            if self.input_dim >= 3:
-                raw_min[2] = -1.0
-                raw_max[2] = 1.0
-            if self.input_dim >= 4:
-                raw_min[3] = max(float(raw_min[3]), 0.0)
-            if self.input_dim >= 5:
-                raw_min[4] = 0.0
-                raw_max[4] = 1.0
-            if self.input_dim >= 6:
-                raw_min[5] = 0.0
-                raw_max[5] = 1.0
+            length_idx = getattr(self.config, 'LENGTH_INDEX', None)
+            if length_idx is not None:
+                length_idx = int(length_idx)
+                if 0 <= length_idx < self.input_dim:
+                    raw_min[length_idx] = 0.0
+                    raw_max[length_idx] = 1.0
+
+            direction_idx = getattr(self.config, 'DIRECTION_INDEX', None)
+            if direction_idx is not None:
+                direction_idx = int(direction_idx)
+                if 0 <= direction_idx < self.input_dim:
+                    raw_min[direction_idx] = -1.0
+                    raw_max[direction_idx] = 1.0
+
+            burst_idx = getattr(self.config, 'BURST_SIZE_INDEX', None)
+            if burst_idx is not None:
+                burst_idx = int(burst_idx)
+                if 0 <= burst_idx < self.input_dim:
+                    raw_min[burst_idx] = max(float(raw_min[burst_idx]), 0.0)
+
+            valid_mask_idx = getattr(self.config, 'VALID_MASK_INDEX', None)
+            if valid_mask_idx is not None:
+                valid_mask_idx = int(valid_mask_idx)
+                if 0 <= valid_mask_idx < self.input_dim:
+                    raw_min[valid_mask_idx] = 0.0
+                    raw_max[valid_mask_idx] = 1.0
 
         device = self.feature_mean.device
         self.feature_mean.data.copy_(torch.from_numpy(mean).to(device))
@@ -198,18 +208,29 @@ class TabDDPM(nn.Module):
     def project_protocol_constraints(self, x_raw):
         x = x_raw
         if self.enable_protocol_constraints:
-            if self.input_dim >= 1:
-                x[..., 0] = torch.clamp(x[..., 0], 0.0, 1.0)
-            if self.input_dim >= 2:
-                x[..., 1] = torch.clamp(x[..., 1], 0.0, float('inf'))
-            if self.input_dim >= 3:
-                x[..., 2] = torch.clamp(x[..., 2], -1.0, 1.0)
-            if self.input_dim >= 4:
-                x[..., 3] = torch.clamp(x[..., 3], 0.0, float('inf'))
-            if self.input_dim >= 5:
-                x[..., 4] = torch.clamp(x[..., 4], 0.0, 1.0)
-            if self.input_dim >= 6:
-                x[..., 5] = torch.clamp(x[..., 5], 0.0, 1.0)
+            length_idx = getattr(self.config, 'LENGTH_INDEX', None)
+            if length_idx is not None:
+                length_idx = int(length_idx)
+                if 0 <= length_idx < self.input_dim:
+                    x[..., length_idx] = torch.clamp(x[..., length_idx], 0.0, 1.0)
+
+            direction_idx = getattr(self.config, 'DIRECTION_INDEX', None)
+            if direction_idx is not None:
+                direction_idx = int(direction_idx)
+                if 0 <= direction_idx < self.input_dim:
+                    x[..., direction_idx] = torch.clamp(x[..., direction_idx], -1.0, 1.0)
+
+            burst_idx = getattr(self.config, 'BURST_SIZE_INDEX', None)
+            if burst_idx is not None:
+                burst_idx = int(burst_idx)
+                if 0 <= burst_idx < self.input_dim:
+                    x[..., burst_idx] = torch.clamp(x[..., burst_idx], 0.0, float('inf'))
+
+            valid_mask_idx = getattr(self.config, 'VALID_MASK_INDEX', None)
+            if valid_mask_idx is not None:
+                valid_mask_idx = int(valid_mask_idx)
+                if 0 <= valid_mask_idx < self.input_dim:
+                    x[..., valid_mask_idx] = torch.clamp(x[..., valid_mask_idx], 0.0, 1.0)
 
         x = torch.max(torch.min(x, self.raw_max), self.raw_min)
         return x
@@ -247,12 +268,12 @@ class TabDDPM(nn.Module):
         Forward diffusion process: add noise to x_0
         
         Args:
-            x_0: (B, 5) - clean data
+            x_0: (B, D) - clean data
             t: (B,) - timesteps
-            noise: (B, 5) - noise (optional)
+            noise: (B, D) - noise (optional)
             
         Returns:
-            x_t: (B, 5) - noisy data at timestep t
+            x_t: (B, D) - noisy data at timestep t
         """
         if noise is None:
             noise = torch.randn_like(x_0)
@@ -319,7 +340,7 @@ class TabDDPM(nn.Module):
         
         2. 结构感知重建损失 (Structure-Aware Reconstruction Loss):
            L_recon = ||ε_pred[masked] - ε_true[masked]||²
-           - 随机mask依赖特征 (Length, IAT, BurstSize)
+           - 随机mask依赖特征 (Length, BurstSize)
            - 强制模型学习特征间的依赖关系
            - 例如: 短握手包通常对应较小的同向BurstSize
         
@@ -406,14 +427,14 @@ class TabDDPM(nn.Module):
         Reverse diffusion: denoise one step
         
         Args:
-            x_t: (B, 5) - noisy data at timestep t
+            x_t: (B, D) - noisy data at timestep t
             t: (B,) - timesteps
             y: (B,) - labels
-            x_cond: (B, 2) - conditional features
+            x_cond: (B, C) - conditional features
             guidance_scale: float - classifier-free guidance scale
             
         Returns:
-            x_{t-1}: (B, 5) - denoised data at timestep t-1
+            x_{t-1}: (B, D) - denoised data at timestep t-1
         """
         # Conditional noise prediction
         noise_cond = self.predict_noise(x_t, t, y, x_cond)
@@ -468,12 +489,12 @@ class TabDDPM(nn.Module):
         Args:
             n_samples: int - number of samples to generate
             y: (n_samples,) - labels (条件标签)
-            x_cond: (n_samples, len(cond_indices)) - conditional features (Direction, Flags)
+            x_cond: (n_samples, len(cond_indices)) - conditional features (Direction, ValidMask)
             guidance_scale: float - CFG引导强度 (1.5=恶意, 1.2=良性)
             device: torch device
             
         Returns:
-            x_0: (n_samples, 5) - generated samples (生成的干净样本)
+            x_0: (n_samples, D) - generated samples (生成的干净样本)
         """
         if int(self.scaler_fitted.item()) != 1:
             raise RuntimeError("TabDDPM scaler not fitted. Call fit_scaler(...) before sampling.")
@@ -652,8 +673,8 @@ class TabDDPM(nn.Module):
                    return 0
         
         3. 条件生成机制:
-           - 从高权重样本中采样条件特征 (Direction, Flags)
-           - 模型生成依赖特征 (Length, IAT, BurstSize)
+           - 从高权重样本中采样条件特征 (Direction, ValidMask)
+           - 模型生成依赖特征 (Length, BurstSize)
            - 保证生成样本符合协议约束
         
         4. 类别平衡策略:

@@ -120,30 +120,26 @@ class MambaBlock(nn.Module):
         A = -torch.exp(self.A_log)  # (d_state,)
         A_bar = torch.exp(dt * A.unsqueeze(0).unsqueeze(0))  # (B, L, d_state)
         
-        # Simplified SSM computation (parallel scan approximation)
-        # For efficiency, we use a simplified version
-        h = torch.zeros(B, self.d_state, D_inner, device=x.device)  # (B, d_state, d_inner)
-        outputs = []
-        
-        for t in range(L):
-            x_t = x[:, t, :]  # (B, d_inner)
-            B_t = B_sel[:, t, :]  # (B, d_state)
-            C_t = C_sel[:, t, :]  # (B, d_state)
-            A_t = A_bar[:, t, :]  # (B, d_state)
-            
-            # State update: h_t = A_t * h_{t-1} + B_t * x_t
-            h = A_t.unsqueeze(-1) * h + B_t.unsqueeze(-1) * x_t.unsqueeze(1)
-            
-            # Output: y_t = C_t * h_t
-            y_t = torch.einsum('bd,bdi->bi', C_t, h)  # (B, d_inner)
-            
-            # Add skip connection
-            y_t = y_t + self.D * x_t
-            
-            outputs.append(y_t)
-        
-        y = torch.stack(outputs, dim=1)  # (B, L, d_inner)
-        
+        # Vectorized scan (removes Python loop over L and is much faster on GPU).
+        #
+        # Recurrence:
+        #   h_t = A_t ⊙ h_{t-1} + B_t ⊙ x_t
+        # Let P_t = ∏_{k<=t} A_k, g_t = h_t / P_t, then:
+        #   g_t = g_{t-1} + (B_t ⊙ x_t) / P_t
+        # So:
+        #   g = cumsum((B ⊙ x)/P), h = g ⊙ P
+        #
+        # Note: A_t ∈ (0,1], so P_t can underflow for long sequences. We clamp P to
+        # avoid numerical blow-ups; this keeps the model stable and fast in practice.
+        eps = 1e-8
+        P = torch.cumprod(A_bar, dim=1).clamp_min(eps)  # (B, L, d_state)
+
+        u = B_sel.unsqueeze(-1) * x.unsqueeze(2)  # (B, L, d_state, d_inner)
+        g = torch.cumsum(u / P.unsqueeze(-1), dim=1)  # (B, L, d_state, d_inner)
+        h = g * P.unsqueeze(-1)  # (B, L, d_state, d_inner)
+
+        y = (C_sel.unsqueeze(-1) * h).sum(dim=2)  # (B, L, d_inner)
+        y = y + self.D.view(1, 1, -1) * x
         return y
 
 
@@ -165,4 +161,3 @@ class MambaLayer(nn.Module):
             output: (B, L, d_model)
         """
         return x + self.mamba(self.norm(x))
-

@@ -44,39 +44,27 @@ class InfoNCELoss(nn.Module):
             loss: scalar
         """
         B = z_i.shape[0]
-        
+
         # L2归一化到单位超球面
         z_i = F.normalize(z_i, dim=1)
         z_j = F.normalize(z_j, dim=1)
-        
+
         # 拼接所有特征：[z_i; z_j]
         z = torch.cat([z_i, z_j], dim=0)  # (2B, d)
-        
-        # 计算相似度矩阵
-        sim_matrix = torch.matmul(z, z.T) / self.temperature  # (2B, 2B)
-        
-        # 创建正样本mask
-        # 对于z_i[k]，正样本是z_j[k]（在位置B+k）
-        # 对于z_j[k]，正样本是z_i[k]（在位置k）
-        pos_mask = torch.zeros(2*B, 2*B, device=z.device)
-        for k in range(B):
-            pos_mask[k, B+k] = 1  # z_i[k] <-> z_j[k]
-            pos_mask[B+k, k] = 1  # z_j[k] <-> z_i[k]
-        
-        # 创建负样本mask（排除自己和正样本）
-        neg_mask = torch.ones(2*B, 2*B, device=z.device)
-        neg_mask.fill_diagonal_(0)  # 排除自己
-        neg_mask = neg_mask - pos_mask  # 排除正样本
-        
-        # 计算InfoNCE损失
-        # log(exp(sim_pos) / sum(exp(sim_neg)))
-        pos_sim = (sim_matrix * pos_mask).sum(dim=1)  # (2B,)
-        neg_sim = torch.exp(sim_matrix) * neg_mask  # (2B, 2B)
-        neg_sim = neg_sim.sum(dim=1)  # (2B,)
-        
-        loss = -torch.log(torch.exp(pos_sim) / (torch.exp(pos_sim) + neg_sim + 1e-8))
-        loss = loss.mean()
-        
+
+        # 计算相似度矩阵 (logits)
+        logits = torch.matmul(z, z.T) / self.temperature  # (2B, 2B)
+
+        # Mask self-similarity to avoid being selected as a candidate.
+        # Use a large negative number instead of -inf for numerical safety.
+        logits = logits.masked_fill(torch.eye(2 * B, device=z.device, dtype=torch.bool), -1e9)
+
+        # Targets: for k in [0..B-1], positive index is B+k; for B+k, positive index is k
+        targets = torch.arange(2 * B, device=z.device)
+        targets = (targets + B) % (2 * B)
+
+        # Standard cross entropy on (2B) classification problems
+        loss = F.cross_entropy(logits, targets)
         return loss
 
 
@@ -204,6 +192,19 @@ class InstanceContrastiveLearning(nn.Module):
             z_i: (B, d) - 第一个视图的特征（用于下游任务）
             z_j: (B, d) - 第二个视图的特征（用于下游任务）
         """
+        try:
+            seq_len = int(getattr(self.config, 'SEQUENCE_LENGTH', x_view1.shape[1]))
+            effective_len = int(getattr(self.config, 'EFFECTIVE_SEQUENCE_LENGTH', seq_len))
+            use_global = bool(getattr(self.config, 'USE_GLOBAL_STATS_TOKEN', False))
+            has_global = bool(use_global and x_view1.dim() == 3 and x_view1.shape[1] == effective_len and effective_len > seq_len)
+        except Exception:
+            has_global = False
+            seq_len = None
+
+        if has_global and seq_len is not None:
+            x_view1 = x_view1[:, :seq_len, :]
+            x_view2 = x_view2[:, :seq_len, :]
+
         z_i = self.backbone(x_view1, return_sequence=False)
         z_j = self.backbone(x_view2, return_sequence=False)
 
@@ -279,54 +280,36 @@ class InstanceContrastiveLearning(nn.Module):
 
 class HybridPretrainingLoss(nn.Module):
     """
-    混合预训练损失
+    MEDAL 混合预训练损失
     
-    L_Total = L_SimMTM + λ * L_InfoNCE
+    L_Total = L_SimMTM + λ_infonce * L_InfoNCE + λ_consistency * L_Consistency
     
-    - L_SimMTM: 理解序列语法（保证模型知道"这是一个合法的TCP流"）
-    - L_InfoNCE: 区分个体差异（保证模型知道"这个TCP流和那个TCP流完全不同"）
+    三项损失：
+    1. L_SimMTM: 序列重构损失 - 理解流量语法
+    2. L_InfoNCE: 实例对比损失 - 区分不同流的个体差异
+    3. L_Consistency: 双流一致性损失 - 强迫内容流与结构流对齐（新增）
+    
+    设计哲学：
+    - SimMTM: 保证模型知道"这是一个合法的TCP流"
+    - InfoNCE: 保证模型知道"这个TCP流和那个TCP流完全不同"
+    - Consistency: 保证模型知道"包长模式必须匹配时间节奏"（去噪核心）
     """
-    
+
     def __init__(self, simmtm_loss, instance_contrastive, lambda_infonce=1.0):
-        """
-        Args:
-            simmtm_loss: SimMTM损失模块
-            instance_contrastive: 实例对比学习模块
-            lambda_infonce: InfoNCE损失的权重
-        """
         super().__init__()
-        
         self.simmtm_loss = simmtm_loss
         self.instance_contrastive = instance_contrastive
-        self.lambda_infonce = lambda_infonce
-    
+        self.lambda_infonce = float(lambda_infonce)
+
     def forward(self, backbone, x_original, x_view1, x_view2, epoch: Optional[int] = None):
-        """
-        计算混合损失
-        
-        Args:
-            backbone: Micro-Bi-Mamba backbone
-            x_original: (B, L, D) - 原始输入（用于SimMTM）
-            x_view1: (B, L, D) - 第一个增强视图（用于InfoNCE）
-            x_view2: (B, L, D) - 第二个增强视图（用于InfoNCE）
-            
-        Returns:
-            total_loss: scalar
-            loss_dict: 各项损失的字典
-        """
-        # SimMTM损失
         loss_simmtm = self.simmtm_loss(backbone, x_original)
-        
-        # InfoNCE损失
         loss_infonce, z_i, z_j = self.instance_contrastive(x_view1, x_view2, epoch=epoch)
-        
-        # 总损失
         total_loss = loss_simmtm + self.lambda_infonce * loss_infonce
-        
+
         loss_dict = {
             'total': total_loss.item(),
             'simmtm': loss_simmtm.item(),
-            'infonce': loss_infonce.item()
+            'infonce': loss_infonce.item(),
         }
-        
+
         return total_loss, loss_dict

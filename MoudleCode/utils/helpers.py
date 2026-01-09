@@ -174,17 +174,28 @@ def find_optimal_threshold(y_true, y_prob, metric='f1_binary', positive_class=1)
     
     if metric == 'f1_binary':
         # 🚀 策略优化：使用 Precision-Recall 曲线直接寻找 F1 峰值
-        precision, recall, thresholds = precision_recall_curve(y_true, prob_positive)
+        precision, recall, thresholds = precision_recall_curve(y_true, prob_positive, pos_label=positive_class)
         
         # 计算每个阈值对应的 F1 Score
         # F1 = 2 * (P * R) / (P + R)
-        # 注意：precision_recall_curve 返回的数组比 thresholds 多一个元素
+        # 注意：precision_recall_curve 返回的 precision/recall 数组比 thresholds 多一个元素
+        # precision[i], recall[i] 对应 thresholds[i]
+        # 最后一个 precision[-1], recall[-1] 对应阈值=inf（所有预测为负类）
+        # 我们只计算有实际阈值的F1分数
         f1_scores = 2 * (precision[:-1] * recall[:-1]) / (precision[:-1] + recall[:-1] + 1e-8)
         
         # 找到 F1 最高的点
         best_idx = np.argmax(f1_scores)
-        best_threshold = thresholds[best_idx]
-        best_f1 = f1_scores[best_idx]
+        best_threshold = float(thresholds[best_idx])
+        best_f1 = float(f1_scores[best_idx])
+        
+        # 验证：使用找到的阈值重新计算F1，确保一致性
+        y_pred_verify = (prob_positive >= best_threshold).astype(int)
+        f1_verify = f1_score(y_true, y_pred_verify, pos_label=positive_class, zero_division=0)
+        
+        # 如果验证F1与搜索F1差异较大，使用验证值（更准确）
+        if abs(f1_verify - best_f1) > 0.001:
+            best_f1 = float(f1_verify)
         
         # 构建返回的 metrics_dict（包含所有阈值点）
         metrics_dict = {

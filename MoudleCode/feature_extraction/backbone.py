@@ -97,7 +97,9 @@ class MicroBiMambaBackbone(nn.Module):
             )
         else:
             self.embedding = nn.Linear(config.INPUT_FEATURE_DIM, config.MODEL_DIM)
-        self.pos_encoding = SinusoidalPositionalEncoding(config.MODEL_DIM, max_len=config.SEQUENCE_LENGTH)
+        # 使用 EFFECTIVE_SEQUENCE_LENGTH 以支持全局统计令牌（第1025行）
+        max_seq_len = getattr(config, 'EFFECTIVE_SEQUENCE_LENGTH', config.SEQUENCE_LENGTH)
+        self.pos_encoding = SinusoidalPositionalEncoding(config.MODEL_DIM, max_len=max_seq_len)
         self.embed_dropout = nn.Dropout(config.EMBEDDING_DROPOUT)
         
         # Forward Mamba layers
@@ -212,6 +214,7 @@ class MicroBiMambaBackbone(nn.Module):
 
 
 class _DualStreamHybridEmbedding(nn.Module):
+    """旧版：仅支持 Direction + BurstSize"""
     def __init__(self, d_model: int):
         super().__init__()
         self.cont_proj = nn.Sequential(
@@ -229,7 +232,54 @@ class _DualStreamHybridEmbedding(nn.Module):
         return embed_cont + embed_dir
 
 
+class _DualStreamStructureEmbedding(nn.Module):
+    """
+    MEDAL-Lite4 结构流 Embedding
+    
+    输入：Direction (离散) + BurstSize (连续)
+    输出：融合后的结构特征向量
+    
+    设计：
+    - Direction: Embedding 层（+1/-1 映射到向量）
+    - BurstSize: 线性投影（1维 → d_model）
+    - 融合：加法（保持特征独立性）
+    """
+    def __init__(self, d_model: int, cont_dim: int = 1):
+        super().__init__()
+        self.cont_proj = nn.Sequential(
+            nn.Linear(cont_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+        self.dir_emb = nn.Embedding(num_embeddings=2, embedding_dim=d_model)
+        nn.init.normal_(self.dir_emb.weight, std=0.02)
+
+    def forward(self, x_dir: torch.Tensor, x_cont: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_dir: (B, L) - Direction 特征 (+1/-1)
+            x_cont: (B, L, cont_dim) - 连续特征 [BurstSize]
+        
+        Returns:
+            embed: (B, L, d_model) - 融合后的结构特征
+        """
+        dir_indices = (x_dir > 0).to(dtype=torch.long)
+        embed_cont = self.cont_proj(x_cont)
+        embed_dir = self.dir_emb(dir_indices)
+        return embed_cont + embed_dir
+
+
 class DualStreamBiMambaBackbone(nn.Module):
+    """
+    MEDAL-Lite4 双流 Bi-Mamba 骨干网络
+    
+    双流物理切分：
+    - Stream 1 (内容流): Length - 学习"大包与小包的排列旋律"
+    - Stream 2 (结构流): Direction + BurstSize - 学习"交互模式的配合"
+    
+    门控融合：动态调整两路特征权重
+    InfoNCE 一致性：强迫双流特征对齐（通过 instance_contrastive 模块）
+    """
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -242,21 +292,28 @@ class DualStreamBiMambaBackbone(nn.Module):
         self._d_len = int(d_len)
         self._d_struct = int(d_struct)
 
+        self.fusion_type = str(getattr(config, 'MAMBA_FUSION_TYPE', 'gate')).strip().lower()
+
+        # Lite4 特征索引
         self.length_index = getattr(config, 'LENGTH_INDEX', 0)
         self.direction_index = getattr(config, 'DIRECTION_INDEX', None)
         self.burst_index = getattr(config, 'BURST_SIZE_INDEX', None)
         self.valid_mask_index = getattr(config, 'VALID_MASK_INDEX', None)
 
+        # Stream 1: 内容流 (Length only)
         self.len_embed = nn.Sequential(
             nn.Linear(1, self._d_len),
             nn.LayerNorm(self._d_len),
             nn.GELU(),
         )
-        self.len_pos = SinusoidalPositionalEncoding(self._d_len, max_len=config.SEQUENCE_LENGTH)
+        # 使用 EFFECTIVE_SEQUENCE_LENGTH 以支持全局统计令牌（第1025行）
+        max_seq_len = getattr(config, 'EFFECTIVE_SEQUENCE_LENGTH', config.SEQUENCE_LENGTH)
+        self.len_pos = SinusoidalPositionalEncoding(self._d_len, max_len=max_seq_len)
         self.len_dropout = nn.Dropout(config.EMBEDDING_DROPOUT)
 
-        self.struct_embed = _DualStreamHybridEmbedding(self._d_struct)
-        self.struct_pos = SinusoidalPositionalEncoding(self._d_struct, max_len=config.SEQUENCE_LENGTH)
+        # Stream 2: 结构流 (Direction + BurstSize)
+        self.struct_embed = _DualStreamStructureEmbedding(self._d_struct, cont_dim=1)
+        self.struct_pos = SinusoidalPositionalEncoding(self._d_struct, max_len=max_seq_len)
         self.struct_dropout = nn.Dropout(config.EMBEDDING_DROPOUT)
 
         self.len_forward_layers = nn.ModuleList([
@@ -303,11 +360,29 @@ class DualStreamBiMambaBackbone(nn.Module):
         ])
         self.struct_proj = nn.Linear(self._d_struct * 2, self._d_struct)
 
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(model_dim, model_dim),
-            nn.Sigmoid(),
-        )
-        self.fusion_proj = nn.Linear(model_dim, model_dim)
+        self.fusion_gate = None
+        self.fusion_proj = None
+        self.len_to_fused = None
+        self.struct_to_fused = None
+
+        if self.fusion_type in ('gate', 'gated', 'gated_fusion'):
+            self.fusion_gate = nn.Sequential(
+                nn.Linear(model_dim, model_dim),
+                nn.Sigmoid(),
+            )
+            self.fusion_proj = nn.Linear(model_dim, model_dim)
+        elif self.fusion_type in ('concat_project', 'concat', 'project'):
+            self.fusion_proj = nn.Linear(model_dim, model_dim)
+        elif self.fusion_type in ('average', 'avg', 'mean'):
+            self.len_to_fused = nn.Linear(self._d_len, model_dim)
+            self.struct_to_fused = nn.Linear(self._d_struct, model_dim)
+        else:
+            self.fusion_type = 'gate'
+            self.fusion_gate = nn.Sequential(
+                nn.Linear(model_dim, model_dim),
+                nn.Sigmoid(),
+            )
+            self.fusion_proj = nn.Linear(model_dim, model_dim)
         self.projection = nn.Linear(model_dim, self.output_dim)
 
         use_mlp_decoder = bool(getattr(config, 'SIMMTM_DECODER_USE_MLP', False))
@@ -323,7 +398,27 @@ class DualStreamBiMambaBackbone(nn.Module):
 
         self.frozen = False
 
-    def forward(self, x, return_sequence=False):
+    def forward(self, x, return_sequence=False, return_dual_features=False, return_pre_fusion=False):
+        """
+        前向传播
+        
+        Args:
+            x: (B, L, D) - 输入特征
+            return_sequence: 是否返回序列特征
+            return_dual_features: 是否返回双流特征（用于 InfoNCE 一致性，池化后）
+            return_pre_fusion: 是否返回融合前的序列特征（用于 InfoNCE 一致性损失计算）
+        
+        Returns:
+            如果 return_pre_fusion=True:
+                h_len: (B, L, d_len) - 内容流序列特征（融合前）
+                h_struct: (B, L, d_struct) - 结构流序列特征（融合前）
+            如果 return_dual_features=True:
+                z_content: (B, d_len) - 内容流特征（池化后）
+                z_structure: (B, d_struct) - 结构流特征（池化后）
+                z_fused: (B, output_dim) - 融合后特征
+            否则:
+                z: (B, output_dim) 或 (B, L, output_dim)
+        """
         valid_mask = None
         if self.valid_mask_index is not None:
             try:
@@ -332,14 +427,24 @@ class DualStreamBiMambaBackbone(nn.Module):
             except Exception:
                 valid_mask = None
 
+        gate = None
+        if valid_mask is not None:
+            gate = (valid_mask > 0.5).to(dtype=x.dtype, device=x.device).unsqueeze(-1)
+
+        # ===== Stream 1: 内容流 (Length) =====
         length_index = int(self.length_index) if self.length_index is not None else 0
         x_len = x[:, :, length_index:length_index + 1]
         x_len = self.len_embed(x_len)
         x_len = self.len_pos(x_len)
         x_len = self.len_dropout(x_len)
+        if gate is not None:
+            x_len = x_len * gate
 
+        # ===== Stream 2: 结构流 (Direction + BurstSize) =====
         x_dir = None
         x_burst = None
+        
+        # Extract Direction
         if self.direction_index is not None:
             try:
                 di = int(self.direction_index)
@@ -347,6 +452,8 @@ class DualStreamBiMambaBackbone(nn.Module):
                     x_dir = x[:, :, di]
             except Exception:
                 x_dir = None
+        
+        # Extract BurstSize
         if self.burst_index is not None:
             try:
                 bi = int(self.burst_index)
@@ -354,16 +461,23 @@ class DualStreamBiMambaBackbone(nn.Module):
                     x_burst = x[:, :, bi:bi + 1]
             except Exception:
                 x_burst = None
-
+        
+        # Fallback to zeros if features are missing
         if x_dir is None:
             x_dir = torch.zeros(x.shape[0], x.shape[1], device=x.device, dtype=x.dtype)
         if x_burst is None:
             x_burst = torch.zeros(x.shape[0], x.shape[1], 1, device=x.device, dtype=x.dtype)
 
-        x_struct = self.struct_embed(x_dir, x_burst)
+        x_struct_cont = x_burst  # (B, L, 1)
+        
+        x_struct = self.struct_embed(x_dir, x_struct_cont)
         x_struct = self.struct_pos(x_struct)
         x_struct = self.struct_dropout(x_struct)
+        if gate is not None:
+            x_struct = x_struct * gate
 
+        # ===== Bi-Mamba 编码 =====
+        # Content stream
         x_len_fwd = x_len
         for layer in self.len_forward_layers:
             x_len_fwd = layer(x_len_fwd)
@@ -373,6 +487,7 @@ class DualStreamBiMambaBackbone(nn.Module):
         x_len_bwd = torch.flip(x_len_bwd, dims=[1])
         h_len = self.len_proj(torch.cat([x_len_fwd, x_len_bwd], dim=-1))
 
+        # Structure stream
         x_struct_fwd = x_struct
         for layer in self.struct_forward_layers:
             x_struct_fwd = layer(x_struct_fwd)
@@ -382,19 +497,49 @@ class DualStreamBiMambaBackbone(nn.Module):
         x_struct_bwd = torch.flip(x_struct_bwd, dims=[1])
         h_struct = self.struct_proj(torch.cat([x_struct_fwd, x_struct_bwd], dim=-1))
 
-        h = torch.cat([h_len, h_struct], dim=-1)
-        gate = self.fusion_gate(h)
-        h = gate * h + (1.0 - gate) * self.fusion_proj(h)
+        # ===== 返回融合前的序列特征（用于 InfoNCE 一致性损失） =====
+        if return_pre_fusion:
+            return h_len, h_struct
 
+        h = torch.cat([h_len, h_struct], dim=-1)  # (B, L, model_dim)
+        if self.fusion_type == 'gate':
+            fusion_gate = self.fusion_gate(h)  # (B, L, model_dim)
+            h_fused = fusion_gate * h + (1.0 - fusion_gate) * self.fusion_proj(h)
+        elif self.fusion_type == 'concat_project':
+            h_fused = self.fusion_proj(h)
+        elif self.fusion_type == 'average':
+            h_fused = 0.5 * (self.len_to_fused(h_len) + self.struct_to_fused(h_struct))
+        else:
+            fusion_gate = self.fusion_gate(h)  # (B, L, model_dim)
+            h_fused = fusion_gate * h + (1.0 - fusion_gate) * self.fusion_proj(h)
+
+        # ===== 返回双流特征（用于 InfoNCE 一致性） =====
+        if return_dual_features:
+            # Pool each stream separately
+            if valid_mask is not None:
+                m = (valid_mask > 0.5).to(dtype=h.dtype, device=h.device).unsqueeze(-1)
+                denom = m.sum(dim=1).clamp_min(1e-6)
+                z_content = (h_len * m).sum(dim=1) / denom  # (B, d_len)
+                z_structure = (h_struct * m).sum(dim=1) / denom  # (B, d_struct)
+                z_fused_pooled = (h_fused * m).sum(dim=1) / denom
+            else:
+                z_content = torch.mean(h_len, dim=1)
+                z_structure = torch.mean(h_struct, dim=1)
+                z_fused_pooled = torch.mean(h_fused, dim=1)
+            
+            z_fused = self.projection(z_fused_pooled)
+            return z_content, z_structure, z_fused
+
+        # ===== 标准返回 =====
         if return_sequence:
-            return self.projection(h)
+            return self.projection(h_fused)
 
         if valid_mask is not None:
-            m = (valid_mask > 0.5).to(dtype=h.dtype, device=h.device).unsqueeze(-1)
+            m = (valid_mask > 0.5).to(dtype=h_fused.dtype, device=h_fused.device).unsqueeze(-1)
             denom = m.sum(dim=1).clamp_min(1e-6)
-            pooled = (h * m).sum(dim=1) / denom
+            pooled = (h_fused * m).sum(dim=1) / denom
         else:
-            pooled = torch.mean(h, dim=1)
+            pooled = torch.mean(h_fused, dim=1)
         return self.projection(pooled)
 
     def freeze(self):
@@ -416,96 +561,145 @@ def build_backbone(config, logger=None):
 
 class SimMTMLoss(nn.Module):
     """
-    SimMTM: Masked Time-series Modeling Loss
+    Masked multi-head reconstruction loss (SimMTM++)
     
-    Implements the complete three-step process:
-    1. Masking: Random masking of time steps
-    2. Manifold Calibration: Compute batch center for alignment
-    3. Reconstruction: Reconstruct masked positions
+    - 随机掩码 + 轻噪声
+    - 连续特征用 MSE/Huber，离散特征用 BCE
+    - 只在被掩码且有效的位置上计算
     """
     
-    def __init__(self, mask_rate=0.5, manifold_weight=0.1):
+    def __init__(
+        self,
+        config,
+        mask_rate: float = 0.5,
+        noise_std: float = 0.05,
+    ):
         super().__init__()
+        self.config = config
         self.mask_rate = mask_rate
-        self.manifold_weight = manifold_weight
+        self.noise_std = noise_std
     
     def forward(self, backbone, x_original):
         """
-        Compute SimMTM loss with manifold calibration
-        
         Args:
-            backbone: Micro-Bi-Mamba backbone model
-            x_original: (B, L, D_in) - original input
-            
+            backbone: 微型 Bi-Mamba 编码器
+            x_original: (B, L, D) 原始输入
+        
         Returns:
-            loss: scalar
-            loss_dict: dictionary with individual loss components
+            total_loss: scalar
         """
         B, L, D = x_original.shape
+        device = x_original.device
+        cfg = backbone.config
 
-        valid_mask_index = getattr(backbone.config, 'VALID_MASK_INDEX', None)
+        seq_len = int(getattr(cfg, 'SEQUENCE_LENGTH', L))
+        effective_len = int(getattr(cfg, 'EFFECTIVE_SEQUENCE_LENGTH', seq_len))
+        use_global_stats = bool(getattr(cfg, 'USE_GLOBAL_STATS_TOKEN', False))
+        has_global = bool(use_global_stats and L == effective_len and L > seq_len)
+        pkt_len = seq_len if has_global else L
+
+        # ===== masking & noise =====
+        valid_mask_idx = getattr(cfg, 'VALID_MASK_INDEX', None)
         valid = None
-        if valid_mask_index is not None:
+        if valid_mask_idx is not None and 0 <= int(valid_mask_idx) < D:
             try:
-                if int(valid_mask_index) >= 0 and int(valid_mask_index) < D:
-                    valid = x_original[:, :, int(valid_mask_index)] > 0.5
+                valid = x_original[:, :pkt_len, int(valid_mask_idx)] > 0.5
             except Exception:
                 valid = None
-        
-        # Step 1: Create mask (randomly mask 50% of time steps)
-        mask = torch.rand(B, L, device=x_original.device) < self.mask_rate
+
+        # True 表示要被掩码重构
+        mask_pos_pkt = torch.rand(B, pkt_len, device=device) < self.mask_rate
         if valid is not None:
-            mask = mask & valid
-        
-        # Masked input
+            mask_pos_pkt = mask_pos_pkt & valid
+        mask_pos_pkt = mask_pos_pkt.unsqueeze(-1)  # (B, pkt_len, 1)
+
         x_masked = x_original.clone()
-        x_masked[mask] = 0.0
-        if valid_mask_index is not None and int(valid_mask_index) >= 0 and int(valid_mask_index) < D:
-            x_masked[:, :, int(valid_mask_index)] = x_original[:, :, int(valid_mask_index)]
-        
-        # Get sequence features from masked input
-        z_seq = backbone(x_masked, return_sequence=True)  # (B, L, d) where d=OUTPUT_DIM
-        
-        # Step 2: Manifold Calibration
-        # Pool to get feature vector for each sample
-        if valid is not None:
-            m = valid.to(dtype=z_seq.dtype).unsqueeze(-1)  # (B, L, 1)
-            denom = m.sum(dim=1).clamp_min(1e-6)
-            z_pooled = (z_seq * m).sum(dim=1) / denom
-        else:
-            z_pooled = torch.mean(z_seq, dim=1)  # (B, d)
-        
-        # Compute batch center (theoretical center) for manifold calibration
-        # Group by labels if available, otherwise use entire batch
-        with torch.no_grad():
-            z_batch_center = torch.mean(z_pooled, dim=0, keepdim=True)  # (1, d)
-            z_batch_center = z_batch_center.expand(B, -1)  # (B, d)
-        
-        # Manifold alignment loss (align features to batch center)
-        manifold_loss = F.mse_loss(z_pooled, z_batch_center.detach())
-        
-        # Step 3: Reconstruction loss
-        # Decode to reconstruct original features
-        x_recon = backbone.decoder(z_seq)  # (B, L, D_in)
-        
-        # Reconstruction loss (only on masked positions)
-        mask_expanded = mask.unsqueeze(-1).expand_as(x_original)
-        if valid_mask_index is not None and int(valid_mask_index) >= 0 and int(valid_mask_index) < D:
-            mask_expanded[:, :, int(valid_mask_index)] = False
-        if mask_expanded.sum() > 0:
-            recon_loss = F.mse_loss(x_recon[mask_expanded], x_original[mask_expanded])
-        else:
-            recon_loss = torch.tensor(0.0, device=x_original.device)
-        
-        # Total SimMTM loss: reconstruction + manifold calibration
-        total_loss = recon_loss + self.manifold_weight * manifold_loss
-        
-        loss_dict = {
-            'total': total_loss.item(),
-            'reconstruction': recon_loss.item(),
-            'manifold': manifold_loss.item()
+        x_masked[:, :pkt_len, :] = x_masked[:, :pkt_len, :] * (~mask_pos_pkt)
+        if valid_mask_idx is not None and 0 <= int(valid_mask_idx) < D:
+            x_masked[:, :pkt_len, int(valid_mask_idx)] = x_original[:, :pkt_len, int(valid_mask_idx)]
+
+        if self.noise_std > 0:
+            # Noise is only applied to continuous channels (e.g., Length/BurstSize) on
+            # unmasked valid positions. Do NOT perturb Direction/ValidMask.
+            noise_apply = (~mask_pos_pkt.squeeze(-1))
+            if valid is not None:
+                noise_apply = noise_apply & valid
+
+            length_idx = getattr(cfg, 'LENGTH_INDEX', None)
+            if length_idx is not None and 0 <= int(length_idx) < D:
+                li = int(length_idx)
+                n = torch.randn_like(x_masked[:, :pkt_len, li]) * self.noise_std
+                x_masked[:, :pkt_len, li] = torch.where(noise_apply, x_masked[:, :pkt_len, li] + n, x_masked[:, :pkt_len, li])
+
+            burst_idx = getattr(cfg, 'BURST_SIZE_INDEX', None)
+            if burst_idx is not None and 0 <= int(burst_idx) < D:
+                bi = int(burst_idx)
+                n = torch.randn_like(x_masked[:, :pkt_len, bi]) * self.noise_std
+                x_masked[:, :pkt_len, bi] = torch.where(noise_apply, x_masked[:, :pkt_len, bi] + n, x_masked[:, :pkt_len, bi])
+
+        # ===== encode & decode =====
+        z_seq = backbone(x_masked, return_sequence=True)  # (B, L, d)
+        x_recon = backbone.decoder(z_seq)  # (B, L, D)
+
+        # ===== per-feature losses =====
+        mask_scalar = mask_pos_pkt.squeeze(-1).to(dtype=x_original.dtype)  # (B, pkt_len)
+
+        def _masked_mean(loss_tensor, mask_tensor):
+            denom = mask_tensor.sum().clamp_min(1e-6)
+            return (loss_tensor * mask_tensor).sum() / denom
+
+        total_components = {}
+        recon_loss = 0.0
+
+        length_idx = getattr(cfg, 'LENGTH_INDEX', None)
+        if length_idx is not None and 0 <= int(length_idx) < D:
+            lt = int(length_idx)
+            loss_len = F.mse_loss(x_recon[:, :pkt_len, lt], x_original[:, :pkt_len, lt], reduction='none')
+            loss_len = _masked_mean(loss_len, mask_scalar)
+            total_components['length'] = loss_len
+            recon_loss = recon_loss + float(getattr(cfg, 'PRETRAIN_LENGTH_WEIGHT', 1.0)) * loss_len
+
+        burst_idx = getattr(cfg, 'BURST_SIZE_INDEX', None)
+        if burst_idx is not None and 0 <= int(burst_idx) < D:
+            bt = int(burst_idx)
+            loss_burst = F.mse_loss(x_recon[:, :pkt_len, bt], x_original[:, :pkt_len, bt], reduction='none')
+            loss_burst = _masked_mean(loss_burst, mask_scalar)
+            total_components['burst'] = loss_burst
+            recon_loss = recon_loss + float(getattr(cfg, 'PRETRAIN_BURST_WEIGHT', 1.0)) * loss_burst
+
+        dir_idx = getattr(cfg, 'DIRECTION_INDEX', None)
+        if dir_idx is not None and 0 <= int(dir_idx) < D:
+            dt = int(dir_idx)
+            target_dir = (x_original[:, :pkt_len, dt] > 0).to(dtype=x_original.dtype)
+            loss_dir = F.binary_cross_entropy_with_logits(
+                x_recon[:, :pkt_len, dt],
+                target_dir,
+                reduction='none'
+            )
+            loss_dir = _masked_mean(loss_dir, mask_scalar)
+            total_components['direction'] = loss_dir
+            recon_loss = recon_loss + float(getattr(cfg, 'PRETRAIN_DIRECTION_WEIGHT', 1.0)) * loss_dir
+
+        if valid_mask_idx is not None and 0 <= int(valid_mask_idx) < D:
+            vm = int(valid_mask_idx)
+            target_vm = x_original[:, :pkt_len, vm]
+            loss_vm = F.binary_cross_entropy_with_logits(
+                x_recon[:, :pkt_len, vm],
+                target_vm,
+                reduction='none'
+            )
+            loss_vm = _masked_mean(loss_vm, mask_scalar)
+            total_components['validmask'] = loss_vm
+            recon_loss = recon_loss + float(getattr(cfg, 'PRETRAIN_VALIDMASK_WEIGHT', 0.5)) * loss_vm
+
+        total_loss = float(getattr(cfg, 'PRETRAIN_RECON_WEIGHT', 1.0)) * recon_loss
+
+        # 缓存分项，便于外部调试
+        self.last_loss_dict = {
+            'total': float(total_loss.item()),
+            **{k: float(v.item()) for k, v in total_components.items()}
         }
-        
+
         return total_loss
 
 
@@ -555,4 +749,3 @@ class SupConLoss(nn.Module):
         loss = -mean_log_prob_pos.mean()
         
         return loss
-

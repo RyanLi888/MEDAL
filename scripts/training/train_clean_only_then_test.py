@@ -20,6 +20,7 @@ from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone, build_b
 
 try:
     from scripts.utils.preprocess import check_preprocessed_exists, load_preprocessed
+    from scripts.utils.preprocess import normalize_burstsize_inplace
     PREPROCESS_AVAILABLE = True
 except Exception:
     PREPROCESS_AVAILABLE = False
@@ -35,6 +36,7 @@ def _safe_makedirs(path: str) -> None:
 def _load_train_dataset():
     if PREPROCESS_AVAILABLE and check_preprocessed_exists('train'):
         X_train, y_train, _ = load_preprocessed('train')
+        X_train = normalize_burstsize_inplace(X_train)
         return X_train, y_train
 
     X_train, y_train, _ = load_dataset(
@@ -42,6 +44,7 @@ def _load_train_dataset():
         malicious_dir=config.MALICIOUS_TRAIN,
         sequence_length=config.SEQUENCE_LENGTH,
     )
+    X_train = normalize_burstsize_inplace(X_train)
     return X_train, y_train
 
 
@@ -78,6 +81,12 @@ def main():
     parser.add_argument('--backbone_path', type=str, default='', help='Path to backbone model (optional)')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--run_tag', type=str, default='')
+    parser.add_argument('--focal_alpha', type=float, default=None)
+    parser.add_argument('--focal_gamma', type=float, default=None)
+    parser.add_argument('--finetune_epochs', type=int, default=None)
+    parser.add_argument('--finetune_scope', type=str, default=None, choices=['projection', 'all'])
+    parser.add_argument('--finetune_lr', type=float, default=None)
+    parser.add_argument('--finetune_warmup_epochs', type=int, default=None)
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -89,21 +98,44 @@ def main():
     # Keep gradients simple: no SoftF1 / no orthogonality / no consistency.
     # ----------------------------
     config.USE_FOCAL_LOSS = True
+    config.USE_BCE_LOSS = False
+    config.USE_LOGIT_MARGIN = False
+    config.USE_MARGIN_LOSS = False
     config.USE_SOFT_F1_LOSS = False
-    config.SOFT_F1_WEIGHT = 0.0
     config.SOFT_ORTH_WEIGHT_START = 0.0
     config.SOFT_ORTH_WEIGHT_END = 0.0
     config.CONSISTENCY_WEIGHT_START = 0.0
     config.CONSISTENCY_WEIGHT_END = 0.0
+    config.STAGE3_ONLINE_AUGMENTATION = False
+    config.STAGE3_USE_ST_MIXUP = False
 
     # Enable backbone finetuning in clean-only experiments (do not overwrite original backbone file).
     config.FINETUNE_BACKBONE = True
-    tmp_scope = str(getattr(config, 'FINETUNE_BACKBONE_SCOPE', 'projection')).lower()
-    config.FINETUNE_BACKBONE_SCOPE = tmp_scope if tmp_scope in ('projection', 'all') else 'projection'
+    config.FINETUNE_BACKBONE_SCOPE = 'projection'
+    config.FINETUNE_BACKBONE_LR = 2e-5
+    config.FINETUNE_BACKBONE_WARMUP_EPOCHS = 30
 
-    # Use full training data in this mode; allow early-stopping on train metric.
-    config.FINETUNE_VAL_SPLIT = 0.0
-    config.FINETUNE_ES_ALLOW_TRAIN_METRIC = True
+    if args.focal_alpha is not None:
+        config.FOCAL_ALPHA = float(args.focal_alpha)
+    if args.focal_gamma is not None:
+        config.FOCAL_GAMMA = float(args.focal_gamma)
+    if args.finetune_epochs is not None:
+        config.FINETUNE_EPOCHS = int(args.finetune_epochs)
+    if args.finetune_scope is not None:
+        config.FINETUNE_BACKBONE_SCOPE = str(args.finetune_scope)
+    if args.finetune_lr is not None:
+        config.FINETUNE_BACKBONE_LR = float(args.finetune_lr)
+    if args.finetune_warmup_epochs is not None:
+        config.FINETUNE_BACKBONE_WARMUP_EPOCHS = int(args.finetune_warmup_epochs)
+
+    # Use full training data in this mode unless a validation override is provided.
+    _env_val_split = os.environ.get('MEDAL_FINETUNE_VAL_SPLIT', '').strip()
+    _env_val_per_class = os.environ.get('MEDAL_FINETUNE_VAL_PER_CLASS', '').strip()
+    if _env_val_split or _env_val_per_class or getattr(config, 'FINETUNE_VAL_SPLIT', 0.0) > 0 or getattr(config, 'FINETUNE_VAL_PER_CLASS', 0) > 0:
+        config.FINETUNE_ES_ALLOW_TRAIN_METRIC = False
+    else:
+        config.FINETUNE_VAL_SPLIT = 0.0
+        config.FINETUNE_ES_ALLOW_TRAIN_METRIC = True
 
     run_tag = args.run_tag.strip() or datetime.now().strftime('%Y%m%d_%H%M%S')
     run_dir = os.path.join(config.LABEL_CORRECTION_DIR, 'analysis', 'clean_only_runs', run_tag)

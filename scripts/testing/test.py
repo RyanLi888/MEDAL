@@ -34,7 +34,7 @@ from MoudleCode.utils.checkpoint import load_state_dict_shape_safe
 
 # 导入预处理模块
 try:
-    from scripts.utils.preprocess import check_preprocessed_exists, load_preprocessed, preprocess_test
+    from scripts.utils.preprocess import check_preprocessed_exists, load_preprocessed, normalize_burstsize_inplace
     PREPROCESS_AVAILABLE = True
 except ImportError:
     PREPROCESS_AVAILABLE = False
@@ -141,18 +141,31 @@ def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
     logger.info(f"   配置默认阈值: {config_threshold:.4f}")
     
     # 阈值对比（解释为什么图里可能是 0.8+ 而不是 0.6）
-    candidate_thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, float(optimal_threshold), float(config_threshold)]
-    candidate_thresholds = sorted(set([round(t, 4) for t in candidate_thresholds]))
+    candidate_thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, float(config_threshold)]
+    # 注意：不对optimal_threshold进行四舍五入，保持原始精度
+    candidate_thresholds_display = sorted(set([round(t, 4) for t in candidate_thresholds]))
+    # 将optimal_threshold插入到正确的位置（用于显示）
+    optimal_threshold_rounded = round(float(optimal_threshold), 4)
+    if optimal_threshold_rounded not in candidate_thresholds_display:
+        candidate_thresholds_display.append(optimal_threshold_rounded)
+        candidate_thresholds_display.sort()
+    
     logger.info("📏 阈值对比 (Malicious=Positive):")
     logger.info(f"  {'threshold':>10s} | {'precision':>9s} | {'recall':>7s} | {'f1':>7s}")
     logger.info("  " + "-"*44)
-    for th in candidate_thresholds:
-        y_pred_th = (y_prob[:, 1] >= th).astype(int)
+    for th_display in candidate_thresholds_display:
+        # 对于最优阈值，使用原始高精度值；其他使用显示值
+        if abs(th_display - optimal_threshold_rounded) < 0.00001:
+            th_actual = float(optimal_threshold)  # 使用原始高精度值
+        else:
+            th_actual = th_display
+        
+        y_pred_th = (y_prob[:, 1] >= th_actual).astype(int)
         p = precision_score(y_true, y_pred_th, pos_label=1, zero_division=0)
         r = recall_score(y_true, y_pred_th, pos_label=1, zero_division=0)
         f1 = f1_score(y_true, y_pred_th, pos_label=1, zero_division=0)
-        marker = " ← 最优" if abs(th - optimal_threshold) < 0.0001 else ""
-        logger.info(f"  {th:10.4f} | {p:9.4f} | {r:7.4f} | {f1:7.4f}{marker}")
+        marker = " ← 最优" if abs(th_display - optimal_threshold_rounded) < 0.00001 else ""
+        logger.info(f"  {th_display:10.4f} | {p:9.4f} | {r:7.4f} | {f1:7.4f}{marker}")
     logger.info("")
     
     # 使用最优阈值生成预测标签（这是最终使用的阈值）
@@ -358,6 +371,7 @@ def main(args):
     if PREPROCESS_AVAILABLE and check_preprocessed_exists('test'):
         logger.info("✓ 发现预处理文件，直接加载...")
         X_test, y_test, test_files = load_preprocessed('test')
+        X_test = normalize_burstsize_inplace(X_test)
         logger.info(f"  从预处理文件加载: {X_test.shape[0]} 个样本")
     else:
         # 从PCAP文件加载
@@ -368,6 +382,7 @@ def main(args):
             malicious_dir=config.MALICIOUS_TEST,
             sequence_length=config.SEQUENCE_LENGTH
         )
+        X_test = normalize_burstsize_inplace(X_test)
     
     if X_test is None:
         logger.error("❌ 测试数据集加载失败!")
@@ -399,9 +414,15 @@ def main(args):
             with open(metadata_path, 'r') as f:
                 metadata = json.load(f)
             backbone_path_from_metadata = metadata.get('backbone_path')
+            input_is_features_from_metadata = metadata.get('input_is_features', False)
+            feature_dim_from_metadata = metadata.get('feature_dim', None)
+            
             if backbone_path_from_metadata:
                 logger.info(f"✓ 从模型元数据中读取到训练时使用的骨干网络:")
                 logger.info(f"  {backbone_path_from_metadata}")
+                if input_is_features_from_metadata:
+                    logger.info(f"✓ 训练时输入类型: 特征向量 (维度={feature_dim_from_metadata})")
+                    logger.info(f"  测试时将自动从序列提取特征")
                 logger.info("")
         except Exception as e:
             logger.warning(f"⚠ 无法读取模型元数据: {e}")

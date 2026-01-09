@@ -2,7 +2,7 @@
 ST-Mixup: Spatio-Temporal Mixup for Traffic Data Augmentation
 
 针对网络流量时序数据的改进版Mixup增强策略：
-1. 空间维度：混合连续特征值（Length, Log-IAT, BurstSize）
+1. 空间维度：混合连续特征值（Length, BurstSize）
 2. 时间维度：简单时间偏移对齐（避免复杂DTW）
 3. 离散特征：随机选择（保持语义完整性）
 4. 类内混合：只混合同类样本（避免语义冲突）
@@ -322,14 +322,13 @@ def create_st_mixup(config, mode='intra_class'):
     """
     if mode == 'intra_class':
         length_idx = getattr(config, 'LENGTH_INDEX', None)
-        iat_idx = getattr(config, 'IAT_INDEX', None)
         burst_idx = getattr(config, 'BURST_SIZE_INDEX', None)
         cum_idx = getattr(config, 'CUMULATIVE_LEN_INDEX', None)
         direction_idx = getattr(config, 'DIRECTION_INDEX', None)
         valid_mask_idx = getattr(config, 'VALID_MASK_INDEX', None)
 
         cont = []
-        for idx in [length_idx, iat_idx, burst_idx, cum_idx]:
+        for idx in [length_idx, burst_idx, cum_idx]:
             if idx is None:
                 continue
             try:
@@ -355,14 +354,13 @@ def create_st_mixup(config, mode='intra_class'):
         )
     elif mode == 'selective':
         length_idx = getattr(config, 'LENGTH_INDEX', None)
-        iat_idx = getattr(config, 'IAT_INDEX', None)
         burst_idx = getattr(config, 'BURST_SIZE_INDEX', None)
         cum_idx = getattr(config, 'CUMULATIVE_LEN_INDEX', None)
         direction_idx = getattr(config, 'DIRECTION_INDEX', None)
         valid_mask_idx = getattr(config, 'VALID_MASK_INDEX', None)
 
         cont = []
-        for idx in [length_idx, iat_idx, burst_idx, cum_idx]:
+        for idx in [length_idx, burst_idx, cum_idx]:
             if idx is None:
                 continue
             try:

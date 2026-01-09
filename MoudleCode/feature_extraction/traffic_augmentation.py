@@ -25,27 +25,32 @@ class TrafficAugmentation:
             config: 配置对象
         """
         self.config = config
-        self.seq_len = config.SEQUENCE_LENGTH  # 1024
+        self.seq_len = config.SEQUENCE_LENGTH  # 1024（包级特征长度）
+        self.use_global_stats = getattr(config, 'USE_GLOBAL_STATS_TOKEN', False)
+        self.effective_len = getattr(config, 'EFFECTIVE_SEQUENCE_LENGTH', config.SEQUENCE_LENGTH)
         
         # 增强策略的概率
-        self.crop_prob = float(getattr(config, 'AUG_CROP_PROB', 0.8))
-        self.jitter_prob = float(getattr(config, 'AUG_JITTER_PROB', 0.6))
-        self.mask_prob = float(getattr(config, 'AUG_CHANNEL_MASK_PROB', 0.5))
+        self.crop_prob = float(getattr(config, 'TRAFFIC_AUG_CROP_PROB', getattr(config, 'AUG_CROP_PROB', 0.8)))
+        self.jitter_prob = float(getattr(config, 'TRAFFIC_AUG_JITTER_PROB', getattr(config, 'AUG_JITTER_PROB', 0.6)))
+        self.mask_prob = float(getattr(config, 'TRAFFIC_AUG_MASK_PROB', getattr(config, 'AUG_CHANNEL_MASK_PROB', 0.5)))
         
         # 裁剪参数
-        self.crop_min_ratio = float(getattr(config, 'AUG_CROP_MIN_RATIO', 0.5))
-        self.crop_max_ratio = float(getattr(config, 'AUG_CROP_MAX_RATIO', 0.9))
+        self.crop_min_ratio = float(getattr(config, 'TRAFFIC_AUG_CROP_MIN_RATIO', getattr(config, 'AUG_CROP_MIN_RATIO', 0.5)))
+        self.crop_max_ratio = float(getattr(config, 'TRAFFIC_AUG_CROP_MAX_RATIO', getattr(config, 'AUG_CROP_MAX_RATIO', 0.9)))
         
-        # 抖动参数（针对Log-IAT维度）
-        self.jitter_std = float(getattr(config, 'AUG_JITTER_STD', 0.1))
-        
+        # 抖动参数
+        self.jitter_std = float(getattr(config, 'TRAFFIC_AUG_JITTER_STD', getattr(config, 'AUG_JITTER_STD', 0.1)))
+
+        # Burst 抖动增强（lite4 推荐使用 Burst 而非 IAT）
+        self.burst_jitter_prob = float(getattr(config, 'TRAFFIC_AUG_BURST_JITTER_PROB', 0.0))
+        self.burst_jitter_std = float(getattr(config, 'TRAFFIC_AUG_BURST_JITTER_STD', 0.0))
+
         # 掩码参数
-        self.mask_ratio = float(getattr(config, 'AUG_CHANNEL_MASK_RATIO', 0.15))
+        self.mask_ratio = float(getattr(config, 'TRAFFIC_AUG_MASK_RATIO', getattr(config, 'AUG_CHANNEL_MASK_RATIO', 0.15)))
 
         self.length_index = getattr(config, 'LENGTH_INDEX', 0)
-        self.iat_index = getattr(config, 'IAT_INDEX', None)
-        self.direction_index = getattr(config, 'DIRECTION_INDEX', 2)
-        self.burst_index = getattr(config, 'BURST_SIZE_INDEX', 3)
+        self.direction_index = getattr(config, 'DIRECTION_INDEX', 1)
+        self.burst_index = getattr(config, 'BURST_SIZE_INDEX', 2)
         self.cumulative_index = getattr(config, 'CUMULATIVE_LEN_INDEX', None)
         self.valid_mask_index = getattr(config, 'VALID_MASK_INDEX', None)
         
@@ -71,25 +76,96 @@ class TrafficAugmentation:
         
         Args:
             x: (B, L, D) - 原始序列
+               L 可能是 1024（无全局统计令牌）或 1025（有全局统计令牌）
             
         Returns:
             x_aug: (B, L, D) - 增强后的序列
         """
-        x_aug = x.clone()
-        
-        # 策略A: 时序非对齐裁剪
-        if np.random.rand() < self.crop_prob:
-            x_aug = self._temporal_crop(x_aug)
-        
-        # 策略B: 时序抖动
-        if np.random.rand() < self.jitter_prob:
-            x_aug = self._temporal_jitter(x_aug)
-        
-        # 策略C: 特征通道掩码
-        if np.random.rand() < self.mask_prob:
-            x_aug = self._channel_mask(x_aug)
-        
-        return x_aug
+        # 检查是否包含全局统计令牌（第1025行）
+        if self.use_global_stats and x.shape[1] == self.effective_len:
+            # 分离全局统计令牌（不参与时序增强）
+            x_packets = x[:, :self.seq_len, :]  # (B, 1024, D) - 包级特征
+            x_global = x[:, self.seq_len:, :]   # (B, 1, D) - 全局统计令牌
+            
+            # 只对包级特征进行增强
+            x_aug = x_packets.clone()
+            
+            # 策略A: 时序非对齐裁剪
+            if np.random.rand() < self.crop_prob:
+                x_aug = self._temporal_crop(x_aug)
+            
+            # 策略B: 时序抖动
+            if np.random.rand() < self.jitter_prob:
+                x_aug = self._temporal_jitter(x_aug)
+
+            # 策略B2: Burst 抖动
+            if self.burst_jitter_prob > 0 and np.random.rand() < self.burst_jitter_prob:
+                x_aug = self._burst_jitter(x_aug)
+            
+            # 策略C: 特征通道掩码
+            if np.random.rand() < self.mask_prob:
+                x_aug = self._channel_mask(x_aug)
+            
+            # 重新拼接全局统计令牌（保持不变）
+            x_aug = torch.cat([x_aug, x_global], dim=1)  # (B, 1025, D)
+            return x_aug
+        else:
+            # 兼容旧版本（无全局统计令牌）或长度不匹配
+            x_aug = x.clone()
+            
+            # 策略A: 时序非对齐裁剪
+            if np.random.rand() < self.crop_prob:
+                x_aug = self._temporal_crop(x_aug)
+            
+            # 策略B: 时序抖动
+            if np.random.rand() < self.jitter_prob:
+                x_aug = self._temporal_jitter(x_aug)
+
+            # 策略B2: Burst 抖动
+            if self.burst_jitter_prob > 0 and np.random.rand() < self.burst_jitter_prob:
+                x_aug = self._burst_jitter(x_aug)
+            
+            # 策略C: 特征通道掩码
+            if np.random.rand() < self.mask_prob:
+                x_aug = self._channel_mask(x_aug)
+            
+            return x_aug
+
+    def _burst_jitter(self, x):
+        """
+        Burst 抖动增强
+
+        - 仅作用于 BurstSize 维度
+        - 仅对有效 token 生效
+        - 以比例噪声形式扰动：burst = burst * (1 + N(0, std))
+        """
+        if self.burst_index is None:
+            return x
+        try:
+            bi = int(self.burst_index)
+        except Exception:
+            return x
+        if bi < 0 or bi >= x.shape[-1]:
+            return x
+        if self.burst_jitter_std <= 0:
+            return x
+
+        out = x.clone()
+        noise = torch.randn_like(out[:, :, bi]) * float(self.burst_jitter_std)
+        scale = (1.0 + noise).clamp_min(0.0)
+
+        if self.valid_mask_index is not None:
+            try:
+                vm_idx = int(self.valid_mask_index)
+                if 0 <= vm_idx < x.shape[-1]:
+                    valid = out[:, :, vm_idx] > 0.5
+                    out[:, :, bi] = torch.where(valid, out[:, :, bi] * scale, out[:, :, bi])
+                    return out
+            except Exception:
+                pass
+
+        out[:, :, bi] = out[:, :, bi] * scale
+        return out
     
     def _temporal_crop(self, x):
         """
@@ -132,34 +208,9 @@ class TrafficAugmentation:
             x: (B, L, D)
             
         Returns:
-            x_jitter: (B, L, D) - 对Log-IAT添加噪声
+            x_jitter: (B, L, D)
         """
-        x_jitter = x.clone()
-        
-        # 只对 Log-IAT 维度添加高斯噪声（仅对有效 token）
-        # lite4 特征集可能没有 IAT，直接跳过。
-        if self.iat_index is None:
-            return x_jitter
-        try:
-            iat_idx = int(self.iat_index)
-        except Exception:
-            return x_jitter
-        if iat_idx < 0 or iat_idx >= x.shape[-1]:
-            return x_jitter
-
-        noise = torch.randn_like(x[:, :, iat_idx]) * self.jitter_std
-        if self.valid_mask_index is not None:
-            try:
-                vm_idx = int(self.valid_mask_index)
-                if 0 <= vm_idx < x.shape[-1]:
-                    valid = x[:, :, vm_idx] > 0.5
-                    x_jitter[:, :, iat_idx] = torch.where(valid, x[:, :, iat_idx] + noise, x[:, :, iat_idx])
-                    return x_jitter
-            except Exception:
-                pass
-        x_jitter[:, :, iat_idx] = x[:, :, iat_idx] + noise
-
-        return x_jitter
+        return x
     
     def _channel_mask(self, x):
         """

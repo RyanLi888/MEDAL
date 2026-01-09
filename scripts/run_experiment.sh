@@ -24,6 +24,17 @@ BACKBONE_DIR="$OUTPUT_DIR/feature_extraction/models"
 PREPROCESSED_DIR="$OUTPUT_DIR/preprocessed"
 LABEL_CORR_ANALYSIS_DIR="$OUTPUT_DIR/label_correction/analysis"
 
+# ------------------------------
+# Fixed Stage 3 backbone policy
+# ------------------------------
+# Freeze backbone first (classifier warmup), then unfreeze with small LR.
+# Users can override by exporting env vars before running this script.
+: "${MEDAL_FINETUNE_BACKBONE:=0}"
+: "${MEDAL_FINETUNE_BACKBONE_SCOPE:=projection}"
+: "${MEDAL_FINETUNE_BACKBONE_LR:=1e-5}"
+: "${MEDAL_FINETUNE_BACKBONE_WARMUP_EPOCHS:=30}"
+export MEDAL_FINETUNE_BACKBONE MEDAL_FINETUNE_BACKBONE_SCOPE MEDAL_FINETUNE_BACKBONE_LR MEDAL_FINETUNE_BACKBONE_WARMUP_EPOCHS
+
 # 颜色定义
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -193,10 +204,10 @@ check_and_select_backbone() {
     if [ "$allow_existing" != "true" ]; then
         return
     fi
+
     
     echo ""
     echo "检查已有的骨干网络模型..."
-    BACKBONE_DIR="$BACKBONE_DIR"
     
     if [ ! -d "$BACKBONE_DIR" ]; then
         echo -e "${YELLOW}⚠ 骨干网络目录不存在，将训练新的骨干网络${NC}"
@@ -259,35 +270,6 @@ check_and_select_backbone() {
     
     echo -e "${GREEN}✓ 已选择: $SELECTED_BACKBONE_NAME${NC}"
     echo "将从 Stage 2 开始运行（跳过骨干网络训练）"
-}
-
-configure_stage3_finetune_backbone() {
-    FT_ENV=""
-
-    echo ""
-    echo "Stage 3 骨干网络微调设置:"
-    echo "是否微调骨干网络? (y/n, 默认y): "
-    read -r finetune_backbone_choice
-    finetune_backbone_choice=${finetune_backbone_choice:-y}
-
-    if [ "$finetune_backbone_choice" = "y" ] || [ "$finetune_backbone_choice" = "Y" ]; then
-        echo -n "微调范围 scope (projection/all, 默认all): "
-        read -r finetune_scope_choice
-        finetune_scope_choice=${finetune_scope_choice:-all}
-        if [ "$finetune_scope_choice" != "projection" ] && [ "$finetune_scope_choice" != "all" ]; then
-            finetune_scope_choice="all"
-        fi
-
-        echo -n "骨干网络学习率 backbone_lr (默认1e-5): "
-        read -r finetune_lr_choice
-        finetune_lr_choice=${finetune_lr_choice:-1e-5}
-
-        FT_ENV="MEDAL_FINETUNE_BACKBONE=1 MEDAL_FINETUNE_BACKBONE_SCOPE=$finetune_scope_choice MEDAL_FINETUNE_BACKBONE_LR=$finetune_lr_choice"
-        echo -e "${GREEN}✓ 已启用骨干网络微调: scope=$finetune_scope_choice, lr=$finetune_lr_choice${NC}"
-    else
-        FT_ENV="MEDAL_FINETUNE_BACKBONE=0"
-        echo -e "${YELLOW}⚠ 骨干网络微调已关闭（仅训练分类器）${NC}"
-    fi
 }
 
 # 选择运行模式
@@ -392,20 +374,26 @@ case $choice in
         echo "  - 跳过标签矫正和数据增强"
         echo "  - 直接训练 Stage 3 分类器"
         echo "  - 使用相同骨干网络进行测试"
+        echo ""
+        echo "最优配置（固定）："
+        echo "  - loss: focal supervised"
+        echo "  - 正交/一致性/边际/softF1: 关闭"
+        echo "  - Stage3 在线增强 / ST-Mixup: 关闭"
+        echo "  - FocalLoss: alpha=0.5, gamma=2.0"
+        echo "  - 骨干微调: projection, warmup=30, lr=2e-5"
+        echo -e "${GREEN}✓ 已锁定最优配置（不再支持其他分支/环境变量覆盖）${NC}"
         
         check_and_select_backbone true
-
-        configure_stage3_finetune_backbone
         
         if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
             echo ""
             echo "将使用已选择的骨干网络: $SELECTED_BACKBONE_NAME"
-            CMD="$FT_ENV python scripts/training/train_clean_only_then_test.py --use_ground_truth --backbone_path $BACKBONE_PATH"
+            CMD="python scripts/training/train_clean_only_then_test.py --use_ground_truth --backbone_path $BACKBONE_PATH"
             MODE="干净数据训练+测试 (使用已有backbone: $SELECTED_BACKBONE_NAME)"
         else
             echo ""
             echo "将先训练新的骨干网络（Stage 1），然后用干净数据训练分类器"
-            CMD="python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 && $FT_ENV python scripts/training/train_clean_only_then_test.py --use_ground_truth"
+            CMD="python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 && python scripts/training/train_clean_only_then_test.py --use_ground_truth"
             MODE="干净数据训练+测试 (训练新backbone)"
         fi
         LOG_PREFIX="clean_train_test"
@@ -505,10 +493,14 @@ case $choice in
         echo "1) 特征提取: 先训练特征提取器(Stage1)，用真实标签(权重1/无噪声)训练分类器，然后测试"
         echo "2) 数据增强: 用真实标签(权重1/无噪声)提取特征后直接增强(TabDDPM)，用真实+增强训练分类器，然后测试"
         echo "3) 标签矫正: 使用30%噪声提取特征->标签矫正->用矫正后的干净数据训练分类器，然后测试"
-        echo "4) 干净数据: 仅干净数据训练分类器（微调骨干网络）并测试"
-        echo "5) 干净+增强: 干净数据+TabDDPM增强训练分类器（微调骨干网络）并测试"
         echo ""
-        echo -n "请输入选择 (1-5): "
+        echo "说明: 所有消融实验均使用最优策略配置（已锁定）："
+        echo "  - Loss: Focal Loss (alpha=0.5, gamma=2.0)"
+        echo "  - 骨干微调: projection层, warmup=30, lr=2e-5"
+        echo "  - 正交/一致性/边际/softF1: 关闭"
+        echo "  - Stage3在线增强/ST-Mixup: 关闭"
+        echo ""
+        echo -n "请输入选择 (1-3): "
         read -r ab_choice
 
         case $ab_choice in
@@ -519,6 +511,7 @@ case $choice in
                 echo "说明: 评估特征提取器（骨干网络）的质量"
                 echo "  - 选项1: 训练新的骨干网络（Stage 1），然后用真实标签训练分类器并测试"
                 echo "  - 选项2: 使用已有骨干网络，直接用真实标签训练分类器并测试"
+                echo "  - 使用最优策略: Focal Loss + projection微调"
                 echo ""
                 
                 check_and_select_backbone true
@@ -543,6 +536,8 @@ case $choice in
                 echo ""
                 echo "[消融-数据增强]"
                 echo "说明: 使用真实标签(无噪声/权重=1)，直接增强(TabDDPM)，再训练分类器，然后测试"
+                echo "  - 使用最优策略: Focal Loss + projection微调"
+                echo ""
                 
                 check_and_select_backbone true
                 
@@ -566,6 +561,8 @@ case $choice in
                 echo ""
                 echo "[消融-标签矫正]"
                 echo "说明: 使用30%噪声进行标签矫正分析，然后用矫正结果训练分类器并测试"
+                echo "  - 使用最优策略: Focal Loss + projection微调"
+                echo ""
                 
                 check_and_select_backbone true
                 
@@ -580,41 +577,6 @@ case $choice in
                     MODE="消融-标签矫正 (训练新backbone)"
                 fi
                 LOG_PREFIX="ablation_label_correction"
-                ;;
-            4)
-                # 消融实验模式4：干净数据训练分类器 + 微调骨干网络
-                echo ""
-                echo "[消融-干净数据(微调骨干)]"
-                echo "说明: 仅干净数据训练 Stage 3 分类器，同时微调骨干网络，然后测试"
-                echo ""
-                check_and_select_backbone true
-                configure_stage3_finetune_backbone
-                if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
-                    CMD="$FT_ENV python scripts/training/train_clean_only_then_test.py --use_ground_truth --backbone_path $BACKBONE_PATH"
-                    MODE="消融-干净数据(微调骨干) (使用已有backbone: $SELECTED_BACKBONE_NAME)"
-                else
-                    CMD="python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 1 && $FT_ENV python scripts/training/train_clean_only_then_test.py --use_ground_truth"
-                    MODE="消融-干净数据(微调骨干) (训练新backbone)"
-                fi
-                LOG_PREFIX="ablation_clean_only_finetune_backbone"
-                ;;
-            5)
-                # 消融实验模式5：干净+增强训练分类器 + 微调骨干网络
-                echo ""
-                echo "[消融-干净+增强(微调骨干)]"
-                echo "说明: 使用真实标签(无噪声/权重=1)进行 TabDDPM 增强，再训练 Stage 3 分类器，同时微调骨干网络，然后测试"
-                echo ""
-                check_and_select_backbone true
-                configure_stage3_finetune_backbone
-                if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
-                    BACKBONE_ARG="--backbone_path $BACKBONE_PATH --start_stage 2"
-                    CMD="$FT_ENV python scripts/training/train.py --noise_rate 0.0 --end_stage 3 --stage2_mode clean_augment_only $BACKBONE_ARG && python scripts/testing/test.py"
-                    MODE="消融-干净+增强(微调骨干) (使用已有backbone: $SELECTED_BACKBONE_NAME)"
-                else
-                    CMD="$FT_ENV python scripts/training/train.py --noise_rate 0.0 --start_stage 1 --end_stage 3 --stage2_mode clean_augment_only && python scripts/testing/test.py"
-                    MODE="消融-干净+增强(微调骨干) (训练新backbone)"
-                fi
-                LOG_PREFIX="ablation_data_augmentation_finetune_backbone"
                 ;;
             *)
                 echo -e "${RED}无效选择${NC}"
@@ -698,9 +660,9 @@ echo "请选择运行方式:"
 echo "1) 前台运行 (实时查看输出，Ctrl+C可终止)"
 echo "2) 后台运行 (推荐长时间训练，日志保存到文件)"
 echo ""
-echo -n "请输入选择 (1-2, 默认1): "
+echo -n "请输入选择 (1-2, 默认2): "
 read -r run_mode
-run_mode=${run_mode:-1}
+run_mode=${run_mode:-2}
 
 # 准备日志文件
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")

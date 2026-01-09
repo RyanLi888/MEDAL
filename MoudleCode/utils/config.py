@@ -7,6 +7,7 @@ Contains all hyperparameters and settings
 """
 import torch
 import os
+import math
 from pathlib import Path
 
 class Config:
@@ -43,21 +44,33 @@ class Config:
     
     # ==================== Preprocessing Parameters ====================
     # PCAP解析参数
-    PACKET_TIMEOUT = 60  # 流超时时间(秒)
-    MAX_PACKETS_PER_FLOW = 1024  # 每个流最大包数
+    PACKET_TIMEOUT = 60  # 流超时时间(秒) - 已弃用，使用SESSION_TIMEOUT
+    SESSION_TIMEOUT = 60  # 会话超时时间(秒) - 相同5元组超过此时间间隔视为新会话
+    TCP_FAST_RECONNECT_THRESHOLD = 5  # TCP快速重连阈值(秒) - 同5元组内短时间SYN重连合并为同一流
+    ONE_FLOW_PER_5TUPLE = True
+    
+    # 序列长度和特征提取策略
+    # 注意：突发特征（Burst）的计算使用所有包，但最终只保留前1024个包的特征
+    # 
+    # 处理流程：
+    # 1. 处理所有包，计算完整的突发特征（Burst需要完整的包序列来准确计算）
+    # 2. 如果包数 > 1024，只保留前1024个包的特征
+    # 3. 如果包数 <= 1024，填充0到1024长度
+    # 
+    # 为什么这样设计：
+    # - 突发特征依赖于包间时间间隔（IAT）和方向变化
+    # - 如果先截断包再计算突发，会导致突发边界不准确
+    # - 因此先用所有包计算突发，再截取前1024个特征
 
-    # -------------------- Fixed Feature Interface (New Design) --------------------
-    # The project is standardized to a 4D feature set:
-    # [Length, Direction, BurstSize, ValidMask]
-    FEATURE_SET = 'lite4'
-
+    # -------------------- Fixed Feature Interface (MEDAL-Lite4 Only) --------------------
+    # Lite4: [Length, Direction, BurstSize, ValidMask]
     FEATURE_NAMES = ['Length', 'Direction', 'BurstSize', 'ValidMask']
     LENGTH_INDEX = 0
-    IAT_INDEX = None
     DIRECTION_INDEX = 1
     BURST_SIZE_INDEX = 2
-    CUMULATIVE_LEN_INDEX = None
+    IAT_INDEX = None
     VALID_MASK_INDEX = 3
+    CUMULATIVE_LEN_INDEX = None
 
     # Burst 检测阈值（秒）
     # 用于判定突发边界：当包间隔 > 阈值时，认为是新的突发
@@ -76,16 +89,47 @@ class Config:
     # 特征归一化参数
     MTU = 1500.0  # 最大传输单元
     TCP_WINDOW_MAX = 65535.0  # TCP窗口最大值
-    IAT_EPSILON = 1e-7  # Log-IAT 防止log(0)
     
     # ==================== Input & Embedding Parameters ====================
     SEQUENCE_LENGTH = 1024  # L: Maximum number of packets per flow
-    INPUT_FEATURE_DIM = 4
+    
+    # BurstSize 归一化（默认启用）
+    BURSTSIZE_NORMALIZE = False
+    _env_burst_norm = os.environ.get('MEDAL_BURSTSIZE_NORMALIZE', '').strip()
+    if _env_burst_norm:
+        try:
+            BURSTSIZE_NORMALIZE = bool(int(float(_env_burst_norm)))
+        except ValueError:
+            pass
+
+    BURSTSIZE_NORM_DENOM = math.log1p(MTU * SEQUENCE_LENGTH)
+    _env_burst_denom = os.environ.get('MEDAL_BURSTSIZE_NORM_DENOM', '').strip()
+    if _env_burst_denom:
+        try:
+            BURSTSIZE_NORM_DENOM = float(_env_burst_denom)
+        except ValueError:
+            pass
+    INPUT_FEATURE_DIM = len(FEATURE_NAMES)
+    USE_GLOBAL_STATS_TOKEN = False  # 启用全局统计令牌（第1025行）
+    _env_use_global = os.environ.get('MEDAL_USE_GLOBAL_STATS_TOKEN', '').strip()
+    if _env_use_global:
+        try:
+            USE_GLOBAL_STATS_TOKEN = bool(int(float(_env_use_global)))
+        except ValueError:
+            pass
+    EFFECTIVE_SEQUENCE_LENGTH = SEQUENCE_LENGTH + (1 if USE_GLOBAL_STATS_TOKEN else 0)
+    GLOBAL_STATS_MIN_PACKETS = 5  # 最少包数（少于此值统计量标记为无效）
+    
     MODEL_DIM = 32          # d_model: Embedding dimension (降低到32维)
     OUTPUT_DIM = 32         # backbone最终输出维度（下游分类/对比学习使用）
     FEATURE_DIM = OUTPUT_DIM
     EMBEDDING_DROPOUT = 0.1
     POSITIONAL_ENCODING = "sinusoidal"  # 正弦位置编码
+    
+    # 日志配置
+    FEATURE_EXTRACTION_VERBOSE = True  # 是否显示详细日志
+    FEATURE_EXTRACTION_PROGRESS_BAR = True  # 是否显示进度条
+    FEATURE_EXTRACTION_VALIDATE = True  # 是否验证特征质量
     
     # ==================== Micro-Bi-Mamba Backbone ====================
     BACKBONE_ARCH = 'dual_stream'
@@ -95,25 +139,91 @@ class Config:
     MAMBA_EXPANSION_FACTOR = 2   # E: Expansion factor
     MAMBA_CONV_KERNEL = 4        # Local conv kernel size
     MAMBA_DROPOUT = 0.1
-    MAMBA_FUSION_TYPE = "concat_project"  # "average" 或 "concat_project"
+    MAMBA_FUSION_TYPE = "gate"  # "average" 或 "concat_project"
+    _env_fusion_type = os.environ.get('MEDAL_MAMBA_FUSION_TYPE', '').strip()
+    if _env_fusion_type:
+        MAMBA_FUSION_TYPE = _env_fusion_type
     MAMBA_PROJECTION_DIM = 64    # Concat后的投影维度(32*2)
     
     # ==================== Pre-training (Stage 1) ====================
-    PRETRAIN_EPOCHS = 500  # 给 Stage 1 充分收敛时间（默认上限）
+    PRETRAIN_EPOCHS = int(float(os.environ.get('MEDAL_PRETRAIN_EPOCHS', 500)))  # 给 Stage 1 充分收敛时间（默认上限）
+
     PRETRAIN_BATCH_SIZE = 64  # 降低批次大小以适应10.75GB显存 (从128降至64)
-    PRETRAIN_BATCH_SIZE_NNCLR = 64  # NNCLR 专用批次大小（显存占用高，需要更小）
+    _env_pretrain_bs = os.environ.get('MEDAL_PRETRAIN_BATCH_SIZE', '').strip()
+    if _env_pretrain_bs:
+        try:
+            PRETRAIN_BATCH_SIZE = int(float(_env_pretrain_bs))
+        except ValueError:
+            pass
+
+    PRETRAIN_BATCH_SIZE_NNCLR = 32  # NNCLR 专用批次大小（显存占用高，需要更小）
+    _env_pretrain_bs_nnclr = os.environ.get('MEDAL_PRETRAIN_BATCH_SIZE_NNCLR', '').strip()
+    if _env_pretrain_bs_nnclr:
+        try:
+            PRETRAIN_BATCH_SIZE_NNCLR = int(float(_env_pretrain_bs_nnclr))
+        except ValueError:
+            pass
+
+    PRETRAIN_BATCH_SIZE_SIMSIAM = PRETRAIN_BATCH_SIZE  # SimSiam 默认沿用
+    _env_pretrain_bs_simsiam = os.environ.get('MEDAL_PRETRAIN_BATCH_SIZE_SIMSIAM', '').strip()
+    if _env_pretrain_bs_simsiam:
+        try:
+            PRETRAIN_BATCH_SIZE_SIMSIAM = int(float(_env_pretrain_bs_simsiam))
+        except ValueError:
+            pass
+
     PRETRAIN_GRADIENT_ACCUMULATION_STEPS = 2  # 梯度累积步数，有效批次 = 64 * 2 = 128
+    _env_pretrain_acc = os.environ.get('MEDAL_PRETRAIN_GRADIENT_ACCUMULATION_STEPS', '').strip()
+    if _env_pretrain_acc:
+        try:
+            PRETRAIN_GRADIENT_ACCUMULATION_STEPS = int(float(_env_pretrain_acc))
+        except ValueError:
+            pass
                                               # 仅用于 NNCLR，保持与其他方法相同的有效批次
     PRETRAIN_LR = 1e-3
     PRETRAIN_WEIGHT_DECAY = 1e-4
     PRETRAIN_MIN_LR = 1e-5
-    PRETRAIN_EARLY_STOPPING = True  # 启用早停机制
+
+    PRETRAIN_EARLY_STOPPING = True
+    _env_pretrain_es = os.environ.get('MEDAL_PRETRAIN_EARLY_STOPPING', '').strip()
+    if _env_pretrain_es:
+        try:
+            PRETRAIN_EARLY_STOPPING = bool(int(float(_env_pretrain_es)))
+        except ValueError:
+            pass
+
     PRETRAIN_ES_WARMUP_EPOCHS = 50
-    PRETRAIN_ES_PATIENCE = 30  # 从 20 增加到 30，更宽容的早停策略
-    PRETRAIN_ES_MIN_DELTA = 0.005  # 从 0.01 降低到 0.005，更敏感的改进检测
+    _env_pretrain_es_warmup = os.environ.get('MEDAL_PRETRAIN_ES_WARMUP_EPOCHS', '').strip()
+    if _env_pretrain_es_warmup:
+        try:
+            PRETRAIN_ES_WARMUP_EPOCHS = int(float(_env_pretrain_es_warmup))
+        except ValueError:
+            pass
+
+    PRETRAIN_ES_PATIENCE = 30
+    _env_pretrain_es_patience = os.environ.get('MEDAL_PRETRAIN_ES_PATIENCE', '').strip()
+    if _env_pretrain_es_patience:
+        try:
+            PRETRAIN_ES_PATIENCE = int(float(_env_pretrain_es_patience))
+        except ValueError:
+            pass
+
+    PRETRAIN_ES_MIN_DELTA = 0.005
+    _env_pretrain_es_min_delta = os.environ.get('MEDAL_PRETRAIN_ES_MIN_DELTA', '').strip()
+    if _env_pretrain_es_min_delta:
+        try:
+            PRETRAIN_ES_MIN_DELTA = float(_env_pretrain_es_min_delta)
+        except ValueError:
+            pass
     
     # SimMTM parameters
     SIMMTM_MASK_RATE = float(os.environ.get('MEDAL_SIMMTM_MASK_RATE', 0.5))  # 50% masking
+    PRETRAIN_NOISE_STD = float(os.environ.get('MEDAL_PRETRAIN_NOISE_STD', 0.05))  # 高斯噪声幅度
+    PRETRAIN_RECON_WEIGHT = float(os.environ.get('MEDAL_PRETRAIN_RECON_WEIGHT', 1.0))
+    PRETRAIN_LENGTH_WEIGHT = float(os.environ.get('MEDAL_PRETRAIN_LENGTH_WEIGHT', 1.0))
+    PRETRAIN_BURST_WEIGHT = float(os.environ.get('MEDAL_PRETRAIN_BURST_WEIGHT', 1.0))
+    PRETRAIN_DIRECTION_WEIGHT = float(os.environ.get('MEDAL_PRETRAIN_DIRECTION_WEIGHT', 1.0))
+    PRETRAIN_VALIDMASK_WEIGHT = float(os.environ.get('MEDAL_PRETRAIN_VALIDMASK_WEIGHT', 0.5))
 
     AUG_CROP_PROB = float(os.environ.get('MEDAL_AUG_CROP_PROB', 0.8))
     AUG_JITTER_PROB = float(os.environ.get('MEDAL_AUG_JITTER_PROB', 0.6))
@@ -136,22 +246,75 @@ class Config:
 
     CONTRASTIVE_METHOD = os.getenv("MEDAL_CONTRASTIVE_METHOD", "infonce").lower()
     NNCLR_QUEUE_SIZE = 4096
-    NNCLR_MIN_SIMILARITY = 0.0
-    NNCLR_WARMUP_EPOCHS = 0
+    _env_nnclr_queue = os.environ.get('MEDAL_NNCLR_QUEUE_SIZE', '').strip()
+    if _env_nnclr_queue:
+        try:
+            NNCLR_QUEUE_SIZE = int(float(_env_nnclr_queue))
+        except ValueError:
+            pass
+    NNCLR_MIN_SIMILARITY = 0.2
+    _env_nnclr_min_sim = os.environ.get('MEDAL_NNCLR_MIN_SIMILARITY', '').strip()
+    if _env_nnclr_min_sim:
+        try:
+            NNCLR_MIN_SIMILARITY = float(_env_nnclr_min_sim)
+        except ValueError:
+            pass
+
+    NNCLR_WARMUP_EPOCHS = 10
+    _env_nnclr_warm = os.environ.get('MEDAL_NNCLR_WARMUP_EPOCHS', '').strip()
+    if _env_nnclr_warm:
+        try:
+            NNCLR_WARMUP_EPOCHS = int(float(_env_nnclr_warm))
+        except ValueError:
+            pass
     
     # InfoNCE参数
     # 修复说明：调整温度和权重，优化对比学习收敛性
     # 温度从 0.3 增加到 0.5：让损失更平滑，更容易收敛到较低值
-    # 权重保持 0.3：平衡 SimMTM 和 InfoNCE 的贡献
-    INFONCE_TEMPERATURE = 0.5  # 温度系数τ（从0.3增到0.5，让损失更平滑易收敛）
-    INFONCE_LAMBDA = 0.5  # InfoNCE损失权重（保持0.3，让SimMTM主导）
+    # 权重调低到 0.3：让重构/判别两路更平衡
+    INFONCE_TEMPERATURE = 0.2  # 温度系数τ（更强判别，通常更利于对比学习）
+    _env_tau = os.environ.get('MEDAL_INFONCE_TEMPERATURE', '').strip()
+    if _env_tau:
+        try:
+            INFONCE_TEMPERATURE = float(_env_tau)
+        except ValueError:
+            pass
+
+    INFONCE_LAMBDA = 0.5  # 对比学习损失权重（SimMTM++ 与对比学习更平衡的默认值）
+    _env_lambda = os.environ.get('MEDAL_INFONCE_LAMBDA', '').strip()
+    if _env_lambda:
+        try:
+            INFONCE_LAMBDA = float(_env_lambda)
+        except ValueError:
+            pass
+    
     
     # 流量增强参数
     # 修复说明：降低增强强度，避免破坏关键特征
     # 原因：过强的增强(80%裁剪)可能破坏恶意样本特征，导致Recall下降12.1%
     TRAFFIC_AUG_CROP_PROB = 0.5  # 时序裁剪概率（从0.8降到0.5）
+    _env_t_crop = os.environ.get('MEDAL_TRAFFIC_AUG_CROP_PROB', '').strip()
+    if _env_t_crop:
+        try:
+            TRAFFIC_AUG_CROP_PROB = float(_env_t_crop)
+        except ValueError:
+            pass
+
     TRAFFIC_AUG_JITTER_PROB = 0.4  # 时序抖动概率（从0.6降到0.4）
+    _env_t_jitter = os.environ.get('MEDAL_TRAFFIC_AUG_JITTER_PROB', '').strip()
+    if _env_t_jitter:
+        try:
+            TRAFFIC_AUG_JITTER_PROB = float(_env_t_jitter)
+        except ValueError:
+            pass
+
     TRAFFIC_AUG_MASK_PROB = 0.3  # 通道掩码概率（从0.5降到0.3）
+    _env_t_mask = os.environ.get('MEDAL_TRAFFIC_AUG_MASK_PROB', '').strip()
+    if _env_t_mask:
+        try:
+            TRAFFIC_AUG_MASK_PROB = float(_env_t_mask)
+        except ValueError:
+            pass
     TRAFFIC_AUG_CROP_MIN_RATIO = 0.5  # 最小裁剪比例
     TRAFFIC_AUG_CROP_MAX_RATIO = 0.9  # 最大裁剪比例
     TRAFFIC_AUG_JITTER_STD = 0.1  # 抖动标准差
@@ -161,7 +324,20 @@ class Config:
     # 模拟真实网络环境中的拥塞，导致突发大小和边界发生微小变化
     # 防止模型死记硬背具体的 Burst 数值
     TRAFFIC_AUG_BURST_JITTER_PROB = 0.5  # Burst 抖动概率
+    _env_bj_p = os.environ.get('MEDAL_TRAFFIC_AUG_BURST_JITTER_PROB', '').strip()
+    if _env_bj_p:
+        try:
+            TRAFFIC_AUG_BURST_JITTER_PROB = float(_env_bj_p)
+        except ValueError:
+            pass
+
     TRAFFIC_AUG_BURST_JITTER_STD = 0.05  # Burst 抖动标准差（±5%）
+    _env_bj_std = os.environ.get('MEDAL_TRAFFIC_AUG_BURST_JITTER_STD', '').strip()
+    if _env_bj_std:
+        try:
+            TRAFFIC_AUG_BURST_JITTER_STD = float(_env_bj_std)
+        except ValueError:
+            pass
     
     # ==================== Label Correction (Stage 2) ====================
     # CL (Confident Learning)
@@ -266,9 +442,10 @@ class Config:
     MASK_PROBABILITY = 0.5
     MASK_LAMBDA = 0.1
     
-    # Feature indices for conditioning
-    COND_FEATURE_INDICES = [2, 5]
-    DEP_FEATURE_INDICES = [0, 1, 3, 4]
+    # Feature indices for conditioning (Lite4):
+    # Cond: Direction, ValidMask; Dep: Length, BurstSize
+    COND_FEATURE_INDICES = [i for i in (DIRECTION_INDEX, VALID_MASK_INDEX) if i is not None]
+    DEP_FEATURE_INDICES = [i for i in (LENGTH_INDEX, BURST_SIZE_INDEX) if i is not None]
 
     ENABLE_COVARIANCE_MATCHING = False
     ENABLE_DISCRETE_QUANTIZATION = False
@@ -284,6 +461,13 @@ class Config:
     # ==================== 温室训练+战场校准策略 ====================
     # Stage 3训练策略：强制1:1平衡采样（温室训练）
     USE_BALANCED_SAMPLING = True  # 启用WeightedRandomSampler强制1:1平衡
+    BALANCED_SAMPLING_RATIO = 1.0  # 目标 正常:恶意 比例 (ratio<1.0 将提高恶意权重)
+    _env_balanced_ratio = os.environ.get('MEDAL_BALANCED_SAMPLING_RATIO', '').strip()
+    if _env_balanced_ratio:
+        try:
+            BALANCED_SAMPLING_RATIO = float(_env_balanced_ratio)
+        except ValueError:
+            pass
     
     # Validation set splitting for threshold optimization
     # Mixed validation set: 20% original + 10% synthetic
@@ -392,31 +576,37 @@ class Config:
     STAGE3_HARD_MINING_NEG_PROB_MIN = 0.60
 
     # Stage 3: Optional backbone fine-tuning
-    # Default keeps the original design (frozen backbone) for stability.
+    # 默认启用骨干网络微调以获得最佳性能（基于实验结果：F1 0.7735 vs 0.7350）
+    # 强制启用以确保最优性能
+    FINETUNE_BACKBONE = True  # 强制启用（最优配置）
+    FINETUNE_BACKBONE_SCOPE = 'projection'  # 只微调 projection head
+    FINETUNE_BACKBONE_LR = 2e-5  # 最优学习率
+    FINETUNE_BACKBONE_WARMUP_EPOCHS = 30  # 前30轮冻结骨干网络
+    
+    # 允许环境变量覆盖（如果需要关闭）
     _env_ft = os.environ.get('MEDAL_FINETUNE_BACKBONE', '').strip().lower()
-    if _env_ft in ('1', 'true', 'yes', 'y', 'on'):
+    if _env_ft in ('0', 'false', 'no', 'n', 'off'):
+        FINETUNE_BACKBONE = False
+    elif _env_ft in ('1', 'true', 'yes', 'y', 'on'):
         FINETUNE_BACKBONE = True
-    elif _env_ft in ('0', 'false', 'no', 'n', 'off'):
-        FINETUNE_BACKBONE = False
-    else:
-        FINETUNE_BACKBONE = False
-    # Scope options:
-    # - 'projection': only train the bidirectional projection head
-    # - 'all': train the whole backbone
+    
     _env_scope = os.environ.get('MEDAL_FINETUNE_BACKBONE_SCOPE', '').strip().lower()
     if _env_scope in ('projection', 'all'):
         FINETUNE_BACKBONE_SCOPE = _env_scope
-    else:
-        FINETUNE_BACKBONE_SCOPE = 'projection'
-    # Use a smaller LR for backbone to avoid catastrophic forgetting
+    
     _env_lr = os.environ.get('MEDAL_FINETUNE_BACKBONE_LR', '').strip()
     if _env_lr:
         try:
             FINETUNE_BACKBONE_LR = float(_env_lr)
         except ValueError:
             pass
-    else:
-        FINETUNE_BACKBONE_LR = 1e-5
+    
+    _env_ft_warmup = os.environ.get('MEDAL_FINETUNE_BACKBONE_WARMUP_EPOCHS', '').strip()
+    if _env_ft_warmup:
+        try:
+            FINETUNE_BACKBONE_WARMUP_EPOCHS = int(float(_env_ft_warmup))
+        except ValueError:
+            pass
 
     LABEL_SMOOTHING = 0.1
     CONSISTENCY_TEMPERATURE = 2.0
@@ -424,10 +614,10 @@ class Config:
     
     # Dynamic loss weights (Linear schedule)
     # 降低正交约束权重，避免过度分离
-    SOFT_ORTH_WEIGHT_START = 0.5   # 从 1.0 降到 0.5
-    SOFT_ORTH_WEIGHT_END = 0.01
+    SOFT_ORTH_WEIGHT_START = 0.0
+    SOFT_ORTH_WEIGHT_END = 0.0
     CONSISTENCY_WEIGHT_START = 0.0
-    CONSISTENCY_WEIGHT_END = 0.5   # 从 1.0 降到 0.5，减少强制一致性
+    CONSISTENCY_WEIGHT_END = 0.0
     
     # Co-teaching
     CO_TEACHING_SELECT_RATE = 0.7  # Select top 70% low-loss samples
@@ -452,13 +642,12 @@ class Config:
     # 修改：alpha=0.5 表示两类平等，避免对恶意类过度偏好
     # 原 alpha=0.25 导致恶意类权重是良性类的 3 倍，造成过度分离
     FOCAL_ALPHA = 0.5              # Alpha for malicious class (改为 0.5，两类平等)
-    _env_focal_alpha = os.environ.get('MEDAL_FOCAL_ALPHA', '').strip()
-    if _env_focal_alpha:
-        try:
-            FOCAL_ALPHA = float(_env_focal_alpha)
-        except ValueError:
-            pass
     FOCAL_GAMMA = 2.0              # Gamma parameter (focus on hard examples)
+
+    USE_BCE_LOSS = False
+    BCE_POS_WEIGHT = 1.0
+    BCE_LABEL_SMOOTHING = 0.0
+    SUP_LOSS_SCALE = 1.0
     
     # Soft F1 Loss: 直接优化 Binary F1-Score
     # ⚠️ 注意：在 1:1 平衡训练集上，Soft F1 Loss 可能导致过度分离
@@ -466,26 +655,9 @@ class Config:
     USE_SOFT_F1_LOSS = False        # 启用 Soft F1 Loss
     SOFT_F1_WEIGHT = 0.1           # 从 0.5 降到 0.3，减少 F1 Loss 的影响
 
-    USE_LOGIT_MARGIN = True
-    _env_logit_margin = os.environ.get('MEDAL_USE_LOGIT_MARGIN', '').strip().lower()
-    if _env_logit_margin in ('1', 'true', 'yes', 'y', 'on'):
-        USE_LOGIT_MARGIN = True
-    elif _env_logit_margin in ('0', 'false', 'no', 'n', 'off'):
-        USE_LOGIT_MARGIN = False
+    USE_LOGIT_MARGIN = False
     LOGIT_MARGIN_M = 0.25
-    _env_logit_m = os.environ.get('MEDAL_LOGIT_MARGIN_M', '').strip()
-    if _env_logit_m:
-        try:
-            LOGIT_MARGIN_M = float(_env_logit_m)
-        except ValueError:
-            pass
     LOGIT_MARGIN_WARMUP_EPOCHS = 30
-    _env_logit_warm = os.environ.get('MEDAL_LOGIT_MARGIN_WARMUP_EPOCHS', '').strip()
-    if _env_logit_warm:
-        try:
-            LOGIT_MARGIN_WARMUP_EPOCHS = int(float(_env_logit_warm))
-        except ValueError:
-            pass
     
     # Margin Loss (ArcFace-style): adds margin between classes
     # Disabled initially to avoid probability distortion (can re-enable after model stabilizes)
@@ -613,6 +785,12 @@ class Config:
         DEVICE = torch.device("cpu")
     NUM_WORKERS = 4
     SEED = 42
+    _env_seed = os.environ.get('MEDAL_SEED', '').strip()
+    if _env_seed:
+        try:
+            SEED = int(float(_env_seed))
+        except ValueError:
+            pass
     
     # Learning rate scheduler
     LR_SCHEDULER = "cosine"  # 'cosine' or 'step'

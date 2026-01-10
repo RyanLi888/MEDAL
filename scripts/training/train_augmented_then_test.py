@@ -1,7 +1,7 @@
 """
-MEDAL-Lite 干净数据训练+测试脚本 (重构版)
+MEDAL-Lite 数据增强训练+测试脚本 (重构版)
 =========================================
-使用干净标签（无噪声）训练分类器，复用主流程代码
+使用真实标签 + TabDDPM数据增强训练分类器，复用主流程代码
 """
 import os
 import sys
@@ -31,7 +31,7 @@ try:
 except Exception:
     PREPROCESS_AVAILABLE = False
 
-from scripts.training.train import stage3_finetune_classifier
+from scripts.training.train import stage2_label_correction_and_augmentation, stage3_finetune_classifier
 from scripts.testing.test import main as test_main
 
 
@@ -56,8 +56,7 @@ def _load_train_dataset():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="干净数据训练+测试")
-    parser.add_argument('--use_ground_truth', action='store_true', help='使用真实标签')
+    parser = argparse.ArgumentParser(description="数据增强训练+测试")
     parser.add_argument('--retrain_backbone', action='store_true', help='重新训练骨干网络')
     parser.add_argument('--backbone_path', type=str, default='', help='骨干网络路径')
     parser.add_argument('--seed', type=int, default=42)
@@ -66,50 +65,52 @@ def main():
 
     set_seed(args.seed)
     config.create_dirs()
-    logger = setup_logger(os.path.join(config.OUTPUT_ROOT, 'logs'), name='clean_train_test')
+    logger = setup_logger(os.path.join(config.OUTPUT_ROOT, 'logs'), name='augmented_train_test')
 
-    # 配置：使用最优参数（干净数据模式）
+    # 配置：使用最优参数
     config.USE_FOCAL_LOSS = True
     config.USE_BCE_LOSS = False
     config.USE_SOFT_F1_LOSS = False
     config.STAGE3_ONLINE_AUGMENTATION = False
     config.STAGE3_USE_ST_MIXUP = False
-    config.FINETUNE_BACKBONE = True  # 启用骨干微调
+    config.FINETUNE_BACKBONE = False  # 特征空间数据不支持骨干微调
     config.FINETUNE_VAL_SPLIT = 0.0
     config.FINETUNE_ES_ALLOW_TRAIN_METRIC = True
-    config.STAGE3_MIXED_STREAM = False  # 干净数据模式不使用混合训练
-    config.CLASSIFIER_INPUT_IS_FEATURES = False  # 输入是原始序列，不是特征
 
     run_tag = args.run_tag.strip() or datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = os.path.join(config.LABEL_CORRECTION_DIR, 'analysis', 'clean_only_runs', run_tag)
+    run_dir = os.path.join(config.LABEL_CORRECTION_DIR, 'analysis', 'augmented_runs', run_tag)
     _safe_makedirs(run_dir)
     
     # 隔离输出目录
     original_classification_dir = config.CLASSIFICATION_DIR
     original_result_dir = config.RESULT_DIR
+    original_data_aug_dir = config.DATA_AUGMENTATION_DIR
+    
     config.CLASSIFICATION_DIR = os.path.join(run_dir, 'classification')
     config.RESULT_DIR = os.path.join(run_dir, 'result')
+    config.DATA_AUGMENTATION_DIR = os.path.join(run_dir, 'data_augmentation')
     
-    for d in [config.CLASSIFICATION_DIR, config.RESULT_DIR]:
+    for d in [config.CLASSIFICATION_DIR, config.RESULT_DIR, config.DATA_AUGMENTATION_DIR]:
         _safe_makedirs(d)
         _safe_makedirs(os.path.join(d, 'models'))
         _safe_makedirs(os.path.join(d, 'figures'))
         _safe_makedirs(os.path.join(d, 'logs'))
 
     try:
-        log_section_header(logger, "🚀 干净数据训练+测试模式")
+        log_section_header(logger, "🚀 数据增强训练+测试模式（消融实验）")
         logger.info(f'运行目录: {run_dir}')
         logger.info(f'时间戳: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
         logger.info('')
         logger.info('📋 训练模式说明:')
-        logger.info('  - 数据来源: 纯原始训练数据（无增强）')
+        logger.info('  - 数据来源: 原始数据 + TabDDPM增强数据')
         logger.info('  - 标签: 真实标签（无噪声）')
-        logger.info('  - 标签矫正: 跳过')
-        logger.info('  - 数据增强: 跳过')
-        logger.info('  - 骨干微调: 启用（使用原始序列）')
+        logger.info('  - 标签矫正: 跳过（使用真实标签）')
+        logger.info('  - 数据增强: TabDDPM（特征空间）')
+        logger.info('  - 骨干微调: 取决于混合训练模式')
         logger.info('')
         
         # 输出配置
+        config.log_stage_config(logger, "Stage 2")
         config.log_stage_config(logger, "Stage 3")
         
         # 加载数据
@@ -125,8 +126,8 @@ def main():
             "训练样本总数": len(X_train),
             "正常样本": int((y_corrected == 0).sum()),
             "恶意样本": int((y_corrected == 1).sum()),
-            "数据类型": "原始序列（支持骨干微调）"
-        }, "训练数据统计")
+            "数据类型": "原始序列（将进行特征空间增强）"
+        }, "原始训练数据统计")
         
         # 加载骨干网络
         backbone = build_backbone(config, logger=logger)
@@ -144,10 +145,31 @@ def main():
             logger.warning('⚠ 使用随机初始化骨干网络')
             backbone.freeze()
         
+        # Stage 2: 数据增强（跳过标签矫正）
+        Z_aug, y_aug, w_aug, correction_stats, tabddpm, n_original = stage2_label_correction_and_augmentation(
+            backbone, X_train, y_corrected, y_corrected, config, logger,
+            stage2_mode='clean_augment_only'
+        )
+
         # Stage 3: 分类器训练
+        # 加载原始序列用于混合训练
+        real_kept_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "real_kept_data.npz")
+        X_real = None
+        use_mixed_stream = bool(getattr(config, 'STAGE3_MIXED_STREAM', True))
+        
+        if os.path.exists(real_kept_path) and use_mixed_stream:
+            logger.info(f'✓ 加载原始序列: {real_kept_path}')
+            real_data = np.load(real_kept_path)
+            X_real = real_data['X_real']
+            logger.info(f'  - 原始序列形状: {X_real.shape}')
+        else:
+            use_mixed_stream = False
+            logger.info('⚠️ 混合训练模式已禁用')
+
         stage3_finetune_classifier(
-            backbone, X_train, y_corrected, correction_weight,
-            config, logger, n_original=len(X_train), backbone_path=backbone_path
+            backbone, Z_aug, y_aug, w_aug, config, logger,
+            n_original=n_original, backbone_path=backbone_path,
+            X_train_real=X_real, use_mixed_stream=use_mixed_stream
         )
 
         # 测试
@@ -175,6 +197,7 @@ def main():
     finally:
         config.CLASSIFICATION_DIR = original_classification_dir
         config.RESULT_DIR = original_result_dir
+        config.DATA_AUGMENTATION_DIR = original_data_aug_dir
 
 
 if __name__ == '__main__':

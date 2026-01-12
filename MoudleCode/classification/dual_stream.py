@@ -105,39 +105,141 @@ class DualStreamMLP(nn.Module):
         return w_a, w_b
 
 class DualStreamLoss(nn.Module):
+    """
+    Dual-Stream Loss with Co-teaching Support
+    
+    Supports:
+    - Focal Loss for both streams
+    - Co-teaching: mutual sample selection between two streams
+    - Dynamic sample selection rate
+    """
+    
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.ce_loss = nn.CrossEntropyLoss(reduction='none')
         self.focal_alpha = float(getattr(config, 'FOCAL_ALPHA', 0.5))
         self.focal_gamma = float(getattr(config, 'FOCAL_GAMMA', 2.0))
+        
+        # Co-teaching parameters
+        self.use_co_teaching = getattr(config, 'USE_CO_TEACHING', False)
+        self.co_teaching_warmup = getattr(config, 'CO_TEACHING_WARMUP_EPOCHS', 10)
+        self.co_teaching_select_rate = getattr(config, 'CO_TEACHING_SELECT_RATE', 0.7)
+        self.co_teaching_dynamic = getattr(config, 'CO_TEACHING_DYNAMIC_RATE', True)
+        self.co_teaching_noise_rate = getattr(config, 'CO_TEACHING_NOISE_RATE', 0.3)
+        
+        # Track last logged epoch to avoid duplicate logging
+        self._last_logged_epoch = -1
+        
+        if self.use_co_teaching:
+            logger.info("✓ Co-teaching enabled:")
+            logger.info(f"  - Warmup epochs: {self.co_teaching_warmup}")
+            logger.info(f"  - Base select rate: {self.co_teaching_select_rate}")
+            logger.info(f"  - Dynamic rate: {self.co_teaching_dynamic}")
+            if self.co_teaching_dynamic:
+                logger.info(f"  - Assumed noise rate: {self.co_teaching_noise_rate}")
 
     def focal_loss(self, logits, labels):
+        """Focal Loss computation"""
         ce_loss = self.ce_loss(logits, labels)
         pt = torch.exp(-ce_loss)
         alpha_t = self.focal_alpha * labels + (1 - self.focal_alpha) * (1 - labels)
         alpha_t = alpha_t.to(labels.device)
         return alpha_t * (1 - pt) ** self.focal_gamma * ce_loss
 
+    def get_select_rate(self, epoch, total_epochs):
+        """
+        Calculate dynamic selection rate for co-teaching
+        
+        Strategy:
+        - Warmup phase: gradually decrease from 1.0 to target rate
+        - Stable phase: use fixed target rate
+        """
+        if not self.co_teaching_dynamic:
+            return self.co_teaching_select_rate
+        
+        if epoch < self.co_teaching_warmup:
+            # Warmup: linearly decrease from 1.0
+            ratio = epoch / self.co_teaching_warmup
+            select_rate = 1.0 - self.co_teaching_noise_rate * ratio
+        else:
+            # Stable: use target rate (1.0 - noise_rate)
+            select_rate = 1.0 - self.co_teaching_noise_rate
+        
+        # Ensure select_rate is within reasonable bounds
+        select_rate = max(0.5, min(1.0, select_rate))
+        return select_rate
+
     def forward(self, model, z, labels, sample_weights, epoch, total_epochs):
+        """
+        Forward pass with optional co-teaching
+        
+        Args:
+            model: DualStreamMLP model
+            z: (B, D) - input features
+            labels: (B,) - ground truth labels
+            sample_weights: (B,) - sample weights (can be None)
+            epoch: current epoch (0-indexed)
+            total_epochs: total training epochs
+            
+        Returns:
+            total_loss: scalar loss
+            loss_dict: dictionary of loss components
+        """
+        # Get separate logits from two streams
         logits_a, logits_b = model(z, return_separate=True)
 
+        # Ensure sample_weights is on correct device
         if sample_weights is None:
             sample_weights = torch.ones_like(labels, dtype=torch.float32, device=z.device)
         else:
             sample_weights = sample_weights.to(device=z.device, dtype=torch.float32)
 
-        loss_a_per_sample = self.focal_loss(logits_a, labels)
-        loss_b_per_sample = self.focal_loss(logits_b, labels)
+        # Compute per-sample losses
+        loss_a_per_sample = self.focal_loss(logits_a, labels)  # (B,)
+        loss_b_per_sample = self.focal_loss(logits_b, labels)  # (B,)
+        
+        # Co-teaching: mutual sample selection
+        if self.use_co_teaching and epoch >= self.co_teaching_warmup:
+            B = labels.size(0)
+            select_rate = self.get_select_rate(epoch, total_epochs)
+            num_select = max(1, int(B * select_rate))
+            
+            # Stream A selects samples for Stream B
+            # Select samples with smallest loss from A's perspective
+            _, idx_a_select = torch.topk(loss_a_per_sample, num_select, largest=False)
+            loss_b_selected = loss_b_per_sample[idx_a_select]
+            weights_b_selected = sample_weights[idx_a_select]
+            
+            # Stream B selects samples for Stream A
+            # Select samples with smallest loss from B's perspective
+            _, idx_b_select = torch.topk(loss_b_per_sample, num_select, largest=False)
+            loss_a_selected = loss_a_per_sample[idx_b_select]
+            weights_a_selected = sample_weights[idx_b_select]
+            
+            # Apply sample weights to selected samples
+            sup_loss_a = (loss_a_selected * weights_a_selected).mean()
+            sup_loss_b = (loss_b_selected * weights_b_selected).mean()
+            
+            # Log co-teaching info (only once per epoch to avoid spam)
+            if epoch != self._last_logged_epoch and epoch % 50 == 0:
+                self._last_logged_epoch = epoch
+                logger.info(f"  [Co-teaching] Epoch {epoch}: select_rate={select_rate:.3f}, "
+                          f"num_select={num_select}/{B}")
+        else:
+            # Standard training: use all samples
+            sup_loss_a = (loss_a_per_sample * sample_weights).mean()
+            sup_loss_b = (loss_b_per_sample * sample_weights).mean()
 
-        sup_loss_a = (loss_a_per_sample * sample_weights).mean()
-        sup_loss_b = (loss_b_per_sample * sample_weights).mean()
+        # Combine losses from both streams
         loss_sup = 0.5 * (sup_loss_a + sup_loss_b)
         total_loss = loss_sup
 
         loss_dict = {
             'total': total_loss.item(),
             'supervision': loss_sup.item(),
+            'stream_a': sup_loss_a.item(),
+            'stream_b': sup_loss_b.item(),
         }
 
         return total_loss, loss_dict

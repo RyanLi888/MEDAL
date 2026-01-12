@@ -441,11 +441,25 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
 
     ddpm_lr = float(getattr(config, 'DDPM_LR', 5e-4))
     optimizer_ddpm = optim.AdamW(tabddpm.parameters(), lr=ddpm_lr)
-    n_epochs_ddpm = int(getattr(config, 'DDPM_EPOCHS', 100))
+    
+    # 学习率调度器（v2.3新增）
+    ddpm_lr_scheduler_type = getattr(config, 'DDPM_LR_SCHEDULER', None)
+    ddpm_scheduler = None
+    if ddpm_lr_scheduler_type == 'cosine':
+        ddpm_min_lr = float(getattr(config, 'DDPM_MIN_LR', 1e-5))
+        n_epochs_ddpm = int(getattr(config, 'DDPM_EPOCHS', 100))
+        ddpm_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer_ddpm, T_max=n_epochs_ddpm, eta_min=ddpm_min_lr
+        )
+        logger.info(f"✓ TabDDPM学习率调度器: Cosine Annealing (lr={ddpm_lr} → {ddpm_min_lr})")
+    else:
+        n_epochs_ddpm = int(getattr(config, 'DDPM_EPOCHS', 100))
+    
     ddpm_use_early_stopping = bool(getattr(config, 'DDPM_EARLY_STOPPING', True))
     ddpm_es_warmup_epochs = int(getattr(config, 'DDPM_ES_WARMUP_EPOCHS', 20))
     ddpm_es_patience = int(getattr(config, 'DDPM_ES_PATIENCE', 30))
     ddpm_es_min_delta = float(getattr(config, 'DDPM_ES_MIN_DELTA', 0.001))
+    ddpm_es_smooth_window = int(getattr(config, 'DDPM_ES_SMOOTH_WINDOW', 5))
 
     dataset_ddpm = TensorDataset(torch.FloatTensor(Z_clean), torch.LongTensor(y_clean))
     loader_ddpm = DataLoader(dataset_ddpm, batch_size=2048, shuffle=True)
@@ -454,6 +468,7 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
     ddpm_best_epoch = -1
     ddpm_best_state = None
     ddpm_no_improve = 0
+    ddpm_loss_history = []  # 用于平滑窗口的损失历史
 
     tabddpm.train()
     for epoch in range(n_epochs_ddpm):
@@ -473,11 +488,29 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
             epoch_loss += float(loss.item())
 
         avg_loss = epoch_loss / max(len(loader_ddpm), 1)
-        logger.info(f"[TabDDPM] Epoch [{epoch+1}/{n_epochs_ddpm}] | Loss: {avg_loss:.4f}")
+        ddpm_loss_history.append(avg_loss)
+        
+        # 计算平滑损失（移动平均）
+        if len(ddpm_loss_history) >= ddpm_es_smooth_window:
+            smoothed_loss = float(np.mean(ddpm_loss_history[-ddpm_es_smooth_window:]))
+        else:
+            smoothed_loss = avg_loss
+        
+        # 学习率调度（v2.3新增）
+        if ddpm_scheduler is not None:
+            ddpm_scheduler.step()
+            current_lr = optimizer_ddpm.param_groups[0]['lr']
+            if (epoch + 1) % 100 == 0:  # 每100轮记录一次学习率
+                logger.info(f"[TabDDPM] Epoch [{epoch+1}/{n_epochs_ddpm}] | Loss: {avg_loss:.4f} | Smoothed: {smoothed_loss:.4f} | LR: {current_lr:.6f}")
+            else:
+                logger.info(f"[TabDDPM] Epoch [{epoch+1}/{n_epochs_ddpm}] | Loss: {avg_loss:.4f} | Smoothed: {smoothed_loss:.4f}")
+        else:
+            logger.info(f"[TabDDPM] Epoch [{epoch+1}/{n_epochs_ddpm}] | Loss: {avg_loss:.4f} | Smoothed: {smoothed_loss:.4f}")
 
-        improved = (ddpm_best_loss - float(avg_loss)) > ddpm_es_min_delta
+        # 使用平滑损失进行早停判断
+        improved = (ddpm_best_loss - smoothed_loss) > ddpm_es_min_delta
         if improved:
-            ddpm_best_loss = float(avg_loss)
+            ddpm_best_loss = smoothed_loss
             ddpm_best_epoch = int(epoch + 1)
             ddpm_best_state = {k: v.detach().cpu().clone() for k, v in tabddpm.state_dict().items()}
             ddpm_no_improve = 0
@@ -485,7 +518,7 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
             ddpm_no_improve += 1
 
         if ddpm_use_early_stopping and (epoch + 1) >= ddpm_es_warmup_epochs and ddpm_no_improve >= ddpm_es_patience:
-            log_early_stopping(logger, epoch+1, ddpm_best_epoch, ddpm_best_loss, avg_loss, ddpm_no_improve, ddpm_es_patience)
+            log_early_stopping(logger, epoch+1, ddpm_best_epoch, ddpm_best_loss, smoothed_loss, ddpm_no_improve, ddpm_es_patience)
             break
 
     if ddpm_best_state is not None:

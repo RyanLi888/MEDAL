@@ -1,5 +1,5 @@
 """
-MEDAL-Lite 统一配置文件 (重构版 v2)
+MEDAL-Lite 统一配置文件 (重构版 v2.6)
 =================================
 按照训练流程 Stage 1/2/3 组织，使用最优训练结果的配置
 
@@ -21,6 +21,45 @@ MEDAL-Lite 统一配置文件 (重构版 v2)
 - 混合训练: 32 real + 96 synthetic batches
 - 骨干微调: 关闭（冻结骨干网络）
 - 损失权重: real=2.0, synthetic=1.0
+- Co-teaching: 禁用（数据无标签噪声）
+- 训练轮数: 1000 epochs
+
+更新日志（v2.6 - 2026-01-11）：
+- 数据增强策略优化：
+  * 新增Mixup增强：在TabDDPM生成后应用特征空间插值
+  * 类别自适应Mixup：正常类alpha=0.1（弱混合），恶意类alpha=0.3（强混合）
+  * 困难样本挖掘：预留接口（需要预训练模型）
+  * 预期效果: F1提升至0.90+（当前0.858）
+
+更新日志（v2.5 - 2026-01-11）：
+- 类别特定增强模式：
+  * 支持按类别设置不同的增强倍数
+  * 当前配置：正常2x，恶意1x（2:1策略）
+  * 预期结果: 750正常 + 500恶意 = 1250 (60%正常, 40%恶意)
+- TabDDPM质量优化：
+  * 恢复旧学习率参数（5e-4, min_lr=1e-5）以提高生成质量
+  * 减少平滑窗口（5→3）提高早停敏感度
+  * 增加质量检查：IQR离群点过滤（最大5%离群点）
+  * 提高模板质量要求（0.7→0.8）
+
+更新日志（v2.3 - 2026-01-11）：
+- TabDDPM优化（组合1 - 保守优化）：
+  * 增加模型容量: [64,128,64] → [128,256,256,128]（4层网络）
+  * 优化学习率: 5e-4 → 8e-4，添加余弦退火调度器
+  * 增加训练轮数: 800 → 1000 epochs
+  * 增加早停耐心值: 50 → 80（避免过早停止）
+  * 预期效果: 最佳损失降至0.28-0.32，F1提升1-2%
+
+更新日志（v2.2 - 2026-01-11）：
+- 禁用Co-teaching：数据使用真实标签（无噪声），Co-teaching会错误丢弃干净样本
+- 恢复训练轮数：1000 epochs（与最优配置一致）
+- 修正噪声率：CO_TEACHING_NOISE_RATE = 0.0（反映真实数据状态）
+
+问题诊断（20260111_130936失败原因）：
+- Co-teaching在无噪声数据上启用，错误丢弃20-30%干净样本
+- 导致性能下降：F1从0.9026降至0.8716（-3.1%）
+- 最优阈值异常：从0.7579升至0.9616（模型过于保守）
+- 训练不足：800 epochs vs 1000 epochs（最优配置）
 """
 
 import torch
@@ -239,13 +278,20 @@ class Config:
     HYBRIDCOURT_DENSITY_HIGH_PCT = 90.0
     HYBRIDCOURT_DENSITY_LOW_PCT = 50.0
 
-    # 2.2 TabDDPM 数据增强（特征空间生成）- 最优配置
+    # 2.2 TabDDPM 数据增强（特征空间生成）- 优化版 v2.5
     STAGE2_USE_TABDDPM = True               # 启用TabDDPM
     STAGE2_TABDDPM_SPACE = 'feature'        # 在特征空间增强
     
-    # 增强倍数策略（最优配置：5x）
-    STAGE2_FEATURE_AUG_MULTIPLIER = 5       # 固定增强倍数（5x）
-    AUGMENTATION_MODE = 'fixed'             # 固定倍数模式
+    # 增强倍数策略（v2.5：按类别差异化增强，模拟测试集分布）
+    AUGMENTATION_MODE = 'class_specific'    # 类别特定模式（新增）
+    STAGE2_FEATURE_AUG_MULTIPLIER = 2       # 默认增强倍数（向后兼容）
+    
+    # 类别特定增强倍数（2:1 策略 - 正常:恶意 = 2:1）
+    STAGE2_BENIGN_AUG_MULTIPLIER = 6        # 正常样本增强2x（250→750，适度增强）
+    STAGE2_MALICIOUS_AUG_MULTIPLIER = 3     # 恶意样本增强1x（250→500，保持学习能力）
+    # 预期结果: 750正常 + 500恶意 = 1250 (60%正常, 40%恶意)
+    
+    # 向后兼容：固定倍数模式
     AUGMENTATION_RATIO_MIN = 1              # 最小倍数
     AUGMENTATION_RATIO_MAX = 1              # 最大倍数
     
@@ -256,18 +302,21 @@ class Config:
     STAGE2_FEATURE_TIER2_MULTIPLIER = 5     # Tier2增强倍数
     STAGE2_FEATURE_LOWCONF_MULTIPLIER = 0   # 低置信度样本不增强
     
-    # TabDDPM 训练参数（针对小数据集优化）
-    DDPM_EPOCHS = 800                       # 训练轮数
-    DDPM_LR = 5e-4                          # 学习率
+    # TabDDPM 训练参数（优化版 v2.5 - 恢复旧参数以提高生成质量）
+    DDPM_EPOCHS = 1500                      # 训练轮数（保持1500）
+    DDPM_LR = 5e-4                          # 初始学习率（恢复旧值：3e-4→5e-4，加快收敛）
+    DDPM_LR_SCHEDULER = 'cosine'            # 学习率调度器
+    DDPM_MIN_LR = 1e-5                      # 最小学习率（恢复旧值：5e-6→1e-5）
     DDPM_TIMESTEPS = 1000                   # 扩散步数
-    DDPM_HIDDEN_DIMS = [64, 128, 64]        # 隐藏层维度
-    DDPM_SAMPLING_STEPS = 50                # DDIM采样步数
+    DDPM_HIDDEN_DIMS = [128, 256, 256, 128] # 隐藏层维度（保持容量）
+    DDPM_SAMPLING_STEPS = 150               # DDIM采样步数（保持150，更精细生成）
     
-    # TabDDPM 早停机制
+    # TabDDPM 早停机制（v2.5：减少平滑窗口，更敏感）
     DDPM_EARLY_STOPPING = True              # 启用早停
-    DDPM_ES_WARMUP_EPOCHS = 50              # 预热轮数
-    DDPM_ES_PATIENCE = 50                   # 耐心值
-    DDPM_ES_MIN_DELTA = 0.0005              # 改善阈值
+    DDPM_ES_WARMUP_EPOCHS = 150             # 预热轮数（保持150）
+    DDPM_ES_PATIENCE = 150                  # 耐心值（保持150）
+    DDPM_ES_MIN_DELTA = 0.0003              # 改善阈值（保持0.0003）
+    DDPM_ES_SMOOTH_WINDOW = 3               # 平滑窗口（优化：5→3，更敏感）
     
     # Differential Guidance（分类引导）
     GUIDANCE_BENIGN = 1.0                   # 正常流量：无引导
@@ -288,9 +337,24 @@ class Config:
     DISCRETE_QUANTIZE_MAX_VALUES = 4096
     AUGMENT_USE_WEIGHTED_SAMPLING = True    # 加权采样
     
-    # 增强模板质量门槛
-    AUGMENT_TEMPLATE_MIN_WEIGHT = 0.7       # 模板最低权重
-    AUGMENT_TEMPLATE_MIN_WEIGHT_HARD = 0.5  # 硬门槛
+    # 增强模板质量门槛（v2.5：提高质量要求）
+    AUGMENT_TEMPLATE_MIN_WEIGHT = 0.8       # 模板最低权重（0.7→0.8，更严格）
+    AUGMENT_TEMPLATE_MIN_WEIGHT_HARD = 0.6  # 硬门槛（0.5→0.6，提高底线）
+    
+    # 数据质量控制（新增 v2.5）
+    AUGMENT_QUALITY_CHECK = True            # 启用质量检查
+    AUGMENT_MAX_OUTLIER_RATIO = 0.05        # 最大离群点比例（5%）
+    AUGMENT_MIN_DIVERSITY_SCORE = 0.3       # 最小多样性分数
+    
+    # Mixup增强（新增 v2.6 - 提升样本多样性）
+    AUGMENT_MIXUP_ENABLED = True            # 启用Mixup增强
+    AUGMENT_MIXUP_ALPHA_BENIGN = 0.1        # 正常类Mixup强度（弱混合，保持纯净）
+    AUGMENT_MIXUP_ALPHA_MALICIOUS = 0.3     # 恶意类Mixup强度（强混合，增加多样性）
+    
+    # 困难样本挖掘（新增 v2.6 - 针对性增强）
+    AUGMENT_HARD_MINING_ENABLED = False     # 启用困难样本挖掘（需要预训练模型）
+    AUGMENT_HARD_MINING_RATIO = 0.3         # Top 30%不确定性样本
+    AUGMENT_HARD_MINING_MULTIPLIER = 3      # 困难样本3倍增强
 
     # ============================================================
     # STAGE 3: 分类器微调 - 最优配置
@@ -302,7 +366,7 @@ class Config:
     CLASSIFIER_INPUT_IS_FEATURES = False    # 输入类型（False=序列，True=特征）
     
     # 3.2 训练基础参数
-    FINETUNE_EPOCHS = 1000                  # 最大训练轮数
+    FINETUNE_EPOCHS = 1000                  # 最大训练轮数（恢复最优配置）
     FINETUNE_BATCH_SIZE = 128               # 批次大小
     FINETUNE_LR = 3e-4                      # 学习率
     FINETUNE_MIN_LR = 1e-6                  # 最小学习率
@@ -327,16 +391,16 @@ class Config:
     BALANCED_SAMPLING_RATIO = 1.0           # 目标比例（正常:恶意=1:1）
     
     # 3.6 骨干网络微调（最优配置）
-    FINETUNE_BACKBONE = False               # 关闭骨干微调（最优配置）
+    FINETUNE_BACKBONE = True               # 关闭骨干微调（最优配置）
     FINETUNE_BACKBONE_SCOPE = 'projection'  # 微调范围
     FINETUNE_BACKBONE_LR = 2e-5             # 骨干网络学习率
     FINETUNE_BACKBONE_WARMUP_EPOCHS = 50    # 预热轮数
     
-    # 3.7 混合训练模式（原始序列 + 增强特征）
+    # 3.7 混合训练模式（原始序列 + 增强特征）- 优化版 v2.4
     STAGE3_MIXED_STREAM = True              # 启用混合训练
-    STAGE3_MIXED_REAL_BATCH_SIZE = 32       # 原始序列批次（最优配置）
-    STAGE3_MIXED_SYN_BATCH_SIZE = 96        # 增强特征批次（最优配置）
-    STAGE3_MIXED_REAL_LOSS_SCALE = 2.0      # 原始数据损失权重
+    STAGE3_MIXED_REAL_BATCH_SIZE = 32       # 原始序列批次
+    STAGE3_MIXED_SYN_BATCH_SIZE = 96        # 增强特征批次
+    STAGE3_MIXED_REAL_LOSS_SCALE = 2.5      # 原始数据损失权重（2.0→2.5，更重视原始数据）
     STAGE3_MIXED_SYN_LOSS_SCALE = 1.0       # 增强数据损失权重
     
     # 3.8 在线数据增强（可选）
@@ -404,11 +468,13 @@ class Config:
     CONSISTENCY_TEMPERATURE = 2.0
     CONSISTENCY_WARMUP_EPOCHS = 5
     
-    # Co-teaching（备选，默认关闭）
-    USE_CO_TEACHING = False
-    CO_TEACHING_SELECT_RATE = 0.7
-    CO_TEACHING_WARMUP_EPOCHS = 10
-    CO_TEACHING_MIN_SAMPLE_WEIGHT = 0.5
+    # Co-teaching（协同教学，禁用 - 数据无噪声）
+    USE_CO_TEACHING = False                 # 禁用Co-teaching（数据使用真实标签，无噪声）
+    CO_TEACHING_SELECT_RATE = 0.7           # 选择率（70%样本）
+    CO_TEACHING_WARMUP_EPOCHS = 10          # 预热轮数（前N轮不启用）
+    CO_TEACHING_MIN_SAMPLE_WEIGHT = 0.5     # 最小样本权重
+    CO_TEACHING_DYNAMIC_RATE = True         # 动态调整选择率
+    CO_TEACHING_NOISE_RATE = 0.0            # 假设噪声率（0.0 = 无噪声）
 
     # ============================================================
     # 硬件和训练配置
@@ -538,6 +604,15 @@ class Config:
             logger.info(f"  - Focal Loss: alpha={self.FOCAL_ALPHA}, gamma={self.FOCAL_GAMMA}")
             logger.info(f"  - 标签平滑: {self.LABEL_SMOOTHING}")
             logger.info("")
+            if self.USE_CO_TEACHING:
+                logger.info("🔧 Co-teaching配置:")
+                logger.info(f"  - 启用: {self.USE_CO_TEACHING}")
+                logger.info(f"  - 预热轮数: {self.CO_TEACHING_WARMUP_EPOCHS}")
+                logger.info(f"  - 选择率: {self.CO_TEACHING_SELECT_RATE}")
+                logger.info(f"  - 动态调整: {self.CO_TEACHING_DYNAMIC_RATE}")
+                if self.CO_TEACHING_DYNAMIC_RATE:
+                    logger.info(f"  - 假设噪声率: {self.CO_TEACHING_NOISE_RATE}")
+                logger.info("")
             logger.info("🔧 采样策略:")
             logger.info(f"  - 平衡采样: {self.USE_BALANCED_SAMPLING}")
             logger.info(f"  - 目标比例: {self.BALANCED_SAMPLING_RATIO}:1")
@@ -610,6 +685,8 @@ if __name__ == "__main__":
     print(f"  - Stage 2: Hybrid Court + TabDDPM ({config.STAGE2_FEATURE_AUG_MULTIPLIER}x增强)")
     print(f"  - Stage 3: Mixed Training (real={config.STAGE3_MIXED_REAL_BATCH_SIZE}, syn={config.STAGE3_MIXED_SYN_BATCH_SIZE})")
     print(f"  - 骨干微调: {'启用' if config.FINETUNE_BACKBONE else '关闭'}")
+    print(f"  - Co-teaching: {'启用' if config.USE_CO_TEACHING else '禁用'} (noise_rate={config.CO_TEACHING_NOISE_RATE})")
+    print(f"  - 训练轮数: {config.FINETUNE_EPOCHS} epochs")
     print(f"  - 最优阈值: {config.MALICIOUS_THRESHOLD}")
     print(f"\n最优性能:")
     print(f"  - F1 Score: 0.9026")
@@ -617,3 +694,10 @@ if __name__ == "__main__":
     print(f"  - Recall: 0.9080")
     print(f"  - AUC: 0.9896")
     print(f"  - Accuracy: 0.9822")
+    print(f"\n配置更新 (v2.3 - 2026-01-11 - TabDDPM优化组合1):")
+    print(f"  - 模型容量: {config.DDPM_HIDDEN_DIMS} (参数量提升~3x)")
+    print(f"  - 学习率: {config.DDPM_LR} (初始) → {config.DDPM_MIN_LR} (最小)")
+    print(f"  - 调度器: {config.DDPM_LR_SCHEDULER}")
+    print(f"  - 训练轮数: {config.DDPM_EPOCHS} epochs")
+    print(f"  - 早停耐心值: {config.DDPM_ES_PATIENCE}")
+    print(f"  - 预期效果: 最佳损失 0.28-0.32, F1提升 1-2%")

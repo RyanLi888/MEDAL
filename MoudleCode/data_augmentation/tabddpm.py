@@ -546,7 +546,23 @@ class TabDDPM(nn.Module):
         logger.info(f"Augmenting feature dataset: {len(Z_keep)} clean samples retained")
 
         augmentation_mode = getattr(self.config, 'AUGMENTATION_MODE', 'weighted')
-        if augmentation_mode == 'fixed':
+        
+        # v2.5: 支持类别特定增强倍数
+        if augmentation_mode == 'class_specific':
+            benign_mult = int(getattr(self.config, 'STAGE2_BENIGN_AUG_MULTIPLIER', 3))
+            malicious_mult = int(getattr(self.config, 'STAGE2_MALICIOUS_AUG_MULTIPLIER', 1))
+            
+            multipliers = np.zeros(len(w_keep), dtype=int)
+            benign_mask = y_keep == 0
+            malicious_mask = y_keep == 1
+            multipliers[benign_mask] = benign_mult
+            multipliers[malicious_mask] = malicious_mult
+            
+            logger.info(f"Using class-specific augmentation mode:")
+            logger.info(f"  Benign: {benign_mult}x ({benign_mask.sum()} samples)")
+            logger.info(f"  Malicious: {malicious_mult}x ({malicious_mask.sum()} samples)")
+            
+        elif augmentation_mode == 'fixed':
             fixed_multiplier = int(getattr(self.config, 'STAGE2_FEATURE_AUG_MULTIPLIER', 5))
             multipliers = np.full(len(w_keep), fixed_multiplier, dtype=int)
             logger.info(f"Using fixed augmentation mode: {fixed_multiplier}x for all samples")
@@ -576,6 +592,7 @@ class TabDDPM(nn.Module):
         w_synthetic_list = []
 
         use_weighted_sampling = bool(getattr(self.config, 'AUGMENT_USE_WEIGHTED_SAMPLING', True))
+        enable_quality_check = bool(getattr(self.config, 'AUGMENT_QUALITY_CHECK', True))
 
         for class_label in np.unique(y_keep):
             class_mask = y_keep == class_label
@@ -583,12 +600,15 @@ class TabDDPM(nn.Module):
             mult_class = multipliers[class_mask]
             w_class = w_keep[class_mask]
 
-            min_w_template = float(getattr(self.config, 'AUGMENT_TEMPLATE_MIN_WEIGHT', 0.5))
-            min_w_template_hard = float(getattr(self.config, 'AUGMENT_TEMPLATE_MIN_WEIGHT_HARD', 0.2))
+            # v2.5: 提高模板质量要求
+            min_w_template = float(getattr(self.config, 'AUGMENT_TEMPLATE_MIN_WEIGHT', 0.8))
+            min_w_template_hard = float(getattr(self.config, 'AUGMENT_TEMPLATE_MIN_WEIGHT_HARD', 0.6))
             template_mask = w_class >= min_w_template
             if template_mask.sum() == 0:
+                logger.warning(f"No templates meet quality threshold {min_w_template}, using hard threshold {min_w_template_hard}")
                 template_mask = w_class >= min_w_template_hard
             if template_mask.sum() == 0:
+                logger.warning(f"No templates meet hard threshold, using all samples")
                 template_mask = np.ones_like(w_class, dtype=bool)
 
             Z_templates_pool = Z_class[template_mask]
@@ -597,6 +617,8 @@ class TabDDPM(nn.Module):
             n_generate = int(mult_templates_pool.sum())
             if n_generate <= 0:
                 continue
+
+            logger.info(f"Class {class_label}: {len(Z_templates_pool)} templates (avg weight: {w_templates_pool.mean():.3f})")
 
             if use_weighted_sampling:
                 p = w_templates_pool.astype(np.float64)
@@ -629,10 +651,25 @@ class TabDDPM(nn.Module):
                 )
                 Z_generated.append(batch_generated.detach().cpu().numpy().astype(np.float32))
             Z_generated = np.concatenate(Z_generated, axis=0)
+            
+            # v2.5: 数据质量检查
+            if enable_quality_check and len(Z_generated) > 0:
+                Z_generated = self._quality_check_samples(Z_generated, Z_templates_pool, class_label)
+            
+            # v2.6: Mixup增强（在质量检查后应用）
+            enable_mixup = bool(getattr(self.config, 'AUGMENT_MIXUP_ENABLED', False))
+            if enable_mixup and len(Z_generated) > 0:
+                # 根据类别选择Mixup强度
+                if int(class_label) == 0:
+                    mixup_alpha = float(getattr(self.config, 'AUGMENT_MIXUP_ALPHA_BENIGN', 0.1))
+                else:
+                    mixup_alpha = float(getattr(self.config, 'AUGMENT_MIXUP_ALPHA_MALICIOUS', 0.3))
+                
+                Z_generated = self._mixup_augmentation(Z_templates_pool, Z_generated, alpha=mixup_alpha)
 
             Z_synthetic_list.append(Z_generated)
-            y_synthetic_list.append(np.full(n_generate, int(class_label), dtype=int))
-            w_synthetic_list.append(w_templates.astype(np.float32))
+            y_synthetic_list.append(np.full(len(Z_generated), int(class_label), dtype=int))
+            w_synthetic_list.append(w_templates[:len(Z_generated)].astype(np.float32))
 
         if len(Z_synthetic_list) == 0:
             logger.info("No synthetic feature samples generated; returning original features")
@@ -645,8 +682,91 @@ class TabDDPM(nn.Module):
         Z_aug = np.concatenate([Z_keep, Z_synth], axis=0)
         y_aug = np.concatenate([y_keep, y_synth], axis=0)
         w_aug = np.concatenate([w_keep, w_synth], axis=0)
+        
+        # 输出增强统计
+        logger.info(f"Augmentation complete:")
+        logger.info(f"  Original: {len(Z_keep)} samples")
+        logger.info(f"  Synthetic: {len(Z_synth)} samples")
+        logger.info(f"  Total: {len(Z_aug)} samples")
+        logger.info(f"  Benign: {(y_aug==0).sum()} ({100*(y_aug==0).sum()/len(y_aug):.1f}%)")
+        logger.info(f"  Malicious: {(y_aug==1).sum()} ({100*(y_aug==1).sum()/len(y_aug):.1f}%)")
 
         return Z_aug, y_aug, w_aug
+    
+    def _quality_check_samples(self, Z_generated, Z_templates, class_label):
+        """
+        v2.5: 质量检查生成的样本，过滤离群点
+        """
+        if len(Z_generated) == 0 or len(Z_templates) == 0:
+            return Z_generated
+        
+        max_outlier_ratio = float(getattr(self.config, 'AUGMENT_MAX_OUTLIER_RATIO', 0.05))
+        
+        # 计算生成样本与模板的距离
+        from scipy.spatial.distance import cdist
+        distances = cdist(Z_generated, Z_templates, metric='euclidean')
+        min_distances = distances.min(axis=1)
+        
+        # 使用IQR方法检测离群点
+        q75, q25 = np.percentile(min_distances, [75, 25])
+        iqr = q75 - q25
+        outlier_threshold = q75 + 1.5 * iqr
+        
+        outlier_mask = min_distances > outlier_threshold
+        n_outliers = outlier_mask.sum()
+        outlier_ratio = n_outliers / len(Z_generated)
+        
+        if outlier_ratio > max_outlier_ratio:
+            # 过滤离群点
+            Z_filtered = Z_generated[~outlier_mask]
+            logger.info(f"  Quality check (class {class_label}): removed {n_outliers}/{len(Z_generated)} outliers ({100*outlier_ratio:.1f}%)")
+            return Z_filtered
+        else:
+            logger.info(f"  Quality check (class {class_label}): passed ({n_outliers} outliers, {100*outlier_ratio:.1f}%)")
+            return Z_generated
+    
+    def _mixup_augmentation(self, Z_templates, Z_synthetic, alpha=0.2):
+        """
+        v2.6: Mixup增强 - 在模板和生成样本之间插值
+        
+        核心思想：
+        - 生成样本可能过于集中在高密度区域
+        - 通过与真实模板混合，增加样本多样性
+        - 同时保持样本的真实性（不会偏离分布太远）
+        
+        公式：
+        Z_mixed = λ * Z_synthetic + (1-λ) * Z_template
+        其中 λ ~ Beta(α, α)
+        
+        Args:
+            Z_templates: (N_template, D) - 真实模板样本
+            Z_synthetic: (N_syn, D) - TabDDPM生成的样本
+            alpha: Beta分布参数（控制混合强度）
+                - alpha=0.1: 弱混合（生成样本占主导，90%权重）
+                - alpha=0.3: 强混合（更多样性，70%权重）
+                - alpha=1.0: 均匀混合（50%权重）
+        
+        Returns:
+            Z_mixed: (N_syn, D) - 混合后的样本
+        """
+        if alpha <= 0 or len(Z_templates) == 0:
+            return Z_synthetic
+        
+        n_samples = len(Z_synthetic)
+        
+        # 从Beta分布采样混合系数
+        lambda_mix = np.random.beta(alpha, alpha, size=n_samples)
+        
+        # 随机选择模板样本进行混合
+        idx = np.random.choice(len(Z_templates), size=n_samples, replace=True)
+        Z_templates_sampled = Z_templates[idx]
+        
+        # 线性插值
+        Z_mixed = lambda_mix[:, None] * Z_synthetic + (1 - lambda_mix[:, None]) * Z_templates_sampled
+        
+        logger.info(f"  Mixup augmentation: alpha={alpha:.2f}, avg_lambda={lambda_mix.mean():.3f}")
+        
+        return Z_mixed
 
     def augment_dataset(self, X_clean, y_clean, action_mask, correction_weight,
                         density_scores, cl_confidence, knn_confidence,

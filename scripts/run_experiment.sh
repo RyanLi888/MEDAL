@@ -256,7 +256,7 @@ case $choice in
         if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
             CMD="python scripts/training/train_augmented_then_test.py --backbone_path $BACKBONE_PATH"
         else
-            CMD="python scripts/training/train_augmented_then_test.py"
+            CMD="python scripts/training/train_augmented_then_test.py --retrain_backbone"
         fi
         MODE="数据增强训练+测试 (消融实验)"
         LOG_PREFIX="ablation_data_augmentation"

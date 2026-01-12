@@ -16,6 +16,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
+from torch.utils.data import TensorDataset, DataLoader
 
 from MoudleCode.utils.config import config
 from MoudleCode.utils.helpers import set_seed, setup_logger
@@ -31,7 +32,7 @@ try:
 except Exception:
     PREPROCESS_AVAILABLE = False
 
-from scripts.training.train import stage2_label_correction_and_augmentation, stage3_finetune_classifier
+from scripts.training.train import stage1_pretrain_backbone, stage2_label_correction_and_augmentation, stage3_finetune_classifier
 from scripts.testing.test import main as test_main
 
 
@@ -133,7 +134,33 @@ def main():
         backbone = build_backbone(config, logger=logger)
         backbone_path = args.backbone_path if args.backbone_path else os.path.join(config.FEATURE_EXTRACTION_DIR, 'models', 'backbone_pretrained.pth')
         
-        if os.path.exists(backbone_path) and not args.retrain_backbone:
+        if args.retrain_backbone:
+            logger.info('🔁 重新训练骨干网络（Stage 1 自监督预训练）...')
+            use_instance_contrastive = getattr(config, 'USE_INSTANCE_CONTRASTIVE', False)
+            contrastive_method = getattr(config, 'CONTRASTIVE_METHOD', 'infonce')
+            method_lower = str(contrastive_method).lower()
+            if use_instance_contrastive and method_lower == 'nnclr':
+                batch_size = getattr(config, 'PRETRAIN_BATCH_SIZE_NNCLR', 64)
+            elif use_instance_contrastive and method_lower == 'simsiam':
+                batch_size = getattr(config, 'PRETRAIN_BATCH_SIZE_SIMSIAM', config.PRETRAIN_BATCH_SIZE)
+            else:
+                batch_size = config.PRETRAIN_BATCH_SIZE
+
+            dataset = TensorDataset(torch.FloatTensor(X_train))
+            train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+            backbone = backbone.to(config.DEVICE)
+            backbone, _pretrain_history = stage1_pretrain_backbone(backbone, train_loader, config, logger)
+
+            default_backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, 'models', 'backbone_pretrained.pth')
+            if args.backbone_path:
+                torch.save(backbone.state_dict(), args.backbone_path)
+                backbone_path = args.backbone_path
+                logger.info(f'✓ 已保存新骨干网络: {backbone_path}')
+            else:
+                backbone_path = default_backbone_path
+                logger.info(f'✓ 已保存新骨干网络: {backbone_path}')
+        elif os.path.exists(backbone_path):
             logger.info(f'✓ 加载骨干网络: {backbone_path}')
             try:
                 state_dict = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)

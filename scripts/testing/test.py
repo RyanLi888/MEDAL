@@ -301,7 +301,6 @@ def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
     metrics['precision'] = metrics['precision_pos']
     metrics['recall'] = metrics['recall_pos']
     metrics['f1'] = metrics['f1_pos']
-    
     return metrics
 
 
@@ -711,6 +710,31 @@ def main(args):
         logger.info("  - Final: 训练结束时的最终模型")
         logger.info("  - 差异: Final - Best F1 (正值表示Final更好)")
         logger.info("")
+
+    chosen_name = None
+    chosen_metrics = None
+    try:
+        def _score(m: dict) -> float:
+            if not isinstance(m, dict):
+                return float('-inf')
+            if 'f1' in m:
+                return float(m['f1'])
+            if 'f1_pos' in m:
+                return float(m['f1_pos'])
+            return float('-inf')
+
+        chosen_name = max(all_metrics.keys(), key=lambda k: _score(all_metrics.get(k)))
+        chosen_metrics = all_metrics.get(chosen_name)
+    except Exception as e:
+        logger.warning(f"⚠ 无法根据F1选择最终模型: {e}")
+
+    if chosen_name is not None and chosen_metrics is not None:
+        logger.info("="*70)
+        logger.info("🏁 最终测试结果选择")
+        logger.info("="*70)
+        logger.info(f"选择模型: {chosen_name}")
+        logger.info(f"依据指标: F1(pos=1) = {float(chosen_metrics.get('f1', chosen_metrics.get('f1_pos', -1.0))):.4f}")
+        logger.info("")
     
     logger.info("="*70)
     logger.info("🎉 测试完成! Testing Complete!")
@@ -728,6 +752,8 @@ def main(args):
     logger.info("")
     logger.info("="*70)
     
+    if chosen_metrics is not None:
+        return chosen_metrics
     return metrics
 
 

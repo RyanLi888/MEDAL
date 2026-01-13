@@ -1084,7 +1084,8 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         torch.save(best_state, best_path)
 
     final_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_final.pth")
-    torch.save(classifier.dual_mlp.state_dict(), final_path)
+    final_state = {k: v.detach().cpu().clone() for k, v in classifier.state_dict().items()}
+    torch.save(final_state, final_path)
     
     history_path = os.path.join(config.CLASSIFICATION_DIR, "models", "training_history.npz")
     np.savez(history_path, **{k: np.array(v) for k, v in history.items()})

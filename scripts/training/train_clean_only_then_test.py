@@ -222,7 +222,7 @@ def main():
             if bp:
                 backbone_path_for_test = bp
 
-        test_args = argparse.Namespace(backbone_path=backbone_path_for_test, classifier_path=classifier_best)
+        test_args = argparse.Namespace(backbone_path=backbone_path_for_test)
         test_main(test_args)
         logger.info(f"🔧 RNG指纹(测试后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
 

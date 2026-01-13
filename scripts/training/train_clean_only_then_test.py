@@ -16,6 +16,8 @@ from datetime import datetime
 
 import numpy as np
 import torch
+import random
+import hashlib
 
 from MoudleCode.utils.config import config
 from MoudleCode.utils.helpers import set_seed, setup_logger
@@ -37,6 +39,49 @@ from scripts.testing.test import main as test_main
 
 def _safe_makedirs(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def _rng_fingerprint_short() -> str:
+    h = hashlib.sha256()
+    try:
+        h.update(repr(random.getstate()).encode('utf-8'))
+    except Exception:
+        h.update(b'py_random_error')
+    try:
+        ns = np.random.get_state()
+        h.update(str(ns[0]).encode('utf-8'))
+        h.update(np.asarray(ns[1], dtype=np.uint32).tobytes())
+        h.update(str(ns[2]).encode('utf-8'))
+        h.update(str(ns[3]).encode('utf-8'))
+        h.update(str(ns[4]).encode('utf-8'))
+    except Exception:
+        h.update(b'numpy_random_error')
+    try:
+        h.update(torch.get_rng_state().detach().cpu().numpy().tobytes())
+    except Exception:
+        h.update(b'torch_cpu_rng_error')
+    try:
+        if torch.cuda.is_available():
+            for s in torch.cuda.get_rng_state_all():
+                h.update(s.detach().cpu().numpy().tobytes())
+        else:
+            h.update(b'no_cuda')
+    except Exception:
+        h.update(b'torch_cuda_rng_error')
+    return h.hexdigest()[:16]
+
+
+def _seed_snapshot(args_seed: int) -> str:
+    torch_seed = None
+    try:
+        torch_seed = int(torch.initial_seed())
+    except Exception:
+        torch_seed = None
+    return (
+        f"args.seed={int(args_seed)} | "
+        f"config.SEED={int(getattr(config, 'SEED', -1))} | "
+        f"torch.initial_seed={torch_seed}"
+    )
 
 
 def _load_train_dataset():
@@ -64,9 +109,14 @@ def main():
     parser.add_argument('--run_tag', type=str, default='')
     args = parser.parse_args()
 
+    rng_fp_before_seed = _rng_fingerprint_short()
     set_seed(args.seed)
+    rng_fp_after_seed = _rng_fingerprint_short()
     config.create_dirs()
     logger = setup_logger(os.path.join(config.OUTPUT_ROOT, 'logs'), name='clean_train_test')
+
+    logger.info(f"🔧 RNG指纹(seed前): {rng_fp_before_seed}")
+    logger.info(f"🔧 RNG指纹(seed后): {rng_fp_after_seed} ({_seed_snapshot(args.seed)})")
 
     # 配置：使用最优参数（干净数据模式）
     config.USE_FOCAL_LOSS = True
@@ -113,7 +163,9 @@ def main():
         config.log_stage_config(logger, "Stage 3")
         
         # 加载数据
+        logger.info(f"🔧 RNG指纹(加载训练数据前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
         X_train, y_train_true = _load_train_dataset()
+        logger.info(f"🔧 RNG指纹(加载训练数据后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
         if X_train is None:
             raise RuntimeError('训练数据集加载失败')
 
@@ -129,29 +181,36 @@ def main():
         }, "训练数据统计")
         
         # 加载骨干网络
+        logger.info(f"🔧 RNG指纹(构建backbone前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
         backbone = build_backbone(config, logger=logger)
+        logger.info(f"🔧 RNG指纹(构建backbone后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
         backbone_path = args.backbone_path if args.backbone_path else os.path.join(config.FEATURE_EXTRACTION_DIR, 'models', 'backbone_pretrained.pth')
         
         if os.path.exists(backbone_path) and not args.retrain_backbone:
             logger.info(f'✓ 加载骨干网络: {backbone_path}')
+            logger.info(f"🔧 RNG指纹(加载backbone权重前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
             try:
                 state_dict = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)
             except TypeError:
                 state_dict = torch.load(backbone_path, map_location=config.DEVICE)
             backbone.load_state_dict(state_dict, strict=False)
+            logger.info(f"🔧 RNG指纹(加载backbone权重后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
             backbone.freeze()
         else:
             logger.warning('⚠ 使用随机初始化骨干网络')
             backbone.freeze()
         
         # Stage 3: 分类器训练
+        logger.info(f"🔧 RNG指纹(Stage3调用前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
         stage3_finetune_classifier(
             backbone, X_train, y_corrected, correction_weight,
             config, logger, n_original=len(X_train), backbone_path=backbone_path
         )
+        logger.info(f"🔧 RNG指纹(Stage3返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
 
         # 测试
         log_section_header(logger, "🧪 测试评估")
+        logger.info(f"🔧 RNG指纹(测试前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
         classifier_best = os.path.join(config.CLASSIFICATION_DIR, 'models', 'classifier_best_f1.pth')
         
         meta_path = os.path.join(config.CLASSIFICATION_DIR, 'models', 'model_metadata.json')
@@ -165,6 +224,7 @@ def main():
 
         test_args = argparse.Namespace(backbone_path=backbone_path_for_test, classifier_path=classifier_best)
         test_main(test_args)
+        logger.info(f"🔧 RNG指纹(测试后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
 
         log_final_summary(logger, "完成", {}, {
             "运行目录": run_dir,

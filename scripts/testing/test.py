@@ -13,6 +13,8 @@ sys.path.insert(0, str(project_root))
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
+import random
+import hashlib
 import argparse
 from datetime import datetime
 import json
@@ -38,6 +40,48 @@ try:
     PREPROCESS_AVAILABLE = True
 except ImportError:
     PREPROCESS_AVAILABLE = False
+
+
+def _rng_fingerprint_short() -> str:
+    h = hashlib.sha256()
+    try:
+        h.update(repr(random.getstate()).encode('utf-8'))
+    except Exception:
+        h.update(b'py_random_error')
+    try:
+        ns = np.random.get_state()
+        h.update(str(ns[0]).encode('utf-8'))
+        h.update(np.asarray(ns[1], dtype=np.uint32).tobytes())
+        h.update(str(ns[2]).encode('utf-8'))
+        h.update(str(ns[3]).encode('utf-8'))
+        h.update(str(ns[4]).encode('utf-8'))
+    except Exception:
+        h.update(b'numpy_random_error')
+    try:
+        h.update(torch.get_rng_state().detach().cpu().numpy().tobytes())
+    except Exception:
+        h.update(b'torch_cpu_rng_error')
+    try:
+        if torch.cuda.is_available():
+            for s in torch.cuda.get_rng_state_all():
+                h.update(s.detach().cpu().numpy().tobytes())
+        else:
+            h.update(b'no_cuda')
+    except Exception:
+        h.update(b'torch_cuda_rng_error')
+    return h.hexdigest()[:16]
+
+
+def _seed_snapshot() -> str:
+    torch_seed = None
+    try:
+        torch_seed = int(torch.initial_seed())
+    except Exception:
+        torch_seed = None
+    return (
+        f"config.SEED={int(getattr(config, 'SEED', -1))} | "
+        f"torch.initial_seed={torch_seed}"
+    )
 
 
 def _load_classifier_checkpoint(classifier, state_dict, logger=None):
@@ -91,8 +135,10 @@ def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
     classifier.to(config.DEVICE)
     
     # Create DataLoader
+    logger.info(f"🔧 RNG指纹(测试-Dataloader创建前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     dataset = TensorDataset(torch.FloatTensor(X_test), torch.LongTensor(y_test))
     test_loader = DataLoader(dataset, batch_size=test_batch_size, shuffle=False)
+    logger.info(f"🔧 RNG指纹(测试-Dataloader创建后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     total_batches = len(test_loader)
     
     # Collect probabilities / labels / features（先不使用阈值）
@@ -100,6 +146,7 @@ def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
     all_labels = []
     all_features = []
     
+    logger.info(f"🔧 RNG指纹(测试-推理开始前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     logger.info("开始推理...")
     logger.info("-"*70)
     
@@ -122,6 +169,7 @@ def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
                 processed = min((batch_idx + 1) * test_batch_size, len(X_test))
                 logger.info(f"  推理进度: {batch_idx+1}/{total_batches} batches ({progress:.1f}%) | 已处理 {processed}/{len(X_test)} 个样本")
     
+    logger.info(f"🔧 RNG指纹(测试-推理结束后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     # Concatenate results
     y_prob = np.concatenate(all_probs)
     y_true = np.concatenate(all_labels)
@@ -336,9 +384,14 @@ def main(args):
     """Main testing function"""
     
     # Setup
+    rng_fp_before_seed = _rng_fingerprint_short()
     set_seed(config.SEED)
+    rng_fp_after_seed = _rng_fingerprint_short()
     config.create_dirs()
     logger = setup_logger(os.path.join(config.OUTPUT_ROOT, "logs"), name='test')
+
+    logger.info(f"🔧 RNG指纹(seed前): {rng_fp_before_seed}")
+    logger.info(f"🔧 RNG指纹(seed后): {rng_fp_after_seed} ({_seed_snapshot()})")
     
     logger.info("="*70)
     logger.info("🧪 MEDAL-Lite Testing Pipeline")
@@ -367,6 +420,7 @@ def main(args):
     logger.info(f"  说明: 将读取上述路径下所有pcap文件，流数在处理时统计")
     logger.info("")
     
+    logger.info(f"🔧 RNG指纹(加载测试数据前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     # 优先使用预处理好的数据
     if PREPROCESS_AVAILABLE and check_preprocessed_exists('test'):
         logger.info("✓ 发现预处理文件，直接加载...")
@@ -383,6 +437,8 @@ def main(args):
             sequence_length=config.SEQUENCE_LENGTH
         )
         X_test = normalize_burstsize_inplace(X_test)
+
+    logger.info(f"🔧 RNG指纹(加载测试数据后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     
     if X_test is None:
         logger.error("❌ 测试数据集加载失败!")
@@ -428,7 +484,9 @@ def main(args):
             logger.warning(f"⚠ 无法读取模型元数据: {e}")
     
     # Load backbone from feature_extraction directory
+    logger.info(f"🔧 RNG指纹(构建backbone前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     backbone = build_backbone(config, logger=logger)
+    logger.info(f"🔧 RNG指纹(构建backbone后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     
     # 确定骨干网络路径
     # 优先级：1. 命令行参数 2. 元数据 3. 默认路径
@@ -460,12 +518,14 @@ def main(args):
     
     logger.info("正在加载骨干网络...")
     logger.info(f"  📥 输入模型: {backbone_path}")
+    logger.info(f"🔧 RNG指纹(加载backbone权重前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     try:
         backbone_state = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)
     except TypeError:
         backbone_state = torch.load(backbone_path, map_location=config.DEVICE)
 
     load_state_dict_shape_safe(backbone, backbone_state, logger, prefix="backbone")
+    logger.info(f"🔧 RNG指纹(加载backbone权重后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     backbone.freeze()
     logger.info(f"✓ 骨干网络加载完成")
     
@@ -491,12 +551,16 @@ def main(args):
         logger.info("正在加载指定的分类器...")
         logger.info(f"  📥 输入模型: {args.classifier_path}")
         
+        logger.info(f"🔧 RNG指纹(构建classifier前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         classifier = MEDAL_Classifier(backbone, config)
+        logger.info(f"🔧 RNG指纹(构建classifier后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         try:
             classifier_state = torch.load(args.classifier_path, map_location=config.DEVICE, weights_only=True)
         except TypeError:
             classifier_state = torch.load(args.classifier_path, map_location=config.DEVICE)
+        logger.info(f"🔧 RNG指纹(加载classifier权重前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         _load_classifier_checkpoint(classifier, classifier_state, logger=logger)
+        logger.info(f"🔧 RNG指纹(加载classifier权重后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         logger.info(f"✓ 分类器加载完成")
         
         # Count parameters
@@ -509,7 +573,9 @@ def main(args):
         logger.info("")
         
         # Test single model
+        logger.info(f"🔧 RNG指纹(进入test_model前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         metrics = test_model(classifier, X_test, y_test, config, logger)
+        logger.info(f"🔧 RNG指纹(test_model返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         try:
             results_path = os.path.join(config.RESULT_DIR, 'models', 'test_predictions.npz')
             npz = np.load(results_path, allow_pickle=True)
@@ -558,12 +624,16 @@ def main(args):
         logger.info(f"正在加载分类器...")
         logger.info(f"  📥 输入模型: {model_path}")
         
+        logger.info(f"🔧 RNG指纹(构建classifier前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         classifier = MEDAL_Classifier(backbone, config)
+        logger.info(f"🔧 RNG指纹(构建classifier后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         try:
             classifier_state = torch.load(model_path, map_location=config.DEVICE, weights_only=True)
         except TypeError:
             classifier_state = torch.load(model_path, map_location=config.DEVICE)
+        logger.info(f"🔧 RNG指纹(加载classifier权重前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         _load_classifier_checkpoint(classifier, classifier_state, logger=logger)
+        logger.info(f"🔧 RNG指纹(加载classifier权重后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         logger.info(f"✓ 分类器加载完成")
         
         if model_name == "Best F1":
@@ -578,7 +648,9 @@ def main(args):
         
         # Test model with specific save prefix
         save_prefix = "test_best" if model_name == "Best F1" else "test_final"
+        logger.info(f"🔧 RNG指纹(进入test_model前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         metrics = test_model(classifier, X_test, y_test, config, logger, save_prefix=save_prefix)
+        logger.info(f"🔧 RNG指纹(test_model返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         try:
             results_path = os.path.join(config.RESULT_DIR, 'models', f'{save_prefix}_predictions.npz')
             npz = np.load(results_path, allow_pickle=True)

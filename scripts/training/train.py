@@ -16,6 +16,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
+import random
+import hashlib
 import argparse
 from datetime import datetime
 
@@ -57,6 +59,48 @@ except ImportError:
 from MoudleCode.label_correction.hybrid_court import HybridCourt
 from MoudleCode.data_augmentation.tabddpm import TabDDPM
 from MoudleCode.classification.dual_stream import MEDAL_Classifier, DualStreamLoss
+
+
+def _rng_fingerprint_short() -> str:
+    h = hashlib.sha256()
+    try:
+        h.update(repr(random.getstate()).encode('utf-8'))
+    except Exception:
+        h.update(b'py_random_error')
+    try:
+        ns = np.random.get_state()
+        h.update(str(ns[0]).encode('utf-8'))
+        h.update(np.asarray(ns[1], dtype=np.uint32).tobytes())
+        h.update(str(ns[2]).encode('utf-8'))
+        h.update(str(ns[3]).encode('utf-8'))
+        h.update(str(ns[4]).encode('utf-8'))
+    except Exception:
+        h.update(b'numpy_random_error')
+    try:
+        h.update(torch.get_rng_state().detach().cpu().numpy().tobytes())
+    except Exception:
+        h.update(b'torch_cpu_rng_error')
+    try:
+        if torch.cuda.is_available():
+            for s in torch.cuda.get_rng_state_all():
+                h.update(s.detach().cpu().numpy().tobytes())
+        else:
+            h.update(b'no_cuda')
+    except Exception:
+        h.update(b'torch_cuda_rng_error')
+    return h.hexdigest()[:16]
+
+
+def _seed_snapshot() -> str:
+    torch_seed = None
+    try:
+        torch_seed = int(torch.initial_seed())
+    except Exception:
+        torch_seed = None
+    return (
+        f"config.SEED={int(getattr(config, 'SEED', -1))} | "
+        f"torch.initial_seed={torch_seed}"
+    )
 
 
 def stage1_pretrain_backbone(backbone, train_loader, config, logger):
@@ -1083,9 +1127,14 @@ def main(args):
     """主训练函数"""
     
     # 初始化
+    rng_fp_before_seed = _rng_fingerprint_short()
     set_seed(config.SEED)
+    rng_fp_after_seed = _rng_fingerprint_short()
     config.create_dirs()
     logger = setup_logger(os.path.join(config.OUTPUT_ROOT, "logs"), name='train')
+
+    logger.info(f"🔧 RNG指纹(seed前): {rng_fp_before_seed}")
+    logger.info(f"🔧 RNG指纹(seed后): {rng_fp_after_seed} ({_seed_snapshot()})")
     
     log_section_header(logger, "🚀 MEDAL-Lite 训练流程")
     logger.info(f"时间戳: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1127,6 +1176,7 @@ def main(args):
     
     if start_stage <= 3:
         log_section_header(logger, "📦 数据集加载")
+        logger.info(f"🔧 RNG指纹(加载训练数据前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         log_data_stats(logger, {
             "正常流量路径": config.BENIGN_TRAIN,
             "恶意流量路径": config.MALICIOUS_TRAIN,
@@ -1145,6 +1195,8 @@ def main(args):
                 sequence_length=config.SEQUENCE_LENGTH
             )
             X_train = normalize_burstsize_inplace(X_train)
+
+        logger.info(f"🔧 RNG指纹(加载训练数据后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         
         if X_train is None:
             logger.error("❌ 训练数据集加载失败!")
@@ -1164,11 +1216,14 @@ def main(args):
             y_train_noisy = None
     
     # 构建骨干网络
+    logger.info(f"🔧 RNG指纹(构建backbone前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     backbone = build_backbone(config, logger=logger)
     backbone = backbone.to(config.DEVICE)
+    logger.info(f"🔧 RNG指纹(构建backbone后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
 
     # Stage 1: 预训练骨干网络
     if start_stage <= 1:
+        logger.info(f"🔧 RNG指纹(Stage1调用前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         use_instance_contrastive = getattr(config, 'USE_INSTANCE_CONTRASTIVE', False)
         contrastive_method = getattr(config, 'CONTRASTIVE_METHOD', 'infonce')
         
@@ -1184,6 +1239,7 @@ def main(args):
         train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
         backbone, pretrain_history = stage1_pretrain_backbone(backbone, train_loader, config, logger)
+        logger.info(f"🔧 RNG指纹(Stage1返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         
         if end_stage <= 1:
             logger.info("✅ 已完成到 Stage 1")
@@ -1201,17 +1257,20 @@ def main(args):
             backbone.freeze()
         elif os.path.exists(backbone_path):
             logger.info(f"✓ 加载骨干网络: {backbone_path}")
+            logger.info(f"🔧 RNG指纹(加载backbone权重前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
             try:
                 backbone_state = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)
             except TypeError:
                 backbone_state = torch.load(backbone_path, map_location=config.DEVICE)
             load_state_dict_shape_safe(backbone, backbone_state, logger, prefix="backbone")
+            logger.info(f"🔧 RNG指纹(加载backbone权重后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         else:
             logger.error(f"❌ 找不到骨干网络: {backbone_path}")
             return
     
     # Stage 2: 标签矫正 + 数据增强
     if start_stage <= 2 and end_stage >= 2:
+        logger.info(f"🔧 RNG指纹(Stage2调用前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         if y_train_noisy is None and y_train_clean is not None:
             logger.info(f"🔀 注入标签噪声 ({config.LABEL_NOISE_RATE*100:.0f}%)...")
             y_train_noisy, noise_mask = inject_label_noise(y_train_clean, config.LABEL_NOISE_RATE)
@@ -1221,6 +1280,7 @@ def main(args):
         X_augmented, y_augmented, sample_weights, correction_stats, tabddpm, n_original = stage2_label_correction_and_augmentation(
             backbone, X_train, y_train_noisy, y_train_clean, config, logger, stage2_mode=stage2_mode
         )
+        logger.info(f"🔧 RNG指纹(Stage2返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         
         if end_stage <= 2:
             logger.info("✅ 已完成到 Stage 2")
@@ -1261,6 +1321,7 @@ def main(args):
 
     # Stage 3: 分类器微调
     if end_stage >= 3 and start_stage <= 3:
+        logger.info(f"🔧 RNG指纹(Stage3调用前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         if hasattr(args, 'backbone_path') and args.backbone_path:
             actual_backbone_path = args.backbone_path
         else:
@@ -1270,6 +1331,7 @@ def main(args):
             backbone, X_augmented, y_augmented, sample_weights, config, logger, 
             n_original=n_original, backbone_path=actual_backbone_path
         )
+        logger.info(f"🔧 RNG指纹(Stage3返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     else:
         logger.info("⏭️ 跳过 Stage 3")
         return backbone

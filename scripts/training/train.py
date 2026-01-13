@@ -865,7 +865,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             logger.info(f"🔥 骨干网络微调在epoch {epoch+1}激活 (scope={finetune_scope})")
         
         epoch_loss = 0.0
-        epoch_losses = {'supervision': 0.0}
+        epoch_losses = {'total': 0.0, 'supervision': 0.0, 'stream_a': 0.0, 'stream_b': 0.0}
         all_train_probs = []
         all_train_labels = []
         
@@ -901,8 +901,11 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
                 loss.backward()
                 optimizer.step()
                 
-                epoch_loss += loss.item()
-                epoch_losses['supervision'] += (loss_dict_real['supervision'] + loss_dict_syn['supervision']) / 2
+                epoch_loss += float(loss.item())
+                epoch_losses['total'] += float(real_loss_scale * loss_dict_real['total'] + syn_loss_scale * loss_dict_syn['total'])
+                epoch_losses['supervision'] += float(real_loss_scale * loss_dict_real['supervision'] + syn_loss_scale * loss_dict_syn['supervision'])
+                epoch_losses['stream_a'] += float(real_loss_scale * loss_dict_real['stream_a'] + syn_loss_scale * loss_dict_syn['stream_a'])
+                epoch_losses['stream_b'] += float(real_loss_scale * loss_dict_real['stream_b'] + syn_loss_scale * loss_dict_syn['stream_b'])
                 
                 with torch.no_grad():
                     logits_a_syn, logits_b_syn = classifier.dual_mlp(Z_syn, return_separate=True)
@@ -933,8 +936,11 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
                 loss.backward()
                 optimizer.step()
 
-                epoch_loss += loss_dict['total']
-                epoch_losses['supervision'] += loss_dict['supervision']
+                epoch_loss += float(loss_dict['total'])
+                epoch_losses['total'] += float(loss_dict['total'])
+                epoch_losses['supervision'] += float(loss_dict['supervision'])
+                epoch_losses['stream_a'] += float(loss_dict.get('stream_a', 0.0))
+                epoch_losses['stream_b'] += float(loss_dict.get('stream_b', 0.0))
 
                 with torch.no_grad():
                     logits_a, logits_b = classifier.dual_mlp(z, return_separate=True)
@@ -955,6 +961,15 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         train_preds = (train_probs[:, 1] >= 0.5).astype(int)
         train_f1 = f1_score(train_labels, train_preds, pos_label=1, zero_division=0)
 
+        monitor_pr_auc = bool(getattr(config, 'MONITOR_PR_AUC', False))
+        train_ap = None
+        if monitor_pr_auc:
+            try:
+                from sklearn.metrics import average_precision_score
+                train_ap = float(average_precision_score(train_labels, train_probs[:, 1]))
+            except Exception as e:
+                logger.warning(f"⚠ 计算训练集PR-AUC失败: {e}")
+
         train_f1_star = None
         train_threshold_star = None
         if X_val_split is None:
@@ -964,6 +979,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
 
         val_f1 = None
         val_threshold = None
+        val_ap = None
 
         if X_val_split is not None:
             classifier.eval()
@@ -990,6 +1006,12 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
 
             val_probs = np.concatenate(all_val_probs)
             val_labels = np.concatenate(all_val_labels)
+            if monitor_pr_auc:
+                try:
+                    from sklearn.metrics import average_precision_score
+                    val_ap = float(average_precision_score(val_labels, val_probs[:, 1]))
+                except Exception as e:
+                    logger.warning(f"⚠ 计算验证集PR-AUC失败: {e}")
             val_threshold, val_metric, _ = find_optimal_threshold(val_labels, val_probs, metric='f1_binary', positive_class=1)
             val_preds = (val_probs[:, 1] >= float(val_threshold)).astype(int)
             val_f1 = f1_score(val_labels, val_preds, pos_label=1, zero_division=0)
@@ -1016,6 +1038,13 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         history['val_threshold'].append(val_threshold if val_threshold is not None else np.nan)
         history['train_f1_star'].append(train_f1_star if train_f1_star is not None else np.nan)
         history['train_threshold_star'].append(train_threshold_star if train_threshold_star is not None else np.nan)
+        if monitor_pr_auc:
+            if 'train_ap' not in history:
+                history['train_ap'] = []
+            if 'val_ap' not in history:
+                history['val_ap'] = []
+            history['train_ap'].append(train_ap if train_ap is not None else np.nan)
+            history['val_ap'].append(val_ap if val_ap is not None else np.nan)
         
         # 早停检查
         if use_early_stopping and (epoch + 1) >= es_warmup_epochs:
@@ -1034,13 +1063,27 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         # 输出日志
         progress = (epoch + 1) / config.FINETUNE_EPOCHS * 100
         if val_f1 is not None:
-            logger.info(f"[Stage 3] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
-                      f"Loss: {epoch_loss:.4f} | TrF1: {train_f1:.4f} | ValF1*: {val_f1:.4f} | Th: {val_threshold:.4f}")
+            msg = (
+                f"[Stage 3] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
+                f"Loss: {epoch_loss:.4f} | "
+                f"L(total={epoch_losses['total']:.4f}, sup={epoch_losses['supervision']:.4f}, a={epoch_losses['stream_a']:.4f}, b={epoch_losses['stream_b']:.4f}) | "
+                f"TrF1: {train_f1:.4f} | ValF1*: {val_f1:.4f} | Th: {val_threshold:.4f}"
+            )
+            if monitor_pr_auc:
+                msg += f" | TrAP: {float(train_ap) if train_ap is not None else float('nan'):.4f} | ValAP: {float(val_ap) if val_ap is not None else float('nan'):.4f}"
+            logger.info(msg)
         else:
             train_f1_star_disp = float(train_f1_star) if train_f1_star is not None else float('nan')
             train_th_star_disp = float(train_threshold_star) if train_threshold_star is not None else float('nan')
-            logger.info(f"[Stage 3] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
-                      f"Loss: {epoch_loss:.4f} | TrF1: {train_f1:.4f} | TrF1*: {train_f1_star_disp:.4f} | Th: {train_th_star_disp:.4f}")
+            msg = (
+                f"[Stage 3] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
+                f"Loss: {epoch_loss:.4f} | "
+                f"L(total={epoch_losses['total']:.4f}, sup={epoch_losses['supervision']:.4f}, a={epoch_losses['stream_a']:.4f}, b={epoch_losses['stream_b']:.4f}) | "
+                f"TrF1: {train_f1:.4f} | TrF1*: {train_f1_star_disp:.4f} | Th: {train_th_star_disp:.4f}"
+            )
+            if monitor_pr_auc:
+                msg += f" | TrAP: {float(train_ap) if train_ap is not None else float('nan'):.4f}"
+            logger.info(msg)
 
     # 输出阶段总结
     actual_epochs = len(history['train_loss'])

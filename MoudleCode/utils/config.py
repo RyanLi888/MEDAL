@@ -368,12 +368,12 @@ class Config:
     # 3.2 训练基础参数
     FINETUNE_EPOCHS = 1000                  # 最大训练轮数（恢复最优配置）
     FINETUNE_BATCH_SIZE = 128               # 批次大小
-    FINETUNE_LR = 3e-4                      # 学习率
+    FINETUNE_LR = 2e-4                      # 学习率
     FINETUNE_MIN_LR = 1e-6                  # 最小学习率
     TEST_BATCH_SIZE = 256                   # 测试批次大小
     
     # 3.3 早停机制（智能训练终止）
-    FINETUNE_EARLY_STOPPING = True          # 启用早停
+    FINETUNE_EARLY_STOPPING = True         # 启用早停
     FINETUNE_ES_WARMUP_EPOCHS = 100         # 预热轮数（前N轮不触发早停）- 增加预热
     FINETUNE_ES_PATIENCE = 50               # 耐心值（连续N轮无改善则停止）- 增加耐心
     FINETUNE_ES_MIN_DELTA = 0.001           # F1改善阈值（需要明显改善）- 提高阈值
@@ -392,7 +392,7 @@ class Config:
     
     # 3.6 骨干网络微调（最优配置）
     FINETUNE_BACKBONE = True               # 关闭骨干微调（最优配置）
-    FINETUNE_BACKBONE_SCOPE = 'projection'  # 微调范围
+    FINETUNE_BACKBONE_SCOPE = 'all'  # 微调范围
     FINETUNE_BACKBONE_LR = 2e-5             # 骨干网络学习率
     FINETUNE_BACKBONE_WARMUP_EPOCHS = 50    # 预热轮数
     

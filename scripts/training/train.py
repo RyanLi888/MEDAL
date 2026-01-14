@@ -839,6 +839,9 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     best_state = None
     best_threshold = float(getattr(config, 'MALICIOUS_THRESHOLD', 0.5))
     finetuned_backbone_path = None
+
+    keep_last_k_minloss = int(getattr(config, 'KEEP_LAST_K_MINLOSS_EPOCHS', 10))
+    last_k_loss_states = []
     
     # 早停配置
     use_early_stopping = bool(getattr(config, 'FINETUNE_EARLY_STOPPING', False))
@@ -954,6 +957,13 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         epoch_loss /= n_batches
         for key in epoch_losses:
             epoch_losses[key] /= n_batches
+
+        # 记录最后K轮的loss最小模型（仅用于训练结束后选取一个保存）
+        if keep_last_k_minloss > 0:
+            current_state = {k: v.detach().cpu().clone() for k, v in classifier.state_dict().items()}
+            last_k_loss_states.append((int(epoch + 1), float(epoch_loss), current_state))
+            if len(last_k_loss_states) > keep_last_k_minloss:
+                last_k_loss_states = last_k_loss_states[-keep_last_k_minloss:]
         
         # 计算训练集F1
         train_probs = np.concatenate(all_train_probs)
@@ -1046,21 +1056,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             history['train_ap'].append(train_ap if train_ap is not None else np.nan)
             history['val_ap'].append(val_ap if val_ap is not None else np.nan)
         
-        # 早停检查
-        if use_early_stopping and (epoch + 1) >= es_warmup_epochs:
-            current_metric = val_f1 if val_f1 is not None else train_f1_star
-            if current_metric is not None:
-                current_metric = float(current_metric)
-                if current_metric > (best_es_metric + es_min_delta):
-                    best_es_metric = current_metric
-                    no_improve_count = 0
-                else:
-                    no_improve_count += 1
-                    if no_improve_count >= es_patience:
-                        log_early_stopping(logger, epoch+1, best_epoch, best_f1, current_metric, no_improve_count, es_patience)
-                        break
-        
-        # 输出日志
+        # 输出日志（先输出再早停，保证触发早停的最后一轮也有epoch日志）
         progress = (epoch + 1) / config.FINETUNE_EPOCHS * 100
         if val_f1 is not None:
             msg = (
@@ -1084,6 +1080,20 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             if monitor_pr_auc:
                 msg += f" | TrAP: {float(train_ap) if train_ap is not None else float('nan'):.4f}"
             logger.info(msg)
+
+        # 早停检查
+        if use_early_stopping and (epoch + 1) >= es_warmup_epochs:
+            current_metric = val_f1 if val_f1 is not None else train_f1_star
+            if current_metric is not None:
+                current_metric = float(current_metric)
+                if current_metric > (best_es_metric + es_min_delta):
+                    best_es_metric = current_metric
+                    no_improve_count = 0
+                else:
+                    no_improve_count += 1
+                    if no_improve_count >= es_patience:
+                        log_early_stopping(logger, epoch+1, best_epoch, best_f1, current_metric, no_improve_count, es_patience)
+                        break
 
     # 输出阶段总结
     actual_epochs = len(history['train_loss'])
@@ -1126,6 +1136,21 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         best_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_best_f1.pth")
         torch.save(best_state, best_path)
 
+    # 保存最后10轮(默认)中loss最小的模型
+    minloss_path = None
+    if keep_last_k_minloss > 0 and len(last_k_loss_states) > 0:
+        try:
+            min_epoch, min_loss, min_state = min(last_k_loss_states, key=lambda t: float(t[1]))
+            minloss_path = os.path.join(
+                config.CLASSIFICATION_DIR,
+                "models",
+                f"classifier_last{int(keep_last_k_minloss)}_minloss_epoch{int(min_epoch)}.pth"
+            )
+            torch.save(min_state, minloss_path)
+            logger.info(f"✓ 已保存最后{int(keep_last_k_minloss)}轮中loss最小模型: epoch={int(min_epoch)} loss={float(min_loss):.6f}")
+        except Exception as e:
+            logger.warning(f"⚠ 保存最后{int(keep_last_k_minloss)}轮loss最小模型失败: {e}")
+
     final_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_final.pth")
     final_state = {k: v.detach().cpu().clone() for k, v in classifier.state_dict().items()}
     torch.save(final_state, final_path)
@@ -1159,6 +1184,8 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         "训练历史": history_path,
         "模型元数据": metadata_path
     }
+    if minloss_path is not None:
+        output_files[f"最后{int(keep_last_k_minloss)}轮loss最小模型"] = minloss_path
     if finetuned_backbone_path:
         output_files["微调骨干网络"] = finetuned_backbone_path
     

@@ -533,15 +533,28 @@ def main(args):
     # ========================
     best_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_best_f1.pth")
     final_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_final.pth")
+    minloss_candidates = []
+    try:
+        models_dir = os.path.join(config.CLASSIFICATION_DIR, "models")
+        if os.path.isdir(models_dir):
+            for fn in os.listdir(models_dir):
+                if isinstance(fn, str) and fn.startswith("classifier_last10_minloss_epoch") and fn.endswith(".pth"):
+                    minloss_candidates.append(os.path.join(models_dir, fn))
+    except Exception:
+        minloss_candidates = []
     
     # 检查哪些模型存在
     has_best = os.path.exists(best_path)
     has_final = os.path.exists(final_path)
+    minloss_path = sorted(minloss_candidates)[-1] if len(minloss_candidates) > 0 else None
+    has_minloss = bool(minloss_path) and os.path.exists(minloss_path)
     
-    if not has_best and not has_final:
+    if not has_best and not has_final and not has_minloss:
         logger.error(f"❌ 未找到任何分类器检查点!")
         logger.error(f"  Best模型: {best_path}")
         logger.error(f"  Final模型: {final_path}")
+        if minloss_path:
+            logger.error(f"  Last10-MinLoss模型: {minloss_path}")
         logger.error("请先运行训练脚本!")
         return
     
@@ -606,6 +619,7 @@ def main(args):
     logger.info("="*70)
     logger.info(f"  Best F1模型: {'✓ 存在' if has_best else '✗ 不存在'}")
     logger.info(f"  Final模型:   {'✓ 存在' if has_final else '✗ 不存在'}")
+    logger.info(f"  Last10-MinLoss模型: {'✓ 存在' if has_minloss else '✗ 不存在'}")
     logger.info("")
     
     models_to_test = []
@@ -613,6 +627,8 @@ def main(args):
         models_to_test.append(("Best F1", best_path))
     if has_final:
         models_to_test.append(("Final", final_path))
+    if has_minloss:
+        models_to_test.append(("Last10-MinLoss", minloss_path))
     
     all_metrics = {}
     
@@ -646,7 +662,12 @@ def main(args):
             logger.info("")
         
         # Test model with specific save prefix
-        save_prefix = "test_best" if model_name == "Best F1" else "test_final"
+        if model_name == "Best F1":
+            save_prefix = "test_best"
+        elif model_name == "Final":
+            save_prefix = "test_final"
+        else:
+            save_prefix = "test_last10_minloss"
         logger.info(f"🔧 RNG指纹(进入test_model前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         metrics = test_model(classifier, X_test, y_test, config, logger, save_prefix=save_prefix)
         logger.info(f"🔧 RNG指纹(test_model返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
@@ -672,43 +693,34 @@ def main(args):
         logger.info("="*70)
         logger.info("")
         
-        # 创建对比表格
-        logger.info(f"{'指标':<20} | {'Best F1':<12} | {'Final':<12} | {'差异':<12}")
-        logger.info("-"*70)
-        
-        metrics_to_compare = ['accuracy', 'precision', 'recall', 'f1', 'f1_macro', 'auc']
-        metric_names = {
-            'accuracy': 'Accuracy',
-            'precision': 'Precision (pos=1)',
-            'recall': 'Recall (pos=1)',
-            'f1': 'F1 (pos=1)',
-            'f1_macro': 'F1-Macro',
-            'auc': 'AUC'
-        }
-        
-        for metric_key in metrics_to_compare:
-            if metric_key in all_metrics.get("Best F1", {}) and metric_key in all_metrics.get("Final", {}):
-                best_val = all_metrics["Best F1"][metric_key]
-                final_val = all_metrics["Final"][metric_key]
-                diff = final_val - best_val
-                diff_str = f"{diff:+.4f}" if abs(diff) > 0.0001 else "0.0000"
-                
-                # 标记哪个更好
-                if abs(diff) > 0.001:
-                    if diff > 0:
-                        marker = " ← Final更好"
-                    else:
-                        marker = " ← Best更好"
-                else:
-                    marker = " (相近)"
-                
-                logger.info(f"{metric_names[metric_key]:<20} | {best_val:<12.4f} | {final_val:<12.4f} | {diff_str:<12}{marker}")
-        
-        logger.info("")
-        logger.info("💡 说明:")
-        logger.info("  - Best F1: 训练过程中验证集F1最高的模型")
-        logger.info("  - Final: 训练结束时的最终模型")
-        logger.info("  - 差异: Final - Best F1 (正值表示Final更好)")
+        # 创建对比表格（支持三模型）
+        header = f"{'Model':<16} | {'F1(pos=1)':>9} | {'Prec':>9} | {'Recall':>9} | {'AUC':>9}"
+        logger.info(header)
+        logger.info("-" * len(header))
+
+        def _get(m: dict, k: str, fallback: float = float('nan')) -> float:
+            try:
+                return float(m.get(k, fallback))
+            except Exception:
+                return fallback
+
+        def _score(m: dict) -> float:
+            if not isinstance(m, dict):
+                return float('-inf')
+            if 'f1' in m:
+                return float(m['f1'])
+            if 'f1_pos' in m:
+                return float(m['f1_pos'])
+            return float('-inf')
+
+        ranked = sorted(all_metrics.items(), key=lambda kv: _score(kv[1]), reverse=True)
+        for name, m in ranked:
+            f1v = _get(m, 'f1', _get(m, 'f1_pos'))
+            pv = _get(m, 'precision', _get(m, 'precision_pos'))
+            rv = _get(m, 'recall', _get(m, 'recall_pos'))
+            aucv = _get(m, 'auc')
+            logger.info(f"{name:<16} | {f1v:9.4f} | {pv:9.4f} | {rv:9.4f} | {aucv:9.4f}")
+
         logger.info("")
 
     chosen_name = None

@@ -181,8 +181,9 @@ echo "4) 骨干网络训练 (Stage 1 only)"
 echo "5) 骨干网络评估 (对比不同方法)"
 echo "6) 干净数据训练+测试 (消融实验)"
 echo "7) 数据增强训练+测试 (消融实验)"
+echo "8) 完整流程去除数据增强 (特征提取+标签矫正+分类训练)"
 echo ""
-echo -n "请输入选择 (1-7): "
+echo -n "请输入选择 (1-8): "
 read -r choice
 
 case $choice in
@@ -260,6 +261,16 @@ case $choice in
         fi
         MODE="数据增强训练+测试 (消融实验)"
         LOG_PREFIX="ablation_data_augmentation"
+        ;;
+    8)
+        select_backbone true
+        if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
+            CMD="python scripts/training/train_no_augmentation_then_test.py --backbone_path $BACKBONE_PATH"
+        else
+            CMD="python scripts/training/train_no_augmentation_then_test.py --retrain_backbone"
+        fi
+        MODE="完整流程去除数据增强 (特征提取+标签矫正+分类训练)"
+        LOG_PREFIX="no_augmentation_train_test"
         ;;
     *)
         echo -e "${RED}无效选择${NC}"

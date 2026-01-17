@@ -411,6 +411,22 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
         cl_confidence = pred_probs.max(axis=1)
     
     logger.info("✓ 标签矫正完成")
+
+    # drop 不删除数据：将 drop 样本归类为 reweight（低权重）
+    try:
+        drop_mask = (action_mask == 2)
+        if hasattr(correction_weight, '__len__') and int(drop_mask.sum()) > 0:
+            correction_weight = correction_weight.astype(np.float32, copy=True)
+            drop_reweight = float(getattr(config, 'STAGE2_DROP_AS_REWEIGHT_WEIGHT', 0.1))
+            correction_weight[drop_mask] = np.minimum(correction_weight[drop_mask], drop_reweight)
+            try:
+                action_mask = np.asarray(action_mask).copy()
+                action_mask[drop_mask] = 3
+            except Exception:
+                pass
+            logger.info(f"🧹 drop样本不删除：已将其归类为reweight并设为低权重 (count={int(drop_mask.sum())}, w={drop_reweight})")
+    except Exception:
+        pass
     
     # 保存矫正结果
     correction_results_path = os.path.join(config.LABEL_CORRECTION_DIR, "models", "correction_results.npz")
@@ -444,16 +460,16 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
         "重加权样本": correction_stats['n_reweight']
     }, "标签矫正统计")
 
-    # 准备干净数据
-    X_clean = X_train[keep_mask]
-    y_clean = y_corrected[keep_mask]
-    weights_clean = correction_weight[keep_mask]
-    Z_clean = features[keep_mask]
+    # Stage2 输出：保留全部原始样本（包括 drop，但其权重=0）
+    X_all = X_train
+    y_all = y_corrected
+    weights_all = correction_weight
+    Z_all = features
 
-    # 保存原始序列用于Stage 3混合训练
+    # 保存原始序列用于Stage 3混合训练（保留全部原始样本，drop 的权重为0）
     try:
         real_kept_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "real_kept_data.npz")
-        np.savez(real_kept_path, X_real=X_clean, y_real=y_clean, sample_weights_real=weights_clean)
+        np.savez(real_kept_path, X_real=X_all, y_real=y_all, sample_weights_real=weights_all)
         logger.info(f"  ✓ 已保存原始序列: {real_kept_path}")
     except Exception as e:
         logger.warning(f"⚠ 无法保存原始序列: {e}")
@@ -462,16 +478,37 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
 
     if not stage2_use_tabddpm:
         logger.info("")
+
         logger.info("步骤 2.2: TabDDPM 数据增强（已跳过）")
-        Z_augmented = Z_clean
-        y_augmented = y_clean
-        sample_weights = weights_clean
-        n_train_original = int(Z_clean.shape[0])
+        Z_augmented = Z_all
+        y_augmented = y_all
+        sample_weights = weights_all
+        n_train_original = int(Z_all.shape[0])
         return Z_augmented, y_augmented, sample_weights, correction_stats, None, n_train_original
     
     # TabDDPM 数据增强
     log_subsection_header(logger, "步骤 2.2: TabDDPM 数据增强 (Feature Space)")
     logger.info(f"  目标: 在骨干网络特征空间中训练/生成")
+
+    # 数据增强仅使用高权重数据（来自标签矫正权重）
+    try:
+        aug_min_w = float(getattr(config, 'STAGE2_AUGMENT_MIN_WEIGHT', getattr(config, 'STAGE2_FEATURE_TIER2_MIN_WEIGHT', 0.7)))
+    except Exception:
+        aug_min_w = 0.7
+    aug_mask = (np.asarray(weights_all) >= float(aug_min_w))
+    Z_clean = Z_all[aug_mask]
+    y_clean = np.asarray(y_all)[aug_mask]
+    weights_clean = np.asarray(weights_all)[aug_mask]
+    logger.info(f"🧪 TabDDPM训练/增强仅使用高权重样本: {int(aug_mask.sum())}/{len(Z_all)} (threshold={aug_min_w})")
+    try:
+        if len(weights_clean) > 0:
+            logger.info(
+                f"🧪 TabDDPM训练集权重统计: min={float(np.min(weights_clean)):.4f}, mean={float(np.mean(weights_clean)):.4f}, max={float(np.max(weights_clean)):.4f}"
+            )
+    except Exception:
+        pass
+    
+    logger.info(f"🔧 RNG指纹(Stage2-TabDDPM训练前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     
     tabddpm = TabDDPM(
         config,
@@ -506,7 +543,9 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
     ddpm_es_smooth_window = int(getattr(config, 'DDPM_ES_SMOOTH_WINDOW', 5))
 
     dataset_ddpm = TensorDataset(torch.FloatTensor(Z_clean), torch.LongTensor(y_clean))
+    logger.info(f"🔧 RNG指纹(Stage2-TabDDPM DataLoader创建前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     loader_ddpm = DataLoader(dataset_ddpm, batch_size=2048, shuffle=True)
+    logger.info(f"🔧 RNG指纹(Stage2-TabDDPM DataLoader创建后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
 
     ddpm_best_loss = float('inf')
     ddpm_best_epoch = -1
@@ -571,11 +610,23 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
 
     # 生成增强特征
     logger.info("步骤 2.3: 生成增强特征")
-    Z_augmented, y_augmented, sample_weights = tabddpm.augment_feature_dataset(Z_clean, y_clean, weights_clean)
+    Z_syn, y_syn, w_syn = tabddpm.augment_feature_dataset(Z_clean, y_clean, weights_clean)
 
-    n_train_original = int(Z_clean.shape[0])
-    n_synthetic = int(Z_augmented.shape[0] - n_train_original)
-    logger.info(f"✓ 特征增强完成: {n_train_original} → {len(Z_augmented)} (合成={n_synthetic})")
+    n_train_original = int(Z_all.shape[0])
+    n_syn = int(Z_syn.shape[0] - int(Z_clean.shape[0]))
+    if n_syn > 0:
+        Z_syn_only = Z_syn[-n_syn:]
+        y_syn_only = y_syn[-n_syn:]
+        w_syn_only = np.ones((len(y_syn_only),), dtype=np.float32)
+    else:
+        Z_syn_only = np.zeros((0, Z_all.shape[1]), dtype=Z_all.dtype)
+        y_syn_only = np.zeros((0,), dtype=np.asarray(y_all).dtype)
+        w_syn_only = np.zeros((0,), dtype=np.asarray(weights_all).dtype)
+
+    Z_augmented = np.concatenate([Z_all, Z_syn_only], axis=0)
+    y_augmented = np.concatenate([np.asarray(y_all), np.asarray(y_syn_only)], axis=0)
+    sample_weights = np.concatenate([np.asarray(weights_all, dtype=np.float32), np.asarray(w_syn_only, dtype=np.float32)], axis=0)
+    logger.info(f"✓ 特征增强完成: 原始={n_train_original} + 合成={len(Z_syn_only)} → 总计={len(Z_augmented)}")
 
     # 保存模型和数据
     tabddpm_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "tabddpm_feature.pth")
@@ -596,7 +647,7 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
     log_stage_end(logger, "Stage 2", {
         "原始样本": n_train_original,
         "增强后样本": len(Z_augmented),
-        "合成样本": n_synthetic
+        "合成样本": n_syn
     })
 
     return Z_augmented, y_augmented, sample_weights, correction_stats, tabddpm, n_train_original
@@ -659,6 +710,27 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     else:
         logger.info(f"  - 输入类型: 原始序列 (3D)")
     logger.info("")
+
+    # 原始样本：权重>0.8 的做有标签监督训练（样本权重=2.0）；<=0.8 的进入无标签半监督训练
+    sw = np.asarray(sample_weights, dtype=np.float32) if hasattr(sample_weights, '__len__') else None
+    sup_thr = float(getattr(config, 'STAGE3_SUP_WEIGHT_THRESHOLD', 0.8))
+    real_sup_weight = float(getattr(config, 'STAGE3_REAL_SUP_WEIGHT', 2.0))
+    syn_weight = float(getattr(config, 'STAGE3_SYN_WEIGHT', 1.0))
+    unlabeled_scale = float(getattr(config, 'STAGE3_UNLABELED_LOSS_SCALE', 1.0))
+
+    orig_n = 0
+    if n_original is not None:
+        try:
+            orig_n = min(int(n_original), int(len(y_train)))
+        except Exception:
+            orig_n = 0
+
+    orig_sup_mask = None
+    orig_unlab_mask = None
+    if sw is not None and orig_n > 0:
+        orig_sup_mask = (sw[:orig_n] > sup_thr)
+        orig_unlab_mask = ~orig_sup_mask
+        logger.info(f"� Stage3 原始样本监督/无标签划分: supervised={int(orig_sup_mask.sum())}, unlabeled={int(orig_unlab_mask.sum())}, threshold={sup_thr}")
 
     # 混合训练模式检查
     if use_mixed_stream and not has_real_sequences:
@@ -779,52 +851,127 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         logger.info("📊 全量训练（不划分验证集）")
     
     # 数据加载器
+    # 构建监督/无标签数据（支持 2D 特征 或 mixed-stream 的 3D 原始序列）
+    def _sym_kl(p, q):
+        p = p.clamp_min(1e-8)
+        q = q.clamp_min(1e-8)
+        return (p * (p.log() - q.log())).sum(dim=1) + (q * (q.log() - p.log())).sum(dim=1)
+
+    X_np = X_train_split
+    y_np = np.asarray(y_train_split)
+    sw_np = np.asarray(sample_weights_split, dtype=np.float32)
+
+    # 合成样本（默认位于尾部：原始n_original + syn_only）
+    if orig_n > 0:
+        syn_idx_start = orig_n
+    else:
+        syn_idx_start = 0
+
+    syn_mask = np.zeros(len(sw_np), dtype=bool)
+    if syn_idx_start < len(sw_np):
+        syn_mask[syn_idx_start:] = True
+
+    sup_mask = syn_mask.copy()
+    unlab_mask = np.zeros(len(sw_np), dtype=bool)
+    if orig_n > 0 and orig_sup_mask is not None:
+        sup_mask[:orig_n] = orig_sup_mask
+        unlab_mask[:orig_n] = orig_unlab_mask
+    else:
+        # 无 n_original 信息时：按权重阈值划分（保守）
+        if sw is not None:
+            sup_mask = (sw_np > sup_thr)
+            unlab_mask = ~sup_mask
+
+    # 监督样本权重：原始高权重=2.0，合成=1.0
+    sw_sup = np.ones(int(sup_mask.sum()), dtype=np.float32) * syn_weight
+    try:
+        if orig_n > 0 and orig_sup_mask is not None:
+            n_orig_sup = int(orig_sup_mask.sum())
+            if n_orig_sup > 0:
+                sw_sup[:n_orig_sup] = real_sup_weight
+    except Exception:
+        pass
+
+    X_sup = X_np[sup_mask]
+    y_sup = y_np[sup_mask]
+
     train_dataset = TensorDataset(
-        torch.FloatTensor(X_train_split),
-        torch.LongTensor(y_train_split),
-        torch.FloatTensor(sample_weights_split)
+        torch.FloatTensor(X_sup),
+        torch.LongTensor(y_sup),
+        torch.FloatTensor(sw_sup)
     )
+
+    unlab_dataset = None
+    if int(unlab_mask.sum()) > 0:
+        X_unlab = X_np[unlab_mask]
+        unlab_dataset = TensorDataset(torch.FloatTensor(X_unlab))
     
-    # 平衡采样
+    # 平衡采样（基于 supervised 数据集）
     use_balanced_sampling = getattr(config, 'USE_BALANCED_SAMPLING', True)
     if use_balanced_sampling:
         from torch.utils.data import WeightedRandomSampler
         target_ratio = float(getattr(config, 'BALANCED_SAMPLING_RATIO', 1.0))
-        class_counts = np.bincount(y_train_split)
-        weight_benign = target_ratio * class_counts[1] / max(class_counts[0], 1)
-        weight_malicious = 1.0
-        class_weights = np.array([weight_benign, weight_malicious])
-        sample_sampling_weights = class_weights[y_train_split]
-        sampler = WeightedRandomSampler(
-            weights=torch.as_tensor(sample_sampling_weights, dtype=torch.double),
-            num_samples=len(sample_sampling_weights), replacement=True
-        )
-        train_loader = DataLoader(train_dataset, batch_size=config.FINETUNE_BATCH_SIZE, sampler=sampler)
-        logger.info(f"🌡️ 温室训练: 平衡采样 (目标比例 {target_ratio}:1)")
+        try:
+            class_counts = np.bincount(np.asarray(y_sup, dtype=int))
+            if len(class_counts) < 2:
+                class_counts = np.pad(class_counts, (0, 2 - len(class_counts)), constant_values=0)
+            weight_benign = target_ratio * class_counts[1] / max(class_counts[0], 1)
+            weight_malicious = 1.0
+            class_weights = np.array([weight_benign, weight_malicious])
+            sample_sampling_weights = class_weights[np.asarray(y_sup, dtype=int)]
+            sampler = WeightedRandomSampler(
+                weights=torch.as_tensor(sample_sampling_weights, dtype=torch.double),
+                num_samples=len(sample_sampling_weights), replacement=True
+            )
+            train_loader = DataLoader(train_dataset, batch_size=config.FINETUNE_BATCH_SIZE, sampler=sampler)
+            logger.info(f"🌡️ 温室训练: 平衡采样 (目标比例 {target_ratio}:1)")
+        except Exception:
+            train_loader = DataLoader(train_dataset, batch_size=config.FINETUNE_BATCH_SIZE, shuffle=True)
     else:
         train_loader = DataLoader(train_dataset, batch_size=config.FINETUNE_BATCH_SIZE, shuffle=True)
     
-    # 混合训练数据加载器
+    # 混合训练数据加载器（原始序列分为 supervised / unlabeled）
     real_loader = None
+    unlab_real_loader = None
     if use_mixed_stream and has_real_sequences:
         n_real = len(X_train_real)
-        y_real = y_train_split[:n_real] if n_real <= len(y_train_split) else y_train_split
-        w_real = sample_weights_split[:n_real] if n_real <= len(sample_weights_split) else sample_weights_split
-        
+        real_n = min(int(orig_n), int(n_real)) if orig_n > 0 else min(len(y_train_split), int(n_real))
+
+        y_real_all = y_np[:real_n]
+        if orig_sup_mask is None or orig_unlab_mask is None or real_n == 0:
+            real_sup_sel = np.ones(real_n, dtype=bool)
+            real_unlab_sel = np.zeros(real_n, dtype=bool)
+        else:
+            real_sup_sel = orig_sup_mask[:real_n]
+            real_unlab_sel = orig_unlab_mask[:real_n]
+
+        X_real_sup = X_train_real[:real_n][real_sup_sel]
+        y_real_sup = y_real_all[real_sup_sel]
+        w_real_sup = np.ones(len(y_real_sup), dtype=np.float32) * real_sup_weight
+
         real_dataset = TensorDataset(
-            torch.FloatTensor(X_train_real[:len(y_real)]),
-            torch.LongTensor(y_real),
-            torch.FloatTensor(w_real)
+            torch.FloatTensor(X_real_sup),
+            torch.LongTensor(y_real_sup),
+            torch.FloatTensor(w_real_sup)
         )
         real_batch_size = int(getattr(config, 'STAGE3_MIXED_REAL_BATCH_SIZE', 32))
         real_loader = DataLoader(real_dataset, batch_size=real_batch_size, shuffle=True)
-        
+
+        if int(real_unlab_sel.sum()) > 0:
+            X_real_unlab = X_train_real[:real_n][real_unlab_sel]
+            unlab_real_dataset = TensorDataset(torch.FloatTensor(X_real_unlab))
+            unlab_real_loader = DataLoader(unlab_real_dataset, batch_size=real_batch_size, shuffle=True)
+
         syn_batch_size = int(getattr(config, 'STAGE3_MIXED_SYN_BATCH_SIZE', 96))
         train_loader = DataLoader(train_dataset, batch_size=syn_batch_size, shuffle=True)
         
         logger.info(f"✓ 混合训练加载器: 原始={len(real_loader)}批, 增强={len(train_loader)}批")
+        if unlab_real_loader is not None:
+            logger.info(f"✓ 无标签原始加载器: {len(unlab_real_loader)}批")
     
     logger.info(f"✓ 数据加载器准备完成 ({len(train_loader)} 个批次)")
+
+    unlab_iter = None
 
     # 训练历史
     history = {
@@ -877,6 +1024,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             max_batches = max(len(real_loader), len(train_loader))
             real_iter = itertools.cycle(real_loader)
             syn_iter = itertools.cycle(train_loader)
+            unlab_iter = itertools.cycle(unlab_real_loader) if unlab_real_loader is not None else None
             
             for batch_idx in range(max_batches):
                 X_real, y_real, w_real = next(real_iter)
@@ -899,8 +1047,22 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
                 
                 loss_real, loss_dict_real = criterion(classifier.dual_mlp, z_real, y_real, w_real, epoch, config.FINETUNE_EPOCHS)
                 loss_syn, loss_dict_syn = criterion(classifier.dual_mlp, Z_syn, y_syn, w_syn, epoch, config.FINETUNE_EPOCHS)
-                
-                loss = real_loss_scale * loss_real + syn_loss_scale * loss_syn
+
+                loss_unlab = 0.0
+                if unlab_iter is not None and unlabeled_scale > 0:
+                    (X_unlab_real,) = next(unlab_iter)
+                    X_unlab_real = X_unlab_real.to(config.DEVICE)
+                    if backbone_finetune_active:
+                        z_unlab = backbone(X_unlab_real, return_sequence=False)
+                    else:
+                        with torch.no_grad():
+                            z_unlab = backbone(X_unlab_real, return_sequence=False)
+                    logits_a, logits_b = classifier.dual_mlp(z_unlab, return_separate=True)
+                    p_a = torch.softmax(logits_a, dim=1)
+                    p_b = torch.softmax(logits_b, dim=1)
+                    loss_unlab = _sym_kl(p_a, p_b).mean()
+
+                loss = real_loss_scale * loss_real + syn_loss_scale * loss_syn + unlabeled_scale * loss_unlab
                 loss.backward()
                 optimizer.step()
                 
@@ -936,7 +1098,22 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
                             z = backbone(X_batch, return_sequence=False)
 
                 loss, loss_dict = criterion(classifier.dual_mlp, z, y_batch, w_batch, epoch, config.FINETUNE_EPOCHS)
-                loss.backward()
+
+                # 无标签半监督：对低权重原始样本做双头一致性（仅特征模式有效）
+                loss_unlab = 0.0
+                if unlab_dataset is not None and unlabeled_scale > 0:
+                    try:
+                        (X_unlab_feat,) = next(unlab_iter)
+                    except Exception:
+                        unlab_iter = iter(DataLoader(unlab_dataset, batch_size=config.FINETUNE_BATCH_SIZE, shuffle=True))
+                        (X_unlab_feat,) = next(unlab_iter)
+                    X_unlab_feat = X_unlab_feat.to(config.DEVICE)
+                    logits_a, logits_b = classifier.dual_mlp(X_unlab_feat, return_separate=True)
+                    p_a = torch.softmax(logits_a, dim=1)
+                    p_b = torch.softmax(logits_b, dim=1)
+                    loss_unlab = _sym_kl(p_a, p_b).mean()
+
+                (loss + unlabeled_scale * loss_unlab).backward()
                 optimizer.step()
 
                 epoch_loss += float(loss_dict['total'])
@@ -1398,9 +1575,19 @@ def main(args):
         else:
             actual_backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
         
+        X_train_real = None
+        try:
+            real_kept_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "real_kept_data.npz")
+            if os.path.exists(real_kept_path):
+                real_pack = np.load(real_kept_path)
+                X_train_real = real_pack.get('X_real', None)
+        except Exception:
+            X_train_real = None
+
         classifier, finetune_history, optimal_threshold = stage3_finetune_classifier(
-            backbone, X_augmented, y_augmented, sample_weights, config, logger, 
-            n_original=n_original, backbone_path=actual_backbone_path
+            backbone, X_augmented, y_augmented, sample_weights, config, logger,
+            n_original=n_original, backbone_path=actual_backbone_path, X_train_real=X_train_real,
+            use_mixed_stream=bool(getattr(config, 'STAGE3_MIXED_STREAM', False))
         )
         logger.info(f"🔧 RNG指纹(Stage3返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     else:
@@ -1429,7 +1616,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MEDAL-Lite 训练脚本")
     
-    parser.add_argument("--noise_rate", type=float, default=0.30, help="标签噪声率")
+    parser.add_argument("--noise_rate", type=float, default=None, help="标签噪声率（默认使用config.LABEL_NOISE_RATE）")
     parser.add_argument("--start_stage", type=str, default="1", choices=["1", "2", "3"], help="起始阶段")
     parser.add_argument("--end_stage", type=str, default="3", choices=["1", "2", "3"], help="结束阶段")
     parser.add_argument("--backbone_path", type=str, default=None, help="骨干网络路径")
@@ -1437,6 +1624,7 @@ if __name__ == "__main__":
     parser.add_argument("--stage2_mode", type=str, default="standard", choices=["standard", "clean_augment_only"], help="Stage 2模式")
     
     args = parser.parse_args()
-    config.LABEL_NOISE_RATE = args.noise_rate
+    if args.noise_rate is not None:
+        config.LABEL_NOISE_RATE = args.noise_rate
     
     main(args)

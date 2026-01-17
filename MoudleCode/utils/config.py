@@ -287,8 +287,8 @@ class Config:
     STAGE2_FEATURE_AUG_MULTIPLIER = 2       # 默认增强倍数（向后兼容）
     
     # 类别特定增强倍数（2:1 策略 - 正常:恶意 = 2:1）
-    STAGE2_BENIGN_AUG_MULTIPLIER = 6        # 正常样本增强2x（250→750，适度增强）
-    STAGE2_MALICIOUS_AUG_MULTIPLIER = 3     # 恶意样本增强1x（250→500，保持学习能力）
+    STAGE2_BENIGN_AUG_MULTIPLIER = 4        # 正常样本增强（适度恢复，提升覆盖）
+    STAGE2_MALICIOUS_AUG_MULTIPLIER = 3     # 恶意样本增强（适度恢复，提升覆盖）
     # 预期结果: 750正常 + 500恶意 = 1250 (60%正常, 40%恶意)
     
     # 向后兼容：固定倍数模式
@@ -301,6 +301,9 @@ class Config:
     STAGE2_FEATURE_TIER2_MIN_WEIGHT = 0.7   # Tier2最低权重
     STAGE2_FEATURE_TIER2_MULTIPLIER = 5     # Tier2增强倍数
     STAGE2_FEATURE_LOWCONF_MULTIPLIER = 0   # 低置信度样本不增强
+
+    # Stage2 增强数据过滤：仅允许高权重样本参与TabDDPM训练/采样
+    STAGE2_AUGMENT_MIN_WEIGHT = 0.8
     
     # TabDDPM 训练参数（优化版 v2.5 - 恢复旧参数以提高生成质量）
     DDPM_EPOCHS = 1500                      # 训练轮数（保持1500）
@@ -375,8 +378,8 @@ class Config:
     # 3.3 早停机制（智能训练终止）
     FINETUNE_EARLY_STOPPING = True         # 启用早停
     FINETUNE_ES_WARMUP_EPOCHS = 100         # 预热轮数（前N轮不触发早停）- 增加预热
-    FINETUNE_ES_PATIENCE = 50               # 耐心值（连续N轮无改善则停止）- 增加耐心
-    FINETUNE_ES_MIN_DELTA = 0.001           # F1改善阈值（需要明显改善）- 提高阈值
+    FINETUNE_ES_PATIENCE = 100               # 耐心值（连续N轮无改善则停止）- 增加耐心
+    FINETUNE_ES_MIN_DELTA = 0.0005           # F1改善阈值（需要明显改善）- 提高阈值
     FINETUNE_ES_METRIC = 'f1_optimal'       # 监控指标
     FINETUNE_ES_ALLOW_TRAIN_METRIC = True   # 允许使用训练集指标
     
@@ -398,10 +401,10 @@ class Config:
     
     # 3.7 混合训练模式（原始序列 + 增强特征）- 优化版 v2.4
     STAGE3_MIXED_STREAM = True              # 启用混合训练
-    STAGE3_MIXED_REAL_BATCH_SIZE = 32       # 原始序列批次
-    STAGE3_MIXED_SYN_BATCH_SIZE = 96        # 增强特征批次
-    STAGE3_MIXED_REAL_LOSS_SCALE = 2.5      # 原始数据损失权重（2.0→2.5，更重视原始数据）
-    STAGE3_MIXED_SYN_LOSS_SCALE = 1.0       # 增强数据损失权重
+    STAGE3_MIXED_REAL_BATCH_SIZE = 64       # 原始序列批次（提高真实数据占比）
+    STAGE3_MIXED_SYN_BATCH_SIZE = 64        # 增强特征批次（降低synthetic主导）
+    STAGE3_MIXED_REAL_LOSS_SCALE = 3.0      # 原始数据损失权重（进一步强调真实序列）
+    STAGE3_MIXED_SYN_LOSS_SCALE = 0.8       # 增强数据损失权重（略降，抑制FP）
     
     # 3.8 在线数据增强（可选）
     STAGE3_ONLINE_AUGMENTATION = False      # 关闭在线增强
@@ -430,7 +433,7 @@ class Config:
     
     # 主损失：Focal Loss（关注困难样本）
     USE_FOCAL_LOSS = True                   # 启用Focal Loss
-    FOCAL_ALPHA = 0.5                       # 恶意类权重（0.5=平衡）
+    FOCAL_ALPHA = 0.6                       # 恶意类权重（提高召回，提升F1）
     FOCAL_GAMMA = 2.0                       # Gamma参数
     
     # 辅助损失（全部关闭 - 最优配置）

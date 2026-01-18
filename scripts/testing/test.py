@@ -497,18 +497,34 @@ def main(args):
         logger.info(f"✓ 使用命令行指定的骨干网络:")
         logger.info(f"  {backbone_path}")
         logger.info("")
-    # 2. 尝试从元数据读取
-    elif backbone_path_from_metadata and os.path.exists(backbone_path_from_metadata):
-        backbone_path = backbone_path_from_metadata
-        logger.info("✓ 使用训练时的骨干网络（从元数据）")
-    # 3. 使用默认路径
+    # 2. 尝试从元数据读取（优先使用训练时保存的路径）
+    elif backbone_path_from_metadata:
+        if os.path.exists(backbone_path_from_metadata):
+            backbone_path = backbone_path_from_metadata
+            logger.info("✓ 使用训练时的骨干网络（从元数据）")
+            logger.info(f"  {backbone_path}")
+        else:
+            # 如果元数据中指定的路径不存在，这是严重问题，不应该回退到旧模型
+            logger.error(f"❌ 严重错误：训练时使用的骨干网络不存在!")
+            logger.error(f"  元数据中记录的路径: {backbone_path_from_metadata}")
+            logger.error(f"  该文件不存在，无法使用正确的模型进行测试!")
+            logger.error("")
+            logger.error("可能的原因:")
+            logger.error("  1. 模型文件被意外删除")
+            logger.error("  2. 模型文件路径发生了变化")
+            logger.error("  3. 使用了错误的输出目录")
+            logger.error("")
+            logger.error("解决方案:")
+            logger.error("  1. 检查模型文件是否存在")
+            logger.error("  2. 重新运行训练脚本")
+            logger.error("  3. 或使用 --backbone_path 参数手动指定正确的模型路径")
+            return
+    # 3. 使用默认路径（仅在元数据不存在或未指定backbone_path时）
     else:
         backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
-        if backbone_path_from_metadata:
-            logger.warning(f"⚠ 元数据中的骨干网络不存在: {backbone_path_from_metadata}")
-            logger.warning(f"  回退到默认路径: {backbone_path}")
-        else:
-            logger.info(f"使用默认骨干网络路径: {backbone_path}")
+        logger.info(f"使用默认骨干网络路径: {backbone_path}")
+        logger.warning("⚠ 注意：未找到模型元数据，使用默认路径可能不是训练时使用的模型!")
+        logger.warning("  建议：确保训练脚本已正确保存模型元数据")
     
     if not os.path.exists(backbone_path):
         logger.error(f"❌ 骨干网络检查点未找到: {backbone_path}")

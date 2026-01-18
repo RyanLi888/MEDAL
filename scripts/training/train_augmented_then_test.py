@@ -309,7 +309,12 @@ def main():
                 meta = json.load(f)
             bp = meta.get('backbone_path', '')
             if bp:
-                backbone_path_for_test = bp
+                if os.path.exists(bp):
+                    backbone_path_for_test = bp
+                    logger.info(f"✓ 使用元数据中记录的骨干网络: {bp}")
+                else:
+                    logger.warning(f"⚠ 元数据中记录的骨干网络不存在: {bp}")
+                    logger.warning(f"  回退到训练时使用的骨干网络: {backbone_path}")
 
         test_args = argparse.Namespace(backbone_path=backbone_path_for_test)
         test_main(test_args)

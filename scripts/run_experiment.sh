@@ -174,6 +174,7 @@ select_gpu
 
 echo ""
 echo "请选择运行模式:"
+echo "0) 数据预处理"
 echo "1) 完整流程 (训练 + 测试) - 使用config最优配置"
 echo "2) 仅训练 - 使用config最优配置"
 echo "3) 仅测试"
@@ -183,10 +184,50 @@ echo "6) 干净数据训练+测试 (消融实验)"
 echo "7) 数据增强训练+测试 (消融实验)"
 echo "8) 完整流程去除数据增强 (特征提取+标签矫正+分类训练)"
 echo ""
-echo -n "请输入选择 (1-8): "
+echo -n "请输入选择 (0-8): "
 read -r choice
 
 case $choice in
+    0)
+        echo ""
+        echo "数据预处理选项:"
+        echo "1) 预处理训练集和测试集 (全部)"
+        echo "2) 仅预处理训练集"
+        echo "3) 仅预处理测试集"
+        echo ""
+        echo -n "请选择 (1-3, 默认1): "
+        read -r preprocess_choice
+        preprocess_choice=${preprocess_choice:-1}
+        
+        echo ""
+        echo -n "是否强制重新预处理（覆盖已有文件）? (y/N): "
+        read -r force_choice
+        force_flag=""
+        if [ "$force_choice" = "y" ] || [ "$force_choice" = "Y" ]; then
+            force_flag="--force"
+        fi
+        
+        case $preprocess_choice in
+            1)
+                CMD="python scripts/utils/preprocess.py $force_flag"
+                MODE="数据预处理 (训练集+测试集)"
+                ;;
+            2)
+                CMD="python scripts/utils/preprocess.py --train_only $force_flag"
+                MODE="数据预处理 (仅训练集)"
+                ;;
+            3)
+                CMD="python scripts/utils/preprocess.py --test_only $force_flag"
+                MODE="数据预处理 (仅测试集)"
+                ;;
+            *)
+                echo "❌ 无效选择，使用默认: 预处理全部"
+                CMD="python scripts/utils/preprocess.py $force_flag"
+                MODE="数据预处理 (训练集+测试集)"
+                ;;
+        esac
+        LOG_PREFIX="preprocess"
+        ;;
     1)
         select_backbone true
         if [ "$USE_EXISTING_BACKBONE" = "true" ]; then

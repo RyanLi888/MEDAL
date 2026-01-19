@@ -230,8 +230,10 @@ class TrafficAugmentation:
         B, L, D = x.shape
         
         # 随机选择要掩码的维度（不掩码 Direction/ValidMask，因为它们是结构性特征）
+        # 可掩码维度：Length, BurstSize, LogIAT（连续特征）
         maskable_dims = []
-        for idx in [self.length_index, self.burst_index, self.cumulative_index]:
+        log_iat_index = getattr(self.config, 'LOG_IAT_INDEX', getattr(self.config, 'IAT_INDEX', None))
+        for idx in [self.length_index, self.burst_index, self.cumulative_index, log_iat_index]:
             if idx is None:
                 continue
             try:

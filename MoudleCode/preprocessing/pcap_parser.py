@@ -1,6 +1,7 @@
 """
 PCAP Parser Module
-Extracts 4-dimensional features from PCAP files
+Extracts 5-dimensional features from PCAP files
+Features: [Length, Direction, BurstSize, LogIAT, ValidMask]
 """
 import numpy as np
 import os
@@ -95,7 +96,7 @@ class PCAPParser:
     
     def parse_pcap_file(self, pcap_path, extract_flows=True, flow_timeout=120.0):
         """
-        Parse a single PCAP file and extract 4D features
+        Parse a single PCAP file and extract 5D features
         
         If extract_flows=True, extracts multiple flows from the PCAP file.
         Each flow is identified by 5-tuple (src_ip, dst_ip, src_port, dst_port, protocol).
@@ -109,7 +110,7 @@ class PCAPParser:
             
         Returns:
             If extract_flows=True: list of feature arrays (one per flow)
-            If extract_flows=False: single feature array of shape (L, 4)
+            If extract_flows=False: single feature array of shape (L, 5)
         """
         try:
             packets = rdpcap(pcap_path)
@@ -165,8 +166,8 @@ class PCAPParser:
             logger.warning(f"No valid flows found in {pcap_path}")
             return []
         
-        logger.info(f"在 {os.path.basename(pcap_path)} 中发现 {len(flows)} 条流（基于5元组+{flow_timeout}秒超时），开始提取4维特征...")
-        logger.info(f"  每个数据包提取: [Length, Direction, BurstSize, ValidMask]")
+        logger.info(f"在 {os.path.basename(pcap_path)} 中发现 {len(flows)} 条流（基于5元组+{flow_timeout}秒超时），开始提取5维特征...")
+        logger.info(f"  每个数据包提取: [Length, Direction, BurstSize, LogIAT, ValidMask]")
         logger.info(f"  每个流转换为: 1024×4 的特征序列")
         logger.info("")
         
@@ -182,25 +183,25 @@ class PCAPParser:
                 all_flow_features.append(flow_features)
                 # 每10条流或最后一条流输出详细日志
                 if flow_count % 10 == 0 or flow_count == len(flows):
-                    logger.info(f"  ✓ 完成 {flow_count}/{len(flows)} 条流 (当前流包含 {len(flow_packets)} 个数据包，已提取 {flow_features.shape[0]}×4 特征)")
+                    logger.info(f"  ✓ 完成 {flow_count}/{len(flows)} 条流 (当前流包含 {len(flow_packets)} 个数据包，已提取 {flow_features.shape[0]}×{flow_features.shape[1]} 特征)")
             else:
                 logger.warning(f"  ✗ 流 {flow_count}/{len(flows)} 解析失败")
         
         logger.info("")
-        logger.info(f"✓ 成功提取 {len(all_flow_features)}/{len(flows)} 条流的4维特征序列")
+        logger.info(f"✓ 成功提取 {len(all_flow_features)}/{len(flows)} 条流的5维特征序列")
         
         return all_flow_features if len(all_flow_features) > 0 else []
     
     def _parse_single_flow(self, packets):
         """
-        Parse a single flow (list of packets) and extract 4D features
+        Parse a single flow (list of packets) and extract 5D features
         
         Args:
             packets: List of Scapy packets belonging to one flow
             
         Returns:
-            features: numpy array of shape (L, 4)
-                     [Length, Direction, BurstSize, ValidMask]
+            features: numpy array of shape (L, 5)
+                     [Length, Direction, BurstSize, LogIAT, ValidMask]
         """
         if len(packets) == 0:
             return None
@@ -290,13 +291,19 @@ class PCAPParser:
             burst_size[start_idx:] = current_sum
         burst_size = np.log1p(burst_size).astype(np.float32)
 
+        # Feature 3: Log-IAT (log1p normalization for stability)
+        # 使用log1p避免log(0)的问题，同时压缩长尾分布
+        log_iat = np.log1p(raw_iats).astype(np.float32)
+
         valid_mask = np.ones((raw_lengths.shape[0],), dtype=np.float32)
 
         # Convert to numpy array
+        # 特征顺序: [Length, Direction, BurstSize, LogIAT, ValidMask]
         features = np.column_stack([
             np.asarray(length_norm_list, dtype=np.float32),
             np.asarray(direction_list, dtype=np.float32),
             burst_size,
+            log_iat,  # 新增: Log-IAT特征
             valid_mask,
         ]).astype(np.float32)
         
@@ -310,10 +317,10 @@ class PCAPParser:
         Align sequence to fixed length L
         
         Args:
-            features: numpy array of shape (N, 4)
+            features: numpy array of shape (N, 5)
             
         Returns:
-            aligned_features: numpy array of shape (L, 4)
+            aligned_features: numpy array of shape (L, 5)
         """
         n_packets = features.shape[0]
         
@@ -322,7 +329,7 @@ class PCAPParser:
             return features[:self.sequence_length]
         else:
             # Pad: append zeros
-            padding = np.zeros((self.sequence_length - n_packets, 4), dtype=np.float32)
+            padding = np.zeros((self.sequence_length - n_packets, features.shape[1]), dtype=np.float32)
             return np.vstack([features, padding])
     
     def parse_directory(self, directory, label, max_flows=None):
@@ -388,7 +395,7 @@ class PCAPParser:
             expected_flow_count = extract_flow_count(filename)
             logger.info(f"开始解析 {filename} (预期流数: {expected_flow_count})...")
             logger.info(f"  步骤1: 识别流（通过5元组: IP+端口+协议，包间隔>120秒则开始新流）")
-            logger.info(f"  步骤2: 为每个流提取4维特征（每个数据包，最多处理前5000个包）")
+            logger.info(f"  步骤2: 为每个流提取5维特征（每个数据包，最多处理前5000个包）")
             logger.info(f"  步骤3: 序列对齐到1024长度")
             logger.info("")
             
@@ -439,7 +446,7 @@ def load_dataset(benign_dir, malicious_dir, sequence_length=1024):
         sequence_length: Sequence length for feature extraction
         
     Returns:
-        X: numpy array of shape (N, L, 4)
+        X: numpy array of shape (N, L, 5)
         y: numpy array of shape (N,)
         filenames: list of filenames
     """

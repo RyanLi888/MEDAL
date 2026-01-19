@@ -271,7 +271,7 @@ class _DualStreamStructureEmbedding(nn.Module):
 
 class DualStreamBiMambaBackbone(nn.Module):
     """
-    MEDAL-Lite4 双流 Bi-Mamba 骨干网络
+    MEDAL-Lite5 双流 Bi-Mamba 骨干网络
     
     双流物理切分：
     - Stream 1 (内容流): Length - 学习"大包与小包的排列旋律"
@@ -679,6 +679,15 @@ class SimMTMLoss(nn.Module):
             loss_dir = _masked_mean(loss_dir, mask_scalar)
             total_components['direction'] = loss_dir
             recon_loss = recon_loss + float(getattr(cfg, 'PRETRAIN_DIRECTION_WEIGHT', 1.0)) * loss_dir
+
+        # LogIAT特征重建损失（MSE，连续值）
+        log_iat_idx = getattr(cfg, 'LOG_IAT_INDEX', getattr(cfg, 'IAT_INDEX', None))
+        if log_iat_idx is not None and 0 <= int(log_iat_idx) < D:
+            iat = int(log_iat_idx)
+            loss_iat = F.mse_loss(x_recon[:, :pkt_len, iat], x_original[:, :pkt_len, iat], reduction='none')
+            loss_iat = _masked_mean(loss_iat, mask_scalar)
+            total_components['logiat'] = loss_iat
+            recon_loss = recon_loss + float(getattr(cfg, 'PRETRAIN_LOG_IAT_WEIGHT', 1.0)) * loss_iat
 
         if valid_mask_idx is not None and 0 <= int(valid_mask_idx) < D:
             vm = int(valid_mask_idx)

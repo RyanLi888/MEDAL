@@ -157,23 +157,86 @@ TIER_CONFIG = {
 }
 
 
-class ConfidentLearning:
-    """Confident Learning (CL) - Probabilistic Diagnosis"""
+class CLProjectionHead(nn.Module):
+    """
+    优化建议2: 为CL创建独立的投影头
+    专门用于计算CL的置信度和KNN距离，与分类MLP分离
+    设计: 较小的MLP (例如 256 -> 128 -> 64)
+    """
+    def __init__(self, input_dim, hidden_dim=128, output_dim=64):
+        super().__init__()
+        self.projection = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),  # 使用LayerNorm而非BatchNorm
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim),
+        )
     
-    def __init__(self, n_folds=5):
+    def forward(self, x):
+        """
+        Args:
+            x: (B, input_dim) - Mamba输出的特征向量
+        Returns:
+            z: (B, output_dim) - 投影后的特征，用于CL和KNN
+        """
+        return self.projection(x)
+
+
+class ConfidentLearning:
+    """Confident Learning (CL) - Probabilistic Diagnosis with Projection Head"""
+    
+    def __init__(self, n_folds=5, use_projection_head=True, feature_dim=32, device='cpu'):
         self.n_folds = n_folds
+        self.use_projection_head = use_projection_head
+        self.device = device
         self.confident_joint = None
         self.thresholds = None
+        
+        # 优化建议2: 创建独立的投影头
+        if use_projection_head:
+            self.projection_head = CLProjectionHead(
+                input_dim=feature_dim,
+                hidden_dim=128,
+                output_dim=64
+            ).to(device)
+            # 优化建议2: 投影头训练模式配置
+            # 默认冻结（推理模式），如果需要训练可通过配置启用
+            self.projection_trainable = getattr(config, 'CL_PROJECTION_TRAINABLE', False) if hasattr(config, 'CL_PROJECTION_TRAINABLE') else False
+            if not self.projection_trainable:
+                self.projection_head.eval()  # 推理模式（冻结）
+                for param in self.projection_head.parameters():
+                    param.requires_grad = False
+            else:
+                self.projection_head.train()  # 训练模式
+        else:
+            self.projection_head = None
     
     def fit_predict(self, features, labels):
+        """
+        Args:
+            features: (N, D) - Mamba提取的特征向量
+            labels: (N,) - 噪声标签
+        """
         n_samples = len(labels)
         n_classes = len(np.unique(labels))
+        
+        # 优化建议2: 如果使用投影头，先投影特征
+        if self.use_projection_head and self.projection_head is not None:
+            features_tensor = torch.FloatTensor(features).to(self.device)
+            with torch.no_grad():
+                features_projected = self.projection_head(features_tensor).cpu().numpy()
+            features_for_cl = features_projected
+        else:
+            features_for_cl = features
+        
         pred_probs = np.zeros((n_samples, n_classes))
         
         kf = KFold(n_splits=self.n_folds, shuffle=True, random_state=42)
         
-        for train_idx, val_idx in kf.split(features):
-            X_train, X_val = features[train_idx], features[val_idx]
+        for train_idx, val_idx in kf.split(features_for_cl):
+            X_train, X_val = features_for_cl[train_idx], features_for_cl[val_idx]
             y_train = labels[train_idx]
             clf = LogisticRegression(max_iter=1000, random_state=42)
             clf.fit(X_train, y_train)
@@ -292,7 +355,15 @@ class HybridCourt:
     
     def __init__(self, config):
         self.config = config
-        self.cl = ConfidentLearning(n_folds=config.CL_K_FOLD)
+        # 优化建议2: 为CL创建独立的投影头
+        use_cl_projection = getattr(config, 'USE_CL_PROJECTION_HEAD', True)
+        feature_dim = getattr(config, 'FEATURE_DIM', getattr(config, 'OUTPUT_DIM', 32))
+        self.cl = ConfidentLearning(
+            n_folds=config.CL_K_FOLD,
+            use_projection_head=use_cl_projection,
+            feature_dim=feature_dim,
+            device=device
+        )
         self.made = MADEDensityEstimator(
             hidden_dims=config.MADE_HIDDEN_DIMS,
             threshold_percentile=config.MADE_DENSITY_THRESHOLD_PERCENTILE
@@ -365,12 +436,23 @@ class HybridCourt:
         
         # ========== Step 1: 运行子模块 ==========
         logger.info("\n[Step 1] 运行子模块...")
+        
+        # 优化建议2: 如果CL使用投影头，KNN和MADE也应该使用相同的投影特征
+        # 这确保CL、KNN、MADE在相同的特征空间工作，提高一致性
+        features_for_analysis = features
+        if self.cl.use_projection_head and self.cl.projection_head is not None:
+            features_tensor = torch.FloatTensor(features).to(device)
+            with torch.no_grad():
+                features_projected = self.cl.projection_head(features_tensor).cpu().numpy()
+            features_for_analysis = features_projected
+            logger.info(f"  ✓ 使用CL投影头特征 (原始: {features.shape[1]}D -> 投影: {features_projected.shape[1]}D)")
+        
         suspected_noise, pred_labels, pred_probs = self.cl.fit_predict(features, noisy_labels)
-        self.made.fit(features, device=device)
-        is_dense, density_scores = self.made.predict_density(features, device=device)
+        self.made.fit(features_for_analysis, device=device)
+        is_dense, density_scores = self.made.predict_density(features_for_analysis, device=device)
         self._maybe_update_density_thresholds(density_scores)
-        self.knn.fit(features)
-        neighbor_labels, neighbor_consistency = self.knn.predict_semantic_label(features, noisy_labels)
+        self.knn.fit(features_for_analysis)
+        neighbor_labels, neighbor_consistency = self.knn.predict_semantic_label(features_for_analysis, noisy_labels)
         
         # 初始化
         clean_labels = noisy_labels.copy()
@@ -797,6 +879,15 @@ class HybridCourt:
         # 目标: 在保证100%纯度的前提下，尽量多拯救样本
         # 策略: 结合迭代CL + 锚点KNN，双重验证确保纯度
         
+        # 优化建议2: 确保Phase 3也能访问投影后的特征
+        # 如果CL使用投影头，所有Phase 3的操作都应该在投影特征空间进行
+        if self.cl.use_projection_head and self.cl.projection_head is not None:
+            features_phase3_tensor = torch.FloatTensor(features).to(device)
+            with torch.no_grad():
+                features_phase3 = self.cl.projection_head(features_phase3_tensor).cpu().numpy()
+        else:
+            features_phase3 = features
+        
         logger.info("\n" + "="*50)
         logger.info("Phase 3: 统一拯救策略 (100%纯度优先)")
         logger.info("="*50)
@@ -817,11 +908,13 @@ class HybridCourt:
         logger.info(f"    干净样本数 (Core+Flip): {n_clean}")
         
         if n_clean >= p3a['MIN_CLEAN_SAMPLES']:
-            X_clean = features[clean_mask]
+            # 优化建议2: 迭代CL使用投影后的特征（与主CL一致）
+            X_clean = features_phase3[clean_mask]
             y_clean = clean_labels[clean_mask]
+            
             clf_iter = LogisticRegression(max_iter=1000, random_state=42)
             clf_iter.fit(X_clean, y_clean)
-            iter_pred_probs_all = clf_iter.predict_proba(features)
+            iter_pred_probs_all = clf_iter.predict_proba(features_phase3)
             logger.info(f"    ✓ 迭代CL模型训练完成")
         else:
             logger.info(f"    ⚠ 干净样本不足，跳过迭代CL")
@@ -830,7 +923,8 @@ class HybridCourt:
         anchor_tiers = ['Tier 1: Core', 'Tier 2: Flip']
         anchor_mask = np.array([t in anchor_tiers for t in tier_info])
         n_anchors = anchor_mask.sum()
-        anchor_features = features[anchor_mask]
+        # 优化建议2: 锚点KNN使用投影后的特征（与CL/KNN一致）
+        anchor_features = features_phase3[anchor_mask]
         anchor_labels = clean_labels[anchor_mask]
         
         logger.info(f"  [Step 3.2] 构建锚点KNN")
@@ -876,7 +970,8 @@ class HybridCourt:
         
         if len(rescue_indices) > 0 and knn_anchor is not None and iter_pred_probs_all is not None:
             # 计算锚点KNN投票
-            rescue_features = features[rescue_mask]
+            # 优化建议2: 救援特征使用投影后的特征（与锚点KNN一致）
+            rescue_features = features_phase3[rescue_mask]
             distances, indices = knn_anchor.kneighbors(rescue_features)
             
             for idx, i in enumerate(rescue_indices):
@@ -1090,8 +1185,9 @@ class HybridCourt:
             if iter_pred_probs_all is not None and knn_anchor is not None:
                 iter_cl_conf = float(iter_pred_probs_all[i, current_label])
                 
-                # 计算锚点KNN投票
-                dist, idx = knn_anchor.kneighbors(features[i:i+1])
+                # 计算锚点KNN投票（使用投影后的特征）
+                feature_query = features_phase3[i:i+1]
+                dist, idx = knn_anchor.kneighbors(feature_query)
                 neighbor_y = anchor_labels[idx[0]]
                 w = 1.0 / (dist[0] + 1e-6)
                 vote_0 = w[neighbor_y == 0].sum()
@@ -1212,7 +1308,8 @@ class HybridCourt:
         
         # 计算所有样本的锚点KNN结果（用于分析）
         if knn_anchor is not None:
-            distances, indices = knn_anchor.kneighbors(features)
+            # 优化建议2: 使用投影后的特征进行KNN查询（与训练时一致）
+            distances, indices = knn_anchor.kneighbors(features_phase3)
             for i in range(n_samples):
                 neighbor_y = anchor_labels[indices[i]]
                 w = 1.0 / (distances[i] + 1e-6)

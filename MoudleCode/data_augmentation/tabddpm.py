@@ -181,6 +181,14 @@ class TabDDPM(nn.Module):
                 if 0 <= burst_idx < self.input_dim:
                     raw_min[burst_idx] = max(float(raw_min[burst_idx]), 0.0)
 
+            # LogIAT特征范围（log1p归一化，通常范围在0-10之间）
+            log_iat_idx = getattr(self.config, 'LOG_IAT_INDEX', getattr(self.config, 'IAT_INDEX', None))
+            if log_iat_idx is not None:
+                log_iat_idx = int(log_iat_idx)
+                if 0 <= log_iat_idx < self.input_dim:
+                    raw_min[log_iat_idx] = max(float(raw_min[log_iat_idx]), 0.0)  # log1p最小值是0
+                    # LogIAT通常上限在10左右（对应IAT约22000秒），但允许更大值
+            
             valid_mask_idx = getattr(self.config, 'VALID_MASK_INDEX', None)
             if valid_mask_idx is not None:
                 valid_mask_idx = int(valid_mask_idx)

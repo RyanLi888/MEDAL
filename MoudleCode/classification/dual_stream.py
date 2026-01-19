@@ -26,8 +26,14 @@ class DualStreamMLP(nn.Module):
         # This is the dimension of features extracted by the backbone
         feature_dim = getattr(config, 'FEATURE_DIM', getattr(config, 'OUTPUT_DIM', config.MODEL_DIM))
         
-        # 关键改进：对比学习特征需要BN层来拉伸幅度
+        # 优化建议1: LayerNorm替代BatchNorm（更适合特征向量）
+        # LayerNorm对特征向量的每个样本独立归一化，不依赖batch统计
+        # 这对Mamba输出的抽象特征向量更合适
+        self.ln_input = nn.LayerNorm(feature_dim)
+        
+        # 保留BatchNorm作为备选（可通过配置切换）
         self.bn_input = nn.BatchNorm1d(feature_dim)
+        self.use_layernorm = getattr(config, 'USE_LAYERNORM_IN_CLASSIFIER', True)
 
         self.mlp_a = nn.Sequential(
             nn.Linear(feature_dim, 32),
@@ -85,7 +91,12 @@ class DualStreamMLP(nn.Module):
             z = z.mean(dim=1)
         if z.dim() != 2:
             raise ValueError(f"DualStreamMLP expects z of shape (B, D) (or (B, L, D)), got {tuple(z.shape)}")
-        z = self.bn_input(z)
+        
+        # 优化建议1: 使用LayerNorm（推荐）或BatchNorm
+        if self.use_layernorm:
+            z = self.ln_input(z)  # LayerNorm: 对每个样本独立归一化
+        else:
+            z = self.bn_input(z)  # BatchNorm: 依赖batch统计
         
         logits_a = self.mlp_a(z)
         logits_b = self.mlp_b(z)
@@ -259,6 +270,15 @@ class MEDAL_Classifier(nn.Module):
         self.dual_mlp = DualStreamMLP(config)
         self.config = config
         
+        # 优化建议1: 在backbone输出后添加LayerNorm（可选）
+        # 这有助于稳定特征分布，特别是当backbone在不同阶段训练时
+        feature_dim = getattr(config, 'FEATURE_DIM', getattr(config, 'OUTPUT_DIM', config.MODEL_DIM))
+        self.use_backbone_layernorm = getattr(config, 'USE_BACKBONE_LAYERNORM', False)
+        if self.use_backbone_layernorm:
+            self.backbone_ln = nn.LayerNorm(feature_dim)
+        else:
+            self.backbone_ln = None
+        
         # By default, keep backbone frozen. Can be overridden in Stage 3 by enabling
         # config.FINETUNE_BACKBONE and selectively unfreezing parameters.
         if not getattr(self.config, 'FINETUNE_BACKBONE', False):
@@ -291,6 +311,10 @@ class MEDAL_Classifier(nn.Module):
             else:
                 with torch.no_grad():
                     z = self.backbone(x, return_sequence=False)
+        
+        # 优化建议1: 在backbone输出后应用LayerNorm（如果启用）
+        if self.use_backbone_layernorm and self.backbone_ln is not None:
+            z = self.backbone_ln(z)
         
         # Classification
         if return_separate or self.training:

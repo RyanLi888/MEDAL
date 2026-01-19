@@ -115,15 +115,16 @@ class Config:
     MTU = 1500.0                            # 最大传输单元
     TCP_WINDOW_MAX = 65535.0                # TCP窗口最大值
     
-    # 特征定义 (MEDAL-Lite4: Length, Direction, BurstSize, ValidMask)
-    FEATURE_NAMES = ['Length', 'Direction', 'BurstSize', 'ValidMask']
+    # 特征定义 (MEDAL-Lite5: Length, Direction, BurstSize, LogIAT, ValidMask)
+    FEATURE_NAMES = ['Length', 'Direction', 'BurstSize', 'LogIAT', 'ValidMask']
     LENGTH_INDEX = 0
     DIRECTION_INDEX = 1
     BURST_SIZE_INDEX = 2
-    VALID_MASK_INDEX = 3
-    IAT_INDEX = None
+    LOG_IAT_INDEX = 3  # 新增: Log-IAT特征索引
+    VALID_MASK_INDEX = 4
+    IAT_INDEX = LOG_IAT_INDEX  # 兼容性别名
     CUMULATIVE_LEN_INDEX = None
-    INPUT_FEATURE_DIM = len(FEATURE_NAMES)  # 4维特征
+    INPUT_FEATURE_DIM = len(FEATURE_NAMES)  # 5维特征
     
     # Burst 检测阈值（针对隧道流量优化）
     BURST_IAT_THRESHOLD = 0.01              # 10ms，适合检测 Iodine/DNS2TCP 隧道碎片
@@ -146,6 +147,17 @@ class Config:
     FEATURE_DIM = OUTPUT_DIM                # 特征维度（用于下游任务）
     EMBEDDING_DROPOUT = 0.1                 # 嵌入层Dropout
     POSITIONAL_ENCODING = "sinusoidal"      # 位置编码类型
+    
+    # ============================================================
+    # 优化建议配置
+    # ============================================================
+    # 优化建议1: LayerNorm vs BatchNorm
+    USE_LAYERNORM_IN_CLASSIFIER = True      # True: 使用LayerNorm (推荐), False: 使用BatchNorm
+    USE_BACKBONE_LAYERNORM = False          # True: 在backbone输出后添加LayerNorm (可选，通常不需要)
+    
+    # 优化建议2: CL独立投影头
+    USE_CL_PROJECTION_HEAD = True           # True: 为CL创建独立投影头 (推荐), False: 直接使用原始特征
+    CL_PROJECTION_TRAINABLE = False         # True: CL投影头可训练 (需要预训练), False: 冻结投影头 (推荐)
     
     # Mamba 层参数
     MAMBA_LAYERS = 2                        # Mamba层数
@@ -184,6 +196,7 @@ class Config:
     PRETRAIN_LENGTH_WEIGHT = 1.0            # Length特征权重
     PRETRAIN_BURST_WEIGHT = 1.0             # BurstSize特征权重
     PRETRAIN_DIRECTION_WEIGHT = 1.0         # Direction特征权重
+    PRETRAIN_LOG_IAT_WEIGHT = 1.0           # LogIAT特征权重（新增）
     PRETRAIN_VALIDMASK_WEIGHT = 0.5         # ValidMask特征权重
     SIMMTM_DECODER_USE_MLP = False          # 解码器使用MLP
     SIMMTM_DECODER_HIDDEN_DIM = 64          # 解码器隐藏层维度
@@ -330,8 +343,10 @@ class Config:
     MASK_LAMBDA = 0.2                       # 掩码损失权重
     
     # 特征条件化配置
-    COND_FEATURE_INDICES = [DIRECTION_INDEX, VALID_MASK_INDEX]  # 条件特征
-    DEP_FEATURE_INDICES = [LENGTH_INDEX, BURST_SIZE_INDEX]      # 依赖特征
+    # 条件特征：Direction, ValidMask（协议约束，固定不变）
+    COND_FEATURE_INDICES = [DIRECTION_INDEX, VALID_MASK_INDEX]
+    # 依赖特征：Length, BurstSize, LogIAT（学习分布，可生成）
+    DEP_FEATURE_INDICES = [LENGTH_INDEX, BURST_SIZE_INDEX, LOG_IAT_INDEX]
     
     # 高级选项
     ENABLE_COVARIANCE_MATCHING = False      # 协方差匹配
@@ -553,7 +568,7 @@ class Config:
             logger.info("🔧 SimMTM 配置:")
             logger.info(f"  - 掩码率: {self.SIMMTM_MASK_RATE}")
             logger.info(f"  - 噪声标准差: {self.PRETRAIN_NOISE_STD}")
-            logger.info(f"  - 特征权重: Length={self.PRETRAIN_LENGTH_WEIGHT}, Burst={self.PRETRAIN_BURST_WEIGHT}, Dir={self.PRETRAIN_DIRECTION_WEIGHT}, VM={self.PRETRAIN_VALIDMASK_WEIGHT}")
+            logger.info(f"  - 特征权重: Length={self.PRETRAIN_LENGTH_WEIGHT}, Burst={self.PRETRAIN_BURST_WEIGHT}, Dir={self.PRETRAIN_DIRECTION_WEIGHT}, LogIAT={self.PRETRAIN_LOG_IAT_WEIGHT}, VM={self.PRETRAIN_VALIDMASK_WEIGHT}")
             logger.info("")
             if self.USE_INSTANCE_CONTRASTIVE:
                 logger.info(f"🔧 对比学习配置 ({self.CONTRASTIVE_METHOD.upper()}):")

@@ -328,7 +328,8 @@ def create_st_mixup(config, mode='intra_class'):
         valid_mask_idx = getattr(config, 'VALID_MASK_INDEX', None)
 
         cont = []
-        for idx in [length_idx, burst_idx, cum_idx]:
+        log_iat_idx = getattr(config, 'LOG_IAT_INDEX', getattr(config, 'IAT_INDEX', None))
+        for idx in [length_idx, burst_idx, cum_idx, log_iat_idx]:
             if idx is None:
                 continue
             try:
@@ -360,7 +361,8 @@ def create_st_mixup(config, mode='intra_class'):
         valid_mask_idx = getattr(config, 'VALID_MASK_INDEX', None)
 
         cont = []
-        for idx in [length_idx, burst_idx, cum_idx]:
+        log_iat_idx = getattr(config, 'LOG_IAT_INDEX', getattr(config, 'IAT_INDEX', None))
+        for idx in [length_idx, burst_idx, cum_idx, log_iat_idx]:
             if idx is None:
                 continue
             try:

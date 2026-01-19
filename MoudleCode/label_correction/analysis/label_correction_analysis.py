@@ -438,7 +438,7 @@ def _log_tier_statistics(results, y_true, logger):
     logger.info("="*90)
 
 
-def generate_sample_analysis_document(results, y_true, noise_mask, save_path, logger):
+def generate_sample_analysis_document(results, y_true, noise_mask, save_path, logger, noise_pct=None):
     """
     Generate detailed per-sample analysis document in strategy-grouped format
     
@@ -448,6 +448,7 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
         noise_mask: (N,) boolean array indicating which labels were flipped to create noise
         save_path: path to save the document
         logger: logger
+        noise_pct: noise percentage (for filename)
     """
     logger.info("")
     logger.info("="*70)
@@ -618,12 +619,136 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
     df = pd.DataFrame(data)
     
     # Save to CSV (基础版本，所有数据在一个文件)
-    csv_path = save_path.replace('.txt', '.csv').replace('.log', '.csv')
+    # 确保文件名包含噪声率
+    if noise_pct is not None:
+        base_name = save_path.replace('.txt', '').replace('.log', '')
+        if f'_{noise_pct}pct' not in base_name:
+            base_name = f"{base_name}_{noise_pct}pct"
+        csv_path = f"{base_name}.csv"
+    else:
+        csv_path = save_path.replace('.txt', '.csv').replace('.log', '.csv')
+    
     df.to_csv(csv_path, index=False, encoding='utf-8-sig')
     logger.info(f"✓ CSV文件已保存: {csv_path}")
     
+    # ========================================
+    # 生成基础可读文本文件（从CSV数据）
+    # ========================================
+    try:
+        readable_text_path = csv_path.replace('.csv', '_readable.txt')
+        with open(readable_text_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"样本分析数据 - 可读文本格式（噪声率: {noise_pct}%）\n")
+            f.write("=" * 80 + "\n\n")
+            
+            # 总览统计
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("总览统计\n")
+            f.write("=" * 80 + "\n\n")
+            
+            tier_summary = []
+            for tier in sorted(df['Tier分级'].unique()):
+                tier_df = df[df['Tier分级'] == tier]
+                valid_df = tier_df[tier_df['矫正是否正确'] != '不适用(已丢弃)']
+                correct_count = len(tier_df[tier_df['矫正是否正确'] == '正确'])
+                error_count = len(tier_df[tier_df['矫正是否正确'] == '错误'])
+                dropped_count = len(tier_df[tier_df['矫正是否正确'] == '不适用(已丢弃)'])
+                
+                tier_summary.append({
+                    'Tier': tier,
+                    '总样本数': len(tier_df),
+                    '✓正确处理': correct_count,
+                    '✗错误处理': error_count,
+                    '⊗已丢弃': dropped_count,
+                    '准确率': f"{correct_count / len(valid_df) * 100:.2f}%" if len(valid_df) > 0 else 'N/A',
+                    '平均权值': f"{tier_df['样本权值'].mean():.4f}",
+                    '噪声样本数': len(tier_df[tier_df['是否噪声'] == '是']),
+                    '干净样本数': len(tier_df[tier_df['是否噪声'] == '否'])
+                })
+            
+            summary_df = pd.DataFrame(tier_summary)
+            f.write(summary_df.to_string(index=False))
+            f.write("\n\n")
+            
+            # 错误样本汇总
+            error_samples = df[df['矫正是否正确'] == '错误']
+            if len(error_samples) > 0:
+                f.write("\n" + "=" * 80 + "\n")
+                f.write(f"错误样本汇总（共{len(error_samples)}个）\n")
+                f.write("=" * 80 + "\n\n")
+                
+                error_key_cols = ['样本ID', 'Tier分级', '是否噪声', '真实标签', '噪声标签', 
+                                 '矫正后标签', '矫正动作', '错误类型', '系统置信度']
+                error_display_cols = [col for col in error_key_cols if col in error_samples.columns]
+                if error_display_cols:
+                    f.write(error_samples[error_display_cols].to_string(index=False))
+                    f.write("\n\n")
+            
+            # 误杀样本
+            false_positive = df[(df['是否噪声'] == '否') & (df['矫正是否正确'] == '错误')]
+            if len(false_positive) > 0:
+                f.write("\n" + "=" * 80 + "\n")
+                f.write(f"误杀干净样本（共{len(false_positive)}个）\n")
+                f.write("=" * 80 + "\n\n")
+                
+                fp_key_cols = ['样本ID', 'Tier分级', '真实标签', '噪声标签', '矫正后标签', 
+                              '矫正动作', '错误类型', '系统置信度']
+                fp_display_cols = [col for col in fp_key_cols if col in false_positive.columns]
+                if fp_display_cols:
+                    f.write(false_positive[fp_display_cols].to_string(index=False))
+                    f.write("\n\n")
+            
+            # 漏网噪声
+            false_negative = df[(df['是否噪声'] == '是') & (df['矫正是否正确'] == '错误')]
+            if len(false_negative) > 0:
+                f.write("\n" + "=" * 80 + "\n")
+                f.write(f"漏网噪声（共{len(false_negative)}个）\n")
+                f.write("=" * 80 + "\n\n")
+                
+                fn_key_cols = ['样本ID', 'Tier分级', '真实标签', '噪声标签', '矫正后标签', 
+                              '矫正动作', '错误类型', '系统置信度']
+                fn_display_cols = [col for col in fn_key_cols if col in false_negative.columns]
+                if fn_display_cols:
+                    f.write(false_negative[fn_display_cols].to_string(index=False))
+                    f.write("\n\n")
+            
+            # 按Tier分组的样本（前20个）
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("各Tier样本详情（每个Tier显示前20个样本）\n")
+            f.write("=" * 80 + "\n\n")
+            
+            tier_order = ['P1: Keep', 'P1: Flip', 'P1: Rescue', 'P1: Reweight',
+                         'P2: Keep', 'P2: Flip', 'P2: Rescue', 'P2: Reweight']
+            
+            for tier in tier_order:
+                tier_data = df[df['Tier分级'] == tier]
+                if len(tier_data) > 0:
+                    f.write(f"\n--- {tier} (共{len(tier_data)}个样本) ---\n")
+                    
+                    key_cols = ['样本ID', '矫正是否正确', '是否噪声', '真实标签', '噪声标签', 
+                               '矫正后标签', '矫正动作', '系统置信度', '样本权值']
+                    display_cols = [col for col in key_cols if col in tier_data.columns]
+                    
+                    display_data = tier_data[display_cols].head(20)
+                    f.write(display_data.to_string(index=False))
+                    if len(tier_data) > 20:
+                        f.write(f"\n... (还有{len(tier_data) - 20}个样本未显示)")
+                    f.write("\n\n")
+            
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("文件结束\n")
+            f.write("=" * 80 + "\n")
+        
+        logger.info(f"✓ 可读文本文件已保存: {readable_text_path}")
+        logger.info(f"  说明: 此文件包含关键统计和样本信息，方便AI直接分析")
+    except Exception as e:
+        logger.warning(f"⚠ 可读文本文件生成失败: {e}")
+        import traceback
+        logger.warning(traceback.format_exc())
+    
     # Save to Excel with multiple sheets (如果openpyxl可用)
     if EXCEL_AVAILABLE:
+        # Excel文件名从CSV文件名生成，已包含噪声率
         excel_path = csv_path.replace('.csv', '.xlsx')
         try:
             from openpyxl.styles import PatternFill, Font
@@ -770,6 +895,73 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
             logger.info(f"✓ Excel文件已保存（多sheet，带颜色标记）: {excel_path}")
             logger.info(f"  包含 {len(pd.ExcelFile(excel_path).sheet_names)} 个工作表")
             logger.info(f"  颜色说明: 绿色=正确处理, 红色=错误处理, 灰色=已丢弃")
+            
+            # ========================================
+            # 生成Excel详细可读文本文件（供AI分析使用）
+            # ========================================
+            try:
+                excel_text_output_path = excel_path.replace('.xlsx', '_excel_readable.txt')
+                with open(excel_text_output_path, 'w', encoding='utf-8') as f:
+                    f.write("=" * 80 + "\n")
+                    f.write(f"样本分析数据 - Excel详细内容（噪声率: {noise_pct}%）\n")
+                    f.write("=" * 80 + "\n\n")
+                    
+                    # 读取所有sheet
+                    excel_file = pd.ExcelFile(excel_path)
+                    
+                    for sheet_name in excel_file.sheet_names:
+                        f.write("\n" + "=" * 80 + "\n")
+                        f.write(f"Sheet: {sheet_name}\n")
+                        f.write("=" * 80 + "\n\n")
+                        
+                        sheet_df = pd.read_excel(excel_path, sheet_name=sheet_name)
+                        
+                        # 如果是统计类sheet，使用更友好的格式
+                        if '统计' in sheet_name or '总览' in sheet_name:
+                            f.write(sheet_df.to_string(index=False))
+                            f.write("\n\n")
+                        else:
+                            # 对于数据类sheet，限制显示行数，避免文件过大
+                            max_rows = 100
+                            if len(sheet_df) > max_rows:
+                                f.write(f"（仅显示前{max_rows}行，共{len(sheet_df)}行）\n\n")
+                                display_df = sheet_df.head(max_rows)
+                            else:
+                                display_df = sheet_df
+                            
+                            # 选择关键列显示
+                            key_columns = [
+                                '样本ID', '矫正是否正确', '错误类型', 'Tier分级', 
+                                '是否噪声', '真实标签', '噪声标签', '矫正后标签',
+                                '矫正动作', '系统置信度', '样本权值'
+                            ]
+                            available_key_cols = [col for col in key_columns if col in display_df.columns]
+                            other_cols = [col for col in display_df.columns if col not in available_key_cols]
+                            
+                            # 优先显示关键列
+                            if available_key_cols:
+                                display_df_key = display_df[available_key_cols]
+                                f.write("【关键信息】\n")
+                                f.write(display_df_key.to_string(index=False))
+                                f.write("\n\n")
+                            
+                            # 如果有其他列且行数不多，也显示
+                            if len(sheet_df) <= 50 and other_cols:
+                                display_df_other = display_df[other_cols]
+                                f.write("【详细信息】\n")
+                                f.write(display_df_other.to_string(index=False))
+                                f.write("\n\n")
+                    
+                    f.write("\n" + "=" * 80 + "\n")
+                    f.write("文件结束\n")
+                    f.write("=" * 80 + "\n")
+                
+                logger.info(f"✓ Excel详细文本文件已保存: {excel_text_output_path}")
+                logger.info(f"  说明: 此文件包含Excel所有sheet的内容，方便AI直接分析")
+            except Exception as e:
+                logger.warning(f"⚠ Excel详细文本文件生成失败: {e}")
+                import traceback
+                logger.warning(traceback.format_exc())
         except Exception as e:
             logger.warning(f"⚠ Excel文件保存失败: {e}")
             import traceback
@@ -1598,9 +1790,9 @@ def main(args):
     logger.info("Step 5: 生成样本分析文档")
     logger.info("="*70)
     
-    doc_path = os.path.join(analysis_dir, "documents", "sample_analysis.log")
+    doc_path = os.path.join(analysis_dir, "documents", f"sample_analysis_{noise_pct}pct.log")
     df_analysis = generate_sample_analysis_document(
-        results, y_train_clean, noise_mask, doc_path, logger
+        results, y_train_clean, noise_mask, doc_path, logger, noise_pct=noise_pct
     )
     logger.info("")
     

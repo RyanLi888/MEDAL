@@ -136,7 +136,8 @@ def main():
     config.USE_SOFT_F1_LOSS = False
     config.STAGE3_ONLINE_AUGMENTATION = False
     config.STAGE3_USE_ST_MIXUP = False
-    config.FINETUNE_BACKBONE = False  # 特征空间数据不支持骨干微调
+    # 混合训练模式下启用骨干微调（混合训练会同时使用原始序列和增强特征）
+    config.FINETUNE_BACKBONE = True if getattr(config, 'STAGE3_MIXED_STREAM', True) else False
     config.FINETUNE_VAL_SPLIT = 0.0
     config.FINETUNE_ES_ALLOW_TRAIN_METRIC = True
 

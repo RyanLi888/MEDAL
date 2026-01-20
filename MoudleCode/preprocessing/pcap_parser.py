@@ -168,7 +168,7 @@ class PCAPParser:
         
         logger.info(f"在 {os.path.basename(pcap_path)} 中发现 {len(flows)} 条流（基于5元组+{flow_timeout}秒超时），开始提取5维特征...")
         logger.info(f"  每个数据包提取: [Length, Direction, BurstSize, LogIAT, ValidMask]")
-        logger.info(f"  每个流转换为: 1024×4 的特征序列")
+        logger.info(f"  每个流转换为: 1024×5 的特征序列")
         logger.info("")
         
         # Extract features for each flow

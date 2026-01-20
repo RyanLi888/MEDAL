@@ -234,7 +234,7 @@ class _DualStreamHybridEmbedding(nn.Module):
 
 class _DualStreamStructureEmbedding(nn.Module):
     """
-    MEDAL-Lite4 结构流 Embedding
+    MEDAL-Lite5 结构流 Embedding
     
     输入：Direction (离散) + BurstSize (连续)
     输出：融合后的结构特征向量
@@ -274,7 +274,7 @@ class DualStreamBiMambaBackbone(nn.Module):
     MEDAL-Lite5 双流 Bi-Mamba 骨干网络
     
     双流物理切分：
-    - Stream 1 (内容流): Length - 学习"大包与小包的排列旋律"
+    - Stream 1 (内容+时序流): Length + LogIAT - 学习"大包与小包的排列旋律" + "时间节奏"
     - Stream 2 (结构流): Direction + BurstSize - 学习"交互模式的配合"
     
     门控融合：动态调整两路特征权重
@@ -294,15 +294,17 @@ class DualStreamBiMambaBackbone(nn.Module):
 
         self.fusion_type = str(getattr(config, 'MAMBA_FUSION_TYPE', 'gate')).strip().lower()
 
-        # Lite4 特征索引
+        # MEDAL-Lite5 特征索引
         self.length_index = getattr(config, 'LENGTH_INDEX', 0)
+        self.log_iat_index = getattr(config, 'LOG_IAT_INDEX', getattr(config, 'IAT_INDEX', None))
         self.direction_index = getattr(config, 'DIRECTION_INDEX', None)
         self.burst_index = getattr(config, 'BURST_SIZE_INDEX', None)
         self.valid_mask_index = getattr(config, 'VALID_MASK_INDEX', None)
 
-        # Stream 1: 内容流 (Length only)
+        # Stream 1: 内容+时序流 (Length + LogIAT)
+        # 使用2维输入：Length (1维) + LogIAT (1维) = 2维
         self.len_embed = nn.Sequential(
-            nn.Linear(1, self._d_len),
+            nn.Linear(2, self._d_len),  # 从1维改为2维：Length + LogIAT
             nn.LayerNorm(self._d_len),
             nn.GELU(),
         )
@@ -419,6 +421,16 @@ class DualStreamBiMambaBackbone(nn.Module):
             否则:
                 z: (B, output_dim) 或 (B, L, output_dim)
         """
+        # 输入维度验证（MEDAL-Lite5应该是5维特征）
+        expected_dim = getattr(self.config, 'INPUT_FEATURE_DIM', 5)
+        if x.shape[-1] != expected_dim:
+            import warnings
+            warnings.warn(
+                f"Input feature dimension mismatch: expected {expected_dim} (MEDAL-Lite5), "
+                f"got {x.shape[-1]}. This may cause feature extraction errors.",
+                UserWarning
+            )
+        
         valid_mask = None
         if self.valid_mask_index is not None:
             try:
@@ -431,9 +443,22 @@ class DualStreamBiMambaBackbone(nn.Module):
         if valid_mask is not None:
             gate = (valid_mask > 0.5).to(dtype=x.dtype, device=x.device).unsqueeze(-1)
 
-        # ===== Stream 1: 内容流 (Length) =====
+        # ===== Stream 1: 内容+时序流 (Length + LogIAT) =====
         length_index = int(self.length_index) if self.length_index is not None else 0
-        x_len = x[:, :, length_index:length_index + 1]
+        log_iat_index = int(self.log_iat_index) if self.log_iat_index is not None else None
+        
+        # 提取Length特征
+        x_length = x[:, :, length_index:length_index + 1]  # (B, L, 1)
+        
+        # 提取LogIAT特征（如果存在）
+        if log_iat_index is not None and 0 <= log_iat_index < x.shape[-1]:
+            x_logiat = x[:, :, log_iat_index:log_iat_index + 1]  # (B, L, 1)
+        else:
+            # 如果LogIAT不存在，使用零填充
+            x_logiat = torch.zeros_like(x_length)
+        
+        # 拼接Length和LogIAT: (B, L, 2)
+        x_len = torch.cat([x_length, x_logiat], dim=-1)
         x_len = self.len_embed(x_len)
         x_len = self.len_pos(x_len)
         x_len = self.len_dropout(x_len)

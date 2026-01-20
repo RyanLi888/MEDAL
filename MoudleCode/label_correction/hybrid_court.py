@@ -187,7 +187,7 @@ class CLProjectionHead(nn.Module):
 class ConfidentLearning:
     """Confident Learning (CL) - Probabilistic Diagnosis with Projection Head"""
     
-    def __init__(self, n_folds=5, use_projection_head=True, feature_dim=32, device='cpu'):
+    def __init__(self, n_folds=5, use_projection_head=True, feature_dim=32, device='cpu', config=None):
         self.n_folds = n_folds
         self.use_projection_head = use_projection_head
         self.device = device
@@ -203,7 +203,10 @@ class ConfidentLearning:
             ).to(device)
             # 优化建议2: 投影头训练模式配置
             # 默认冻结（推理模式），如果需要训练可通过配置启用
-            self.projection_trainable = getattr(config, 'CL_PROJECTION_TRAINABLE', False) if hasattr(config, 'CL_PROJECTION_TRAINABLE') else False
+            if config is not None:
+                self.projection_trainable = getattr(config, 'CL_PROJECTION_TRAINABLE', False)
+            else:
+                self.projection_trainable = False
             if not self.projection_trainable:
                 self.projection_head.eval()  # 推理模式（冻结）
                 for param in self.projection_head.parameters():
@@ -358,11 +361,20 @@ class HybridCourt:
         # 优化建议2: 为CL创建独立的投影头
         use_cl_projection = getattr(config, 'USE_CL_PROJECTION_HEAD', True)
         feature_dim = getattr(config, 'FEATURE_DIM', getattr(config, 'OUTPUT_DIM', 32))
+        # 自动检测设备
+        import torch
+        device = getattr(config, 'DEVICE', None)
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # 如果device是torch.device对象，转换为字符串
+        if isinstance(device, torch.device):
+            device = str(device)
         self.cl = ConfidentLearning(
             n_folds=config.CL_K_FOLD,
             use_projection_head=use_cl_projection,
             feature_dim=feature_dim,
-            device=device
+            device=device,
+            config=config
         )
         self.made = MADEDensityEstimator(
             hidden_dims=config.MADE_HIDDEN_DIMS,

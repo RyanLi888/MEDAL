@@ -15,7 +15,7 @@ For structure-aware data augmentation
    
 3. 条件-依赖解耦 (Condition-Dependence Decoupling)
    - 条件特征 (固定): Direction, ValidMask - 协议约束
-   - 依赖特征 (生成): Length, BurstSize - 学习分布
+   - 依赖特征 (生成): Length, BurstSize, LogIAT - 学习分布
    - 训练时随机mask依赖特征，强制模型学习特征间依赖关系
 
 训练目标：
@@ -348,7 +348,7 @@ class TabDDPM(nn.Module):
         
         2. 结构感知重建损失 (Structure-Aware Reconstruction Loss):
            L_recon = ||ε_pred[masked] - ε_true[masked]||²
-           - 随机mask依赖特征 (Length, BurstSize)
+           - 随机mask依赖特征 (Length, BurstSize, LogIAT)
            - 强制模型学习特征间的依赖关系
            - 例如: 短握手包通常对应较小的同向BurstSize
         
@@ -802,7 +802,7 @@ class TabDDPM(nn.Module):
         
         3. 条件生成机制:
            - 从高权重样本中采样条件特征 (Direction, ValidMask)
-           - 模型生成依赖特征 (Length, BurstSize)
+           - 模型生成依赖特征 (Length, BurstSize, LogIAT)
            - 保证生成样本符合协议约束
         
         4. 类别平衡策略:
@@ -836,6 +836,6 @@ class TabDDPM(nn.Module):
             sample_weights: (N_aug,) - weights for training
         """
         raise RuntimeError(
-            "augment_dataset(raw/sequence-level) is not supported in the fixed lite4 + dual-stream design. "
+            "augment_dataset(raw/sequence-level) is not supported in the fixed MEDAL-Lite5 + dual-stream design. "
             "Use augment_feature_dataset(Z_clean, y_clean, weights_clean) instead."
         )

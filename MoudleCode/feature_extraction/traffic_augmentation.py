@@ -41,7 +41,7 @@ class TrafficAugmentation:
         # 抖动参数
         self.jitter_std = float(getattr(config, 'TRAFFIC_AUG_JITTER_STD', getattr(config, 'AUG_JITTER_STD', 0.1)))
 
-        # Burst 抖动增强（lite4 推荐使用 Burst 而非 IAT）
+        # Burst 抖动增强（MEDAL-Lite5 推荐使用 Burst 而非 IAT）
         self.burst_jitter_prob = float(getattr(config, 'TRAFFIC_AUG_BURST_JITTER_PROB', 0.0))
         self.burst_jitter_std = float(getattr(config, 'TRAFFIC_AUG_BURST_JITTER_STD', 0.0))
 

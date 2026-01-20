@@ -196,7 +196,7 @@ class Config:
     PRETRAIN_LENGTH_WEIGHT = 1.0            # Length特征权重
     PRETRAIN_BURST_WEIGHT = 1.0             # BurstSize特征权重
     PRETRAIN_DIRECTION_WEIGHT = 1.0         # Direction特征权重
-    PRETRAIN_LOG_IAT_WEIGHT = 1.0           # LogIAT特征权重（新增）
+    PRETRAIN_LOG_IAT_WEIGHT = 0.8           # LogIAT特征权重（新增，降低至0.8以平衡学习）
     PRETRAIN_VALIDMASK_WEIGHT = 0.5         # ValidMask特征权重
     SIMMTM_DECODER_USE_MLP = False          # 解码器使用MLP
     SIMMTM_DECODER_HIDDEN_DIM = 64          # 解码器隐藏层维度
@@ -204,7 +204,7 @@ class Config:
     # 1.4 InfoNCE 对比学习参数（最优配置）
     USE_INSTANCE_CONTRASTIVE = True         # 启用实例对比学习
     CONTRASTIVE_METHOD = "infonce"          # 对比学习方法: infonce/nnclr/simsiam
-    INFONCE_TEMPERATURE = 0.2               # 温度系数τ（更强判别）
+    INFONCE_TEMPERATURE = 0.25              # 温度系数τ（从0.2提升至0.25，改善小数据集对比学习）
     INFONCE_LAMBDA = 0.5                    # 对比学习损失权重
     
     # NNCLR 参数（备选）
@@ -332,7 +332,7 @@ class Config:
     DDPM_ES_WARMUP_EPOCHS = 150             # 预热轮数（保持150）
     DDPM_ES_PATIENCE = 150                  # 耐心值（保持150）
     DDPM_ES_MIN_DELTA = 0.0003              # 改善阈值（保持0.0003）
-    DDPM_ES_SMOOTH_WINDOW = 3               # 平滑窗口（优化：5→3，更敏感）
+    DDPM_ES_SMOOTH_WINDOW = 5               # 平滑窗口（优化：5→3，更敏感）
     
     # Differential Guidance（分类引导）
     GUIDANCE_BENIGN = 1.0                   # 正常流量：无引导
@@ -409,7 +409,11 @@ class Config:
     BALANCED_SAMPLING_RATIO = 1.0           # 目标比例（正常:恶意=1:1）
     
     # 3.6 骨干网络微调（最优配置）
-    FINETUNE_BACKBONE = True               # 关闭骨干微调（最优配置）
+    # 注意：如果Stage 3输入是特征向量（2D），骨干微调会被自动禁用
+    # 原因：特征向量无法反向传播到骨干网络
+    # 解决方案：启用混合训练（STAGE3_MIXED_STREAM = True）以支持骨干微调
+    # 当前配置：混合训练已启用，因此骨干微调可以正常工作
+    FINETUNE_BACKBONE = True               # 启用骨干微调（混合训练模式下有效）
     FINETUNE_BACKBONE_SCOPE = 'all'  # 微调范围
     FINETUNE_BACKBONE_LR = 2e-5             # 骨干网络学习率
     FINETUNE_BACKBONE_WARMUP_EPOCHS = 50    # 预热轮数

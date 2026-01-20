@@ -680,7 +680,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     
     # 确定输入类型
     if use_mixed_stream is None:
-        use_mixed_stream = bool(getattr(config, 'STAGE3_MIXED_STREAM', False))
+        use_mixed_stream = bool(getattr(config, 'STAGE3_MIXED_STREAM', True))  # 默认启用混合训练
     
     has_real_sequences = X_train_real is not None and len(X_train_real) > 0
     
@@ -1587,7 +1587,7 @@ def main(args):
         classifier, finetune_history, optimal_threshold = stage3_finetune_classifier(
             backbone, X_augmented, y_augmented, sample_weights, config, logger,
             n_original=n_original, backbone_path=actual_backbone_path, X_train_real=X_train_real,
-            use_mixed_stream=bool(getattr(config, 'STAGE3_MIXED_STREAM', False))
+            use_mixed_stream=bool(getattr(config, 'STAGE3_MIXED_STREAM', True))  # 默认启用混合训练
         )
         logger.info(f"🔧 RNG指纹(Stage3返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     else:

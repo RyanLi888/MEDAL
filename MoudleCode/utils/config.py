@@ -247,7 +247,28 @@ class Config:
     # STAGE 2: 标签矫正 + 数据增强 - 最优配置
     # ============================================================
     
+    # 2.1 标签矫正策略（两阶段CL+KNN，去除MADE）
+    # KNN一致性等级阈值（用于判断KNN一致性等级：low < medium < high）
+    KNN_CONSISTENCY_MEDIUM_THRESHOLD = 0.5    # Medium等级阈值（>=此值为medium或high）
+    KNN_CONSISTENCY_HIGH_THRESHOLD = 0.7      # High等级阈值（>=此值为high）
+    
     # 2.1 Hybrid Court 标签矫正（三阶段策略）
+    # 策略配置对应日志: label_correction_batch_20260121_005513.log
+    # 启用 Phase2 保守补刀/救援策略（LateFlip 和 UndoFlip）
+    PHASE2_ENABLE = True                     # 启用 Phase2 策略（默认 False，设为 True 启用三阶段）
+    # 启用 Phase1 超激进翻转（最终极优化方案 - The Ultimate Design）
+    PHASE1_AGGRESSIVE = True                 # True=Phase1 使用超激进策略；False=使用保守策略
+    # Phase1 Aggressive 参数（对应日志中的策略）
+    # 原始策略: 恶意: AUM<0.05 且 (KNN反对 或 CL<0.6)
+    # 优化策略: 恶意: AUM<-0.1 且 (KNN反对且KNN一致性>0.7 或 CL<0.5) - 更严格，减少误杀
+    PHASE1_AGGRESSIVE_MALICIOUS_AUM_THRESHOLD = -0.1   # 恶意: AUM < -0.1 (优化: 从0.05降到-0.1)
+    PHASE1_AGGRESSIVE_MALICIOUS_CL_THRESHOLD = 0.5     # 恶意: CL < 0.5 (优化: 从0.6降到0.5)
+    PHASE1_AGGRESSIVE_MALICIOUS_KNN_CONS_THRESHOLD = 0.7  # 恶意: KNN一致性阈值 (优化: 从0.6提高到0.7)
+    # 原始策略: 正常: AUM<-0.05 且 KNN反对 且 KNN一致性>0.55
+    # 优化策略: 正常: AUM<0.0 且 KNN反对 且 KNN一致性>0.5 - 更宽松，减少漏网
+    PHASE1_AGGRESSIVE_BENIGN_AUM_THRESHOLD = 0.0       # 正常: AUM < 0.0 (优化: 从-0.05提高到0.0)
+    PHASE1_AGGRESSIVE_BENIGN_KNN_THRESHOLD = 0.5       # 正常: KNN一致性 > 0.5 (优化: 从0.55降到0.5)
+    
     # Phase 1: 核心严选阈值
     HC_PHASE1_CL_BENIGN = 0.54              # 正常样本CL置信度阈值
     HC_PHASE1_CL_MALICIOUS = 0.57           # 恶意样本CL置信度阈值
@@ -256,8 +277,31 @@ class Config:
     
     # Phase 2: 分级挽救阈值
     HC_PHASE2_REWEIGHT_BASE_CL = 0.35       # 重加权基础准入线
-    HC_PHASE2_MADE_ANOMALY = 60.0           # MADE密度异常分界线
     HC_PHASE2_SYS_CONF_SPLIT = 0.30         # 系统置信度分界线
+    # Phase 2 参数（旧设计：Conservative Fix/Rescue - 依赖Phase1动作）
+    # 对应日志: Phase2: 保守优化策略 (旧设计)
+    PHASE2_INDEPENDENT = False             # 使用保守补刀/救援策略（依赖Phase1动作）
+    # Phase2独立翻转策略参数（基于Phase1矫正后标签重新计算的指标）
+    PHASE2_MALICIOUS_AUM_THRESHOLD = 0.05  # 恶意标签: stage2_AUM阈值（比Phase1更严格）
+    PHASE2_MALICIOUS_CL_THRESHOLD = 0.65   # 恶意标签: stage2_CL阈值（比Phase1的0.7更严格）
+    PHASE2_MALICIOUS_KNN_CONS_THRESHOLD = 0.55  # 恶意标签: stage2_KNN一致性阈值（比Phase1的0.6更严格）
+    PHASE2_BENIGN_AUM_THRESHOLD = -0.2    # 正常标签: stage2_AUM阈值（比Phase1的-0.15更严格）
+    PHASE2_BENIGN_KNN_THRESHOLD = 0.6      # 正常标签: stage2_KNN一致性阈值（比Phase1的0.55更严格）
+    # 旧策略参数（Conservative Fix/Rescue）
+    # 原始策略: LateFlip: stage2_AUM<-0.5 且 stage2_KNN反对 且 stage2_KNN>0.65 且 iter_CL_current<0.4
+    # 优化策略: LateFlip: stage2_AUM<-0.3 且 stage2_KNN反对 且 stage2_KNN>0.6 且 iter_CL_current<0.35 - 更积极补刀
+    PHASE2_LATE_FLIP_AUM_THRESHOLD = -0.3   # LateFlip: AUM 阈值 (优化: 从-0.5提高到-0.3)
+    PHASE2_LATE_FLIP_KNN_THRESHOLD = 0.6    # LateFlip: KNN 一致性阈值 (优化: 从0.65降到0.6)
+    PHASE2_LATE_FLIP_CL_THRESHOLD = 0.35    # LateFlip: iter_CL当前标签置信度阈值 (优化: 从0.4降到0.35)
+    # 原始策略: UndoFlip: stage2_AUM<-0.8 或 iter_CL_current<0.25 (OR条件)
+    # 优化策略: UndoFlip: 结合P1_AUM判断，更智能的救援策略（见代码实现）
+    PHASE2_UNDO_FLIP_AUM_THRESHOLD = -1.0   # UndoFlip: AUM 阈值 (优化: 从-0.8降到-1.0，配合P1_AUM使用)
+    PHASE2_UNDO_FLIP_CL_THRESHOLD = 0.35    # UndoFlip: CL 置信度阈值 (优化: 从0.25提高到0.35，配合P1_AUM使用)
+    PHASE2_UNDO_FLIP_USE_AND = False        # UndoFlip: 使用OR条件（不是AND），但会结合P1_AUM判断
+    # 新增：UndoFlip的P1_AUM判断阈值
+    PHASE2_UNDO_FLIP_P1_AUM_HESITANT = -0.2  # P1翻转时AUM阈值（高于此值认为P1犹豫）
+    PHASE2_UNDO_FLIP_P1_AUM_STRONG = -0.5   # P1翻转时AUM阈值（低于此值认为P1很坚决，给免死金牌）
+    PHASE2_UNDO_FLIP_P2_AUM_WEAK = 1.5      # P2环境下AUM阈值（低于此值认为P2不认可）
     
     # Phase 3: 锚点拯救阈值
     HC_PHASE3_MIN_ANCHORS = 20              # 最少锚点样本数
@@ -278,19 +322,10 @@ class Config:
     # CL (Confident Learning) 参数
     CL_K_FOLD = 5                           # K折交叉验证
     
-    # MADE (Density Estimation) 参数
-    MADE_HIDDEN_DIMS = [64, 128, 64]        # 隐藏层维度
-    MADE_DENSITY_THRESHOLD_PERCENTILE = 70  # 密度阈值百分位
-    
     # KNN (Semantic Voting) 参数
     KNN_NEIGHBORS = 20                      # K近邻数量
     KNN_METRIC = "euclidean"                # 距离度量
     
-    # 动态密度阈值（可选）
-    HYBRIDCOURT_DYNAMIC_DENSITY_THRESHOLDS = False
-    HYBRIDCOURT_DENSITY_HIGH_PCT = 90.0
-    HYBRIDCOURT_DENSITY_LOW_PCT = 50.0
-
     # 2.2 TabDDPM 数据增强（特征空间生成）- 优化版 v2.5
     STAGE2_USE_TABDDPM = True               # 启用TabDDPM
     STAGE2_TABDDPM_SPACE = 'feature'        # 在特征空间增强
@@ -332,7 +367,7 @@ class Config:
     DDPM_ES_WARMUP_EPOCHS = 150             # 预热轮数（保持150）
     DDPM_ES_PATIENCE = 150                  # 耐心值（保持150）
     DDPM_ES_MIN_DELTA = 0.0003              # 改善阈值（保持0.0003）
-    DDPM_ES_SMOOTH_WINDOW = 5               # 平滑窗口（优化：5→3，更敏感）
+    DDPM_ES_SMOOTH_WINDOW = 3               # 平滑窗口（优化：5→3，更敏感）
     
     # Differential Guidance（分类引导）
     GUIDANCE_BENIGN = 1.0                   # 正常流量：无引导

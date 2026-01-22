@@ -482,11 +482,6 @@ def main(args):
         except Exception as e:
             logger.warning(f"⚠ 无法读取模型元数据: {e}")
     
-    # Load backbone from feature_extraction directory
-    logger.info(f"🔧 RNG指纹(构建backbone前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
-    backbone = build_backbone(config, logger=logger)
-    logger.info(f"🔧 RNG指纹(构建backbone后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
-    
     # 确定骨干网络路径
     # 优先级：1. 命令行参数 2. 元数据 3. 默认路径
     backbone_path = None
@@ -534,12 +529,15 @@ def main(args):
     logger.info("正在加载骨干网络...")
     logger.info(f"  📥 输入模型: {backbone_path}")
     logger.info(f"🔧 RNG指纹(加载backbone权重前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
-    try:
-        backbone_state = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)
-    except TypeError:
-        backbone_state = torch.load(backbone_path, map_location=config.DEVICE)
-
-    load_state_dict_shape_safe(backbone, backbone_state, logger, prefix="backbone")
+    
+    # 使用安全的模型加载函数（自动处理兼容性）
+    from MoudleCode.utils.model_loader import load_backbone_safely
+    backbone = load_backbone_safely(
+        backbone_path=backbone_path,
+        config=config,
+        device=config.DEVICE,
+        logger=logger
+    )
     logger.info(f"🔧 RNG指纹(加载backbone权重后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     backbone.freeze()
     logger.info(f"✓ 骨干网络加载完成")

@@ -257,11 +257,14 @@ def main():
 
             if os.path.exists(backbone_path):
                 logger.info(f'✓ 加载骨干网络: {backbone_path}')
-                try:
-                    state_dict = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)
-                except TypeError:
-                    state_dict = torch.load(backbone_path, map_location=config.DEVICE)
-                backbone.load_state_dict(state_dict, strict=False)
+                # 使用安全的模型加载函数（自动处理兼容性）
+                from MoudleCode.utils.model_loader import load_backbone_safely
+                backbone = load_backbone_safely(
+                    backbone_path=backbone_path,
+                    config=config,
+                    device=config.DEVICE,
+                    logger=logger
+                )
                 backbone.freeze()
             else:
                 logger.warning('⚠ 使用随机初始化骨干网络')

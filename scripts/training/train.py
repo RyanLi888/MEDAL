@@ -388,25 +388,40 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
     # 标签矫正
     log_subsection_header(logger, "步骤 2.1: Hybrid Court 标签矫正")
     logger.info(f"  输入: {len(y_train_noisy)} 个样本，噪声率: {config.LABEL_NOISE_RATE*100:.0f}%")
-    logger.info(f"  方法: CL (置信学习) + MADE (密度估计) + KNN (语义投票)")
+    logger.info(f"  方法: CL (置信学习) + AUM (训练动态) + KNN (语义投票)")
     
     hybrid_court = HybridCourt(config)
 
     if stage2_mode == 'clean_augment_only':
-        # 跳过标签矫正，直接使用干净标签
-        suspected_noise, pred_labels, pred_probs = hybrid_court.cl.fit_predict(features, y_train_clean)
-        hybrid_court.made.fit(features, device=config.DEVICE)
-        is_dense, density_scores = hybrid_court.made.predict_density(features, device=config.DEVICE)
-        hybrid_court.knn.fit(features)
-        neighbor_labels, neighbor_consistency = hybrid_court.knn.predict_semantic_label(features, y_train_clean)
+        # 跳过标签矫正，直接使用干净标签，所有样本权重为1
+        logger.info("  ⚠️  模式7: 跳过标签矫正，直接使用真实标签，所有样本权重=1.0")
         y_corrected = y_train_clean.copy()
-        action_mask = np.zeros(len(y_train_clean), dtype=int)
-        confidence = pred_probs.max(axis=1)
-        correction_weight = np.ones(len(y_train_clean), dtype=np.float32)
+        action_mask = np.zeros(len(y_train_clean), dtype=int)  # 全部为Keep
+        confidence = np.ones(len(y_train_clean), dtype=np.float32)  # 置信度设为1.0
+        correction_weight = np.ones(len(y_train_clean), dtype=np.float32)  # 所有样本权重=1.0
+        # 为了兼容后续代码，设置一些占位值
+        aum_scores = np.zeros((len(y_train_clean),), dtype=np.float32)
+        neighbor_consistency = np.ones(len(y_train_clean), dtype=np.float32)
+        # 创建简单的pred_probs（用于兼容性）
+        n_classes = len(np.unique(y_train_clean))
+        pred_probs = np.zeros((len(y_train_clean), n_classes), dtype=np.float32)
+        for i in range(len(y_train_clean)):
+            pred_probs[i, y_train_clean[i]] = 1.0
         cl_confidence = pred_probs.max(axis=1)
     else:
-        y_corrected, action_mask, confidence, correction_weight, density_scores, neighbor_consistency, pred_probs = hybrid_court.correct_labels(
-            features, y_train_noisy, device=config.DEVICE
+        cl_threshold = float(getattr(config, 'STAGE2_CL_THRESHOLD', 0.7))
+        aum_threshold = float(getattr(config, 'STAGE2_AUM_THRESHOLD', 0.0))
+        aum_epochs = int(getattr(config, 'AUM_EPOCHS', 30))
+        aum_batch_size = int(getattr(config, 'AUM_BATCH_SIZE', 128))
+        aum_lr = float(getattr(config, 'AUM_LR', 0.01))
+        knn_purity_threshold = float(getattr(config, 'STAGE2_KNN_PURITY_THRESHOLD', 0.8))
+        use_drop = bool(getattr(config, 'STAGE2_USE_DROP', False))
+
+        y_corrected, action_mask, confidence, correction_weight, aum_scores, neighbor_consistency, pred_probs = hybrid_court.correct_labels(
+            features=features,
+            noisy_labels=y_train_noisy,
+            device=str(config.DEVICE),
+            y_true=y_train_clean,
         )
         cl_confidence = pred_probs.max(axis=1)
     
@@ -436,7 +451,7 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
              action_mask=action_mask,
              confidence=confidence,
              correction_weight=correction_weight,
-             density_scores=density_scores,
+             aum_scores=aum_scores,
              neighbor_consistency=neighbor_consistency,
              pred_probs=pred_probs)
     
@@ -1506,11 +1521,15 @@ def main(args):
         elif os.path.exists(backbone_path):
             logger.info(f"✓ 加载骨干网络: {backbone_path}")
             logger.info(f"🔧 RNG指纹(加载backbone权重前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
-            try:
-                backbone_state = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)
-            except TypeError:
-                backbone_state = torch.load(backbone_path, map_location=config.DEVICE)
-            load_state_dict_shape_safe(backbone, backbone_state, logger, prefix="backbone")
+            # 使用安全的模型加载函数（自动处理兼容性）
+            from MoudleCode.utils.model_loader import load_backbone_safely
+            backbone = load_backbone_safely(
+                backbone_path=backbone_path,
+                config=config,
+                device=config.DEVICE,
+                logger=logger
+            )
+            backbone.train()  # 设置为训练模式
             logger.info(f"🔧 RNG指纹(加载backbone权重后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         else:
             logger.error(f"❌ 找不到骨干网络: {backbone_path}")

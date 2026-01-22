@@ -126,39 +126,22 @@ def analyze_cl_performance(df):
     print(f"    Accuracy:  {accuracy*100:.2f}%")
 
 
-def analyze_made_performance(df):
-    """Analyze MADE density estimation performance"""
+def analyze_aum_performance(df):
+    """Analyze AUM score distribution if present"""
+    if 'AUM_Score' not in df.columns:
+        return
+
     print("\n" + "="*70)
-    print("MADE DENSITY ESTIMATION PERFORMANCE")
+    print("AUM PERFORMANCE")
     print("="*70)
-    
-    # Convert density score to float
-    df['MADE_Density_Score_Float'] = df['MADE_Density_Score'].astype(float)
-    
-    print(f"\n  Density Score Statistics:")
-    print(f"    Mean:   {df['MADE_Density_Score_Float'].mean():.4f}")
-    print(f"    Median: {df['MADE_Density_Score_Float'].median():.4f}")
-    print(f"    Std:    {df['MADE_Density_Score_Float'].std():.4f}")
-    print(f"    Min:    {df['MADE_Density_Score_Float'].min():.4f}")
-    print(f"    Max:    {df['MADE_Density_Score_Float'].max():.4f}")
-    
-    print(f"\n  Density Classification:")
-    n_dense = df['MADE_Is_Dense'].sum()
-    n_sparse = len(df) - n_dense
-    print(f"    High density: {n_dense} ({n_dense/len(df)*100:.1f}%)")
-    print(f"    Low density:  {n_sparse} ({n_sparse/len(df)*100:.1f}%)")
-    
-    # Density vs Noise
-    print(f"\n  Density vs Noise:")
-    dense_noise = ((df['MADE_Is_Dense'] == True) & (df['Is_Noise'] == True)).sum()
-    dense_clean = ((df['MADE_Is_Dense'] == True) & (df['Is_Noise'] == False)).sum()
-    sparse_noise = ((df['MADE_Is_Dense'] == False) & (df['Is_Noise'] == True)).sum()
-    sparse_clean = ((df['MADE_Is_Dense'] == False) & (df['Is_Noise'] == False)).sum()
-    
-    print(f"    Dense + Noise:  {dense_noise} ({dense_noise/n_dense*100:.1f}% of dense)")
-    print(f"    Dense + Clean:  {dense_clean} ({dense_clean/n_dense*100:.1f}% of dense)")
-    print(f"    Sparse + Noise: {sparse_noise} ({sparse_noise/n_sparse*100:.1f}% of sparse)")
-    print(f"    Sparse + Clean: {sparse_clean} ({sparse_clean/n_sparse*100:.1f}% of sparse)")
+
+    df['AUM_Score_Float'] = df['AUM_Score'].astype(float)
+    print(f"\n  AUM Score Statistics:")
+    print(f"    Mean:   {df['AUM_Score_Float'].mean():.4f}")
+    print(f"    Median: {df['AUM_Score_Float'].median():.4f}")
+    print(f"    Std:    {df['AUM_Score_Float'].std():.4f}")
+    print(f"    Min:    {df['AUM_Score_Float'].min():.4f}")
+    print(f"    Max:    {df['AUM_Score_Float'].max():.4f}")
 
 
 def analyze_knn_performance(df):
@@ -228,7 +211,12 @@ def analyze_error_patterns(df):
     # Common characteristics of errors
     print(f"\n  Characteristics of Incorrect Corrections:")
     print(f"    CL suspected noise: {incorrect['CL_Suspected_Noise'].sum()} ({incorrect['CL_Suspected_Noise'].sum()/len(incorrect)*100:.1f}%)")
-    print(f"    MADE high density:  {incorrect['MADE_Is_Dense'].sum()} ({incorrect['MADE_Is_Dense'].sum()/len(incorrect)*100:.1f}%)")
+    if 'AUM_Score' in incorrect.columns:
+        try:
+            aum_vals = incorrect['AUM_Score'].astype(float)
+            print(f"    AUM mean (incorrect): {aum_vals.mean():.4f}")
+        except Exception:
+            pass
     print(f"    Actually noise:     {incorrect['Is_Noise'].sum()} ({incorrect['Is_Noise'].sum()/len(incorrect)*100:.1f}%)")
 
 
@@ -329,7 +317,7 @@ def main():
     print_basic_statistics(df)
     analyze_by_action(df)
     analyze_cl_performance(df)
-    analyze_made_performance(df)
+    analyze_aum_performance(df)
     analyze_knn_performance(df)
     analyze_error_patterns(df)
     plot_component_comparison(df)

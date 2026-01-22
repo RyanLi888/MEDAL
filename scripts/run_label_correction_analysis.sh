@@ -174,17 +174,19 @@ echo ""
 read -ra RATES_ARRAY <<< "$NOISE_RATES"
 
 run_analysis() {
-    echo "=========================================="
-    echo "MEDAL-Lite 标签矫正分析"
-    echo "=========================================="
-    echo "开始时间: $(date)"
-    echo "噪声率: $NOISE_RATES"
+    # 清晰的标题
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "║              MEDAL-Lite 标签矫正分析 (批量)                    ║"
+    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "  开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "  噪声率: $NOISE_RATES"
     if [ "$USE_EXISTING_BACKBONE" = "true" ]; then
-        echo "骨干网络: $(basename "$BACKBONE_PATH")"
+        echo "  骨干网络: $(basename "$BACKBONE_PATH")"
     else
-        echo "骨干网络: 随机初始化"
+        echo "  骨干网络: 随机初始化"
     fi
-    echo "=========================================="
     echo ""
     
     # 重新解析噪声率数组
@@ -193,12 +195,15 @@ run_analysis() {
     local completed=0
     local failed=0
     
+    # 存储每个噪声率的结果摘要
+    declare -A results_summary
+    
     for noise_rate in "${rates_array[@]}"; do
         local noise_pct=$(printf "%.0f" $(echo "$noise_rate * 100" | bc))
         
-        echo "=========================================="
-        echo "分析噪声率: ${noise_pct}% ($((completed+1))/${total})"
-        echo "=========================================="
+        echo "┌────────────────────────────────────────────────────────────────┐"
+        echo "│  噪声率: ${noise_pct}%  ($((completed+1))/${total})"
+        echo "└────────────────────────────────────────────────────────────────┘"
         echo ""
         
         local cmd_args="--noise_rate $noise_rate"
@@ -209,42 +214,66 @@ run_analysis() {
             cmd_args="$cmd_args $RETRAIN_BACKBONE"
         fi
         
-        # Python脚本会创建自己的日志文件: noise_{noise_pct}pct_analysis_{timestamp}.log
-        # 这里只输出简要信息到主日志
-        echo "开始处理噪声率 ${noise_pct}%..."
-        echo "详细日志将保存到: ${OUTPUT_DIR}/logs/noise_${noise_pct}pct_analysis_*.log"
-        echo ""
-        
-        if python "$PYTHON_SCRIPT" $cmd_args; then
+        # 运行Python脚本并捕获输出
+        local temp_output=$(mktemp)
+        if python "$PYTHON_SCRIPT" $cmd_args 2>&1 | tee "$temp_output"; then
+            # 提取摘要信息
+            local summary_line=$(grep "^SUMMARY:" "$temp_output" | tail -1)
+            if [ -n "$summary_line" ]; then
+                results_summary["${noise_pct}"]="$summary_line"
+            fi
+            
             echo ""
-            echo "✓ 噪声率 ${noise_pct}% 完成"
+            echo "  ✓ 噪声率 ${noise_pct}% 完成"
             completed=$((completed + 1))
         else
             echo ""
-            echo "✗ 噪声率 ${noise_pct}% 失败"
+            echo "  ✗ 噪声率 ${noise_pct}% 失败"
             failed=$((failed + 1))
         fi
+        rm -f "$temp_output"
         echo ""
     done
     
-    echo "=========================================="
-    echo "批量分析完成"
-    echo "=========================================="
-    echo "  总计: ${total}"
-    echo "  成功: ${completed}"
-    echo "  失败: ${failed}"
-    echo "  结束时间: $(date)"
+    # 显示汇总结果
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "║                        批量分析完成                            ║"
+    echo "╚════════════════════════════════════════════════════════════════╝"
     echo ""
-    echo "输出目录: ${OUTPUT_DIR}/label_correction/analysis/"
+    echo "  总计: ${total}  |  成功: ${completed}  |  失败: ${failed}"
+    echo "  结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
     echo ""
-    echo "各噪声率的详细日志:"
-    for noise_rate in "${rates_array[@]}"; do
-        local noise_pct=$(printf "%.0f" $(echo "$noise_rate * 100" | bc))
-        local latest_log=$(ls -t "${OUTPUT_DIR}/logs/noise_${noise_pct}pct_analysis_"*.log 2>/dev/null | head -1)
-        if [ -n "$latest_log" ]; then
-            echo "  ${noise_pct}%: $latest_log"
-        fi
-    done
+    
+    # 显示每个噪声率的关键指标
+    if [ ${#results_summary[@]} -gt 0 ]; then
+        echo "┌────────────────────────────────────────────────────────────────┐"
+        echo "│  结果摘要                                                       │"
+        echo "├────────────────────────────────────────────────────────────────┤"
+        printf "│  %-8s │ %-12s │ %-12s │ %-10s │ %-8s │\n" "噪声率" "原始纯度" "最终纯度" "提升" "翻转数"
+        echo "├────────────────────────────────────────────────────────────────┤"
+        
+        for noise_rate in "${rates_array[@]}"; do
+            local noise_pct=$(printf "%.0f" $(echo "$noise_rate * 100" | bc))
+            local summary="${results_summary["${noise_pct}"]}"
+            if [ -n "$summary" ]; then
+                # 解析摘要行
+                local orig_purity=$(echo "$summary" | grep -oP 'original_purity=\K[0-9.]+')
+                local final_purity=$(echo "$summary" | grep -oP 'final_purity=\K[0-9.]+')
+                local improvement=$(echo "$summary" | grep -oP 'improvement=\K[0-9.+-]+')
+                local flip_count=$(echo "$summary" | grep -oP 'flip_count=\K[0-9]+')
+                
+                printf "│  %-8s │ %-12s │ %-12s │ %-10s │ %-8s │\n" \
+                    "${noise_pct}%" "${orig_purity}%" "${final_purity}%" "+${improvement}%" "${flip_count}"
+            else
+                printf "│  %-8s │ %-12s │ %-12s │ %-10s │ %-8s │\n" \
+                    "${noise_pct}%" "-" "-" "-" "-"
+            fi
+        done
+        echo "└────────────────────────────────────────────────────────────────┘"
+        echo ""
+    fi
+    
+    echo "  输出目录: ${OUTPUT_DIR}/label_correction/analysis/"
     echo ""
     
     if [ $failed -gt 0 ]; then

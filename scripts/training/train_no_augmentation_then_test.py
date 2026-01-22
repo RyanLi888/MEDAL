@@ -215,11 +215,14 @@ def main():
             
             if os.path.exists(backbone_path):
                 logger.info(f"🔧 RNG指纹(加载backbone权重前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
-                try:
-                    state_dict = torch.load(backbone_path, map_location=config.DEVICE, weights_only=True)
-                except TypeError:
-                    state_dict = torch.load(backbone_path, map_location=config.DEVICE)
-                backbone.load_state_dict(state_dict, strict=False)
+                # 使用安全的模型加载函数（自动处理兼容性）
+                from MoudleCode.utils.model_loader import load_backbone_safely
+                backbone = load_backbone_safely(
+                    backbone_path=backbone_path,
+                    config=config,
+                    device=config.DEVICE,
+                    logger=logger
+                )
                 logger.info(f"🔧 RNG指纹(加载backbone权重后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
             else:
                 logger.warning('⚠ 骨干网络文件不存在，使用随机初始化')

@@ -47,23 +47,16 @@ class BackboneEvaluator:
         # 加载配置
         config = Config()
         
-        # 加载骨干网络
-        print(f"[加载] 骨干网络: {backbone_path}")
-        self.backbone = build_backbone(config)
-
-        load_location = 'cpu' if str(device) != 'cpu' else 'cpu'
-        try:
-            checkpoint = torch.load(backbone_path, map_location=load_location, weights_only=True)
-        except TypeError:
-            checkpoint = torch.load(backbone_path, map_location=load_location)
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        else:
-            state_dict = checkpoint
+        # 使用安全的模型加载函数（自动处理兼容性）
+        from MoudleCode.utils.model_loader import load_backbone_safely
         
-        self.backbone.load_state_dict(state_dict, strict=False)
-        self.backbone.to(device)
-        self.backbone.eval()
+        print(f"[加载] 骨干网络: {backbone_path}")
+        self.backbone = load_backbone_safely(
+            backbone_path=backbone_path,
+            config=config,
+            device=device,
+            logger=None  # 使用print输出
+        )
         
         # 加载预处理数据
         print(f"[加载] 预处理数据: {data_root}")
@@ -110,9 +103,32 @@ class BackboneEvaluator:
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         
-        # t-SNE 降维
-        tsne = TSNE(n_components=2, random_state=42, perplexity=30)
-        features_2d = tsne.fit_transform(self.features)
+        # 检查特征是否有效
+        if self.features is None or len(self.features) == 0:
+            print("[警告] 特征为空，跳过t-SNE可视化")
+            return
+        
+        # 检查特征是否有NaN或Inf
+        if np.any(np.isnan(self.features)) or np.any(np.isinf(self.features)):
+            print("[警告] 特征包含NaN或Inf，跳过t-SNE可视化")
+            return
+        
+        # t-SNE 降维（添加错误处理）
+        try:
+            # 根据样本数调整perplexity
+            n_samples = len(self.features)
+            perplexity = min(30, max(5, n_samples // 4))
+            
+            print(f"  - 样本数: {n_samples}, perplexity: {perplexity}")
+            tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity, 
+                       max_iter=1000, verbose=0)
+            features_2d = tsne.fit_transform(self.features)
+        except Exception as e:
+            print(f"[错误] t-SNE降维失败: {e}")
+            print("跳过t-SNE可视化")
+            import traceback
+            traceback.print_exc()
+            return
         
         # 绘制特征空间分布
         fig, ax = plt.subplots(1, 1, figsize=(10, 8))

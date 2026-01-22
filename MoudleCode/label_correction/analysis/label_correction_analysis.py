@@ -5,7 +5,7 @@ Only runs label correction part and generates detailed analysis documents and fe
 This script:
 1. Loads dataset and injects label noise
 2. Extracts features using pre-trained backbone
-3. Runs Hybrid Court label correction (CL + MADE + KNN)
+3. Runs Hybrid Court label correction (CL + AUM + KNN)
 4. Generates detailed per-sample analysis document
 5. Creates feature distribution plots for clean, noisy, and corrected data
 """
@@ -155,7 +155,7 @@ def extract_features_with_backbone(backbone, X_data, config, logger):
 
 def run_hybrid_court_with_detailed_tracking(features, noisy_labels, config, logger, y_true=None):
     """
-    Run Hybrid Court v9 三阶段标签矫正 with detailed tracking
+    Run Hybrid Court (CL+AUM+KNN Two-Phase, No-Drop) with detailed tracking
     
     Args:
         features: 特征矩阵
@@ -169,28 +169,39 @@ def run_hybrid_court_with_detailed_tracking(features, noisy_labels, config, logg
     """
     logger.info("")
     logger.info("="*70)
-    logger.info("Running Hybrid Court v9 三阶段标签矫正")
+    logger.info("Running Hybrid Court (CL+AUM+KNN)")
     logger.info("="*70)
     
     hybrid_court = HybridCourt(config)
     n_samples = len(noisy_labels)
-    
-    # 调用三阶段标签矫正
-    clean_labels, action_mask, confidence, correction_weight, density_scores, neighbor_consistency, pred_probs = hybrid_court.correct_labels(
-        features, noisy_labels, device=config.DEVICE, y_true=y_true
+
+    clean_labels, action_mask, confidence, correction_weight, aum_scores, neighbor_consistency, pred_probs = hybrid_court.correct_labels(
+        features=features,
+        noisy_labels=noisy_labels,
+        device=str(config.DEVICE),
+        y_true=y_true,
     )
     
     # 从各子模块中读取缓存的中间结果
     suspected_noise = getattr(hybrid_court.cl, "last_suspected_noise", None)
     pred_labels = getattr(hybrid_court.cl, "last_pred_labels", None)
-    is_dense = getattr(hybrid_court.made, "last_is_dense", None)
     neighbor_labels = getattr(hybrid_court.knn, "last_neighbor_labels", None)
-    tier_info = getattr(hybrid_court, "last_tier_info", [''] * n_samples)
+    action_names = ['Keep', 'Flip', 'Drop', 'Reweight']
+    tier_info = [action_names[int(a)] if int(a) < len(action_names) else '' for a in np.asarray(action_mask).tolist()]
     
     # 获取迭代CL和锚点KNN结果
     iter_pred_probs = getattr(hybrid_court, "iter_pred_probs_all", None)
     anchor_votes = getattr(hybrid_court, "anchor_votes_all", None)
     anchor_consistency = getattr(hybrid_court, "anchor_consistency_all", None)
+
+    # Phase1 矫正后重算的 Stage2 指标（供二阶段策略使用）
+    stage2_aum_scores = getattr(hybrid_court, "stage2_aum_scores_all", None)
+    stage2_knn_neighbor_labels = getattr(hybrid_court, "stage2_knn_neighbor_labels_all", None)
+    stage2_knn_neighbor_consistency = getattr(hybrid_court, "stage2_knn_neighbor_consistency_all", None)
+    stage2_cl_suspected_noise = getattr(hybrid_court, "stage2_cl_suspected_noise_all", None)
+    stage2_cl_pred_labels = getattr(hybrid_court, "stage2_cl_pred_labels_all", None)
+    stage2_cl_pred_probs = getattr(hybrid_court, "stage2_cl_pred_probs_all", None)
+    phase2_actions = getattr(hybrid_court, "phase2_action_all", None)
     
     # 生成决策原因
     decision_reasons = []
@@ -198,23 +209,23 @@ def run_hybrid_court_with_detailed_tracking(features, noisy_labels, config, logg
         tier = tier_info[i] if i < len(tier_info) else ''
         
         # 获取迭代CL和锚点KNN信息
-        iter_cl_current = float(iter_pred_probs[i, int(noisy_labels[i])]) if iter_pred_probs is not None else None
-        iter_cl_target = float(iter_pred_probs[i, 1 - int(noisy_labels[i])]) if iter_pred_probs is not None else None
+        # iter_pred_probs 对应 “Phase1 矫正后标签” 的 CL 概率，因此当前标签用 clean_labels
+        iter_cl_current = float(iter_pred_probs[i, int(clean_labels[i])]) if iter_pred_probs is not None else None
+        iter_cl_target = float(iter_pred_probs[i, 1 - int(clean_labels[i])]) if iter_pred_probs is not None else None
         anchor_vote = int(anchor_votes[i]) if anchor_votes is not None else None
         anchor_cons = float(anchor_consistency[i]) if anchor_consistency is not None else None
         
         reason = _generate_decision_reason(
-            tier, 
-            int(noisy_labels[i]), 
+            tier,
+            int(noisy_labels[i]),
             int(clean_labels[i]),
             int(action_mask[i]),
             bool(suspected_noise[i]) if suspected_noise is not None else False,
-            bool(is_dense[i]) if is_dense is not None else True,
             int(neighbor_labels[i]) if neighbor_labels is not None else -1,
             float(neighbor_consistency[i]),
             float(pred_probs[i, 0]),
             float(pred_probs[i, 1]),
-            float(density_scores[i]),
+            float(aum_scores[i]) if aum_scores is not None else 0.0,
             iter_cl_current,
             iter_cl_target,
             anchor_vote,
@@ -234,9 +245,7 @@ def run_hybrid_court_with_detailed_tracking(features, noisy_labels, config, logg
         'cl_suspected_noise': suspected_noise,
         'cl_pred_labels': pred_labels,
         'cl_pred_probs': pred_probs,
-        # MADE results
-        'made_is_dense': is_dense,
-        'made_density_scores': density_scores,
+        'aum_scores': aum_scores,
         # KNN results
         'knn_neighbor_labels': neighbor_labels,
         'knn_neighbor_consistency': neighbor_consistency,
@@ -245,6 +254,14 @@ def run_hybrid_court_with_detailed_tracking(features, noisy_labels, config, logg
         # Anchor KNN results
         'anchor_votes': anchor_votes,
         'anchor_consistency': anchor_consistency,
+        # Stage2 metrics (recomputed on phase1 corrected labels)
+        'stage2_aum_scores': stage2_aum_scores,
+        'stage2_knn_neighbor_labels': stage2_knn_neighbor_labels,
+        'stage2_knn_neighbor_consistency': stage2_knn_neighbor_consistency,
+        'stage2_cl_suspected_noise': stage2_cl_suspected_noise,
+        'stage2_cl_pred_labels': stage2_cl_pred_labels,
+        'stage2_cl_pred_probs': stage2_cl_pred_probs,
+        'phase2_actions': phase2_actions,
         # Decision tracking
         'decision_reasons': decision_reasons,
         'tier_info': tier_info
@@ -256,9 +273,9 @@ def run_hybrid_court_with_detailed_tracking(features, noisy_labels, config, logg
     return results
 
 
-def _generate_decision_reason(tier, noisy_label, clean_label, action, is_suspected, is_dense, 
-                               knn_label, knn_cons, cl_prob_0, cl_prob_1, density,
-                               iter_cl_current=None, iter_cl_target=None, 
+def _generate_decision_reason(tier, noisy_label, clean_label, action, is_suspected,
+                               knn_label, knn_cons, cl_prob_0, cl_prob_1, aum,
+                               iter_cl_current=None, iter_cl_target=None,
                                anchor_vote=None, anchor_cons=None):
     """生成详细的决策原因说明"""
     current_label_name = '正常' if noisy_label == 0 else '恶意'
@@ -273,40 +290,30 @@ def _generate_decision_reason(tier, noisy_label, clean_label, action, is_suspect
     knn_vote_name = '正常' if knn_label == 0 else '恶意'
     knn_support = '支持' if knn_label == noisy_label else '反对'
     
-    # Tier 1: Core - 定海神针
-    if 'Tier 1: Core' in tier:
-        reasons = []
-        if orig_cl_current >= 0.70:
-            reasons.append(f"原CL高({orig_cl_current:.3f}≥0.70)")
-        if knn_cons >= 0.70 and knn_label == noisy_label:
-            reasons.append(f"KNN强支持({knn_cons:.3f}≥0.70)")
-        if not reasons:
-            reasons.append(f"MADE+KNN补充(KNN={knn_cons:.3f})")
-        return f"[Phase1-Core] {' 或 '.join(reasons)} → 核心样本(w=1.0)"
-    
-    # Tier 2: Flip - 智能翻转
-    elif 'Tier 2: Flip' in tier:
+    if action == 1:
         cl_diff = orig_cl_target - orig_cl_current
-        if noisy_label == 0:  # 正常→恶意
-            return (f"[Phase2-Flip] CL差值={cl_diff:.3f}≥0.15 + 正常样本 + "
-                   f"原CL={orig_cl_current:.3f}≤0.95 + MADE={density:.1f}≤35 → "
-                   f"翻转{current_label_name}→{new_label_name}(w=1.0)")
-        else:  # 恶意→正常
-            return (f"[Phase2-Flip] CL差值={cl_diff:.3f}≥0.15 + 恶意样本 + "
-                   f"MADE={density:.1f}≥15 + 原CL={orig_cl_current:.3f}≥0.5 → "
-                   f"翻转{current_label_name}→{new_label_name}(w=1.0)")
-    
-    # Tier 3: Keep - 高质量保持
-    elif 'Tier 3' in tier or 'Keep' in tier:
-        if 'High' in tier or '3a' in tier:
-            return (f"[Phase2-Keep-High] 原CL={orig_cl_current:.3f}≥0.55 + KNN支持({knn_cons:.3f}≥0.55) + "
-                   f"MADE正常({density:.1f}) → 保持{current_label_name}(w=0.8-1.0)")
-        else:
-            return (f"[Phase2-Keep-Low] 恶意样本 + MADE异常高({density:.1f}) → "
-                   f"可能误标正常,保持{current_label_name}(w=0.4)")
+        knn_vote_name = '正常' if knn_label == 0 else '恶意'
+        return (
+            f"[Flip] CL差值={cl_diff:.3f} | AUM={aum:.3f} | "
+            f"KNN投票={knn_vote_name}(cons={knn_cons:.3f}) → 翻转{current_label_name}→{new_label_name}"
+        )
+    if action == 2:
+        return (
+            f"[Drop] CL={orig_cl_current:.3f} | AUM={aum:.3f} | "
+            f"KNN(cons={knn_cons:.3f}) → 丢弃{current_label_name}"
+        )
+    if action == 3:
+        return (
+            f"[Reweight] CL={orig_cl_current:.3f} | AUM={aum:.3f} | "
+            f"KNN(cons={knn_cons:.3f}) → 重加权{current_label_name}"
+        )
+    return (
+        f"[Keep] CL={orig_cl_current:.3f} | AUM={aum:.3f} | "
+        f"KNN(cons={knn_cons:.3f}) → 保持{current_label_name}"
+    )
     
     # Tier 4: Reweight - 不确定样本
-    elif 'Tier 4' in tier or 'Reweight' in tier:
+    if 'Tier 4' in tier or 'Reweight' in tier:
         reasons = []
         if orig_cl_current < 0.55:
             reasons.append(f"原CL低({orig_cl_current:.3f}<0.55)")
@@ -321,7 +328,7 @@ def _generate_decision_reason(tier, noisy_label, clean_label, action, is_suspect
         return f"[Phase2-Reweight] {' + '.join(reasons)} → 降权保持{current_label_name}(w=0.5)"
     
     # Tier 5: Rescued - Phase 3拯救
-    elif 'Tier 5' in tier or 'Rescued' in tier:
+    if 'Tier 5' in tier or 'Rescued' in tier:
         if anchor_cons is not None and anchor_vote is not None:
             anchor_vote_name = '正常' if anchor_vote == 0 else '恶意'
             if 'Keep' in tier or '5a' in tier:
@@ -336,7 +343,7 @@ def _generate_decision_reason(tier, noisy_label, clean_label, action, is_suspect
             return f"[Phase3-Rescued] 锚点拯救 → {new_label_name}"
     
     # Dropped - 丢弃
-    elif 'Dropped' in tier:
+    if 'Dropped' in tier:
         drop_reasons = []
         if iter_cl_current is not None:
             if iter_cl_current < 0.48:
@@ -377,65 +384,7 @@ def _log_tier_statistics(results, y_true, logger):
         if y_true is not None and clean_labels[i] == y_true[i]:
             tier_correct[tier] += 1
     
-    logger.info("")
-    logger.info("="*90)
-    logger.info("📊 三阶段标签矫正 - 详细Tier统计")
-    logger.info("="*90)
-    
-    tier_order = [
-        'Tier 1: Core',
-        'Tier 2: Flip',
-        'Tier 3a: Keep-High',
-        'Tier 3b: Keep-Low',
-        'Tier 4a: Reweight-High',
-        'Tier 4b: Reweight-Low',
-        'Tier 5a: Rescued-Keep',
-        'Tier 5b: Rescued-Flip',
-        'Dropped (Low CL)',
-        'Dropped'
-    ]
-    
-    role_map = {
-        'Tier 1: Core': '[定海神针] 绝对纯净的基石数据',
-        'Tier 2: Flip': '[强力纠错] 成功挽回的样本',
-        'Tier 3a: Keep-High': '[难例精华] 优质保持样本',
-        'Tier 3b: Keep-Low': '[风险隔离] 边缘样本低权重',
-        'Tier 4a: Reweight-High': '[泛化主力] 清洗后的长尾数据',
-        'Tier 4b: Reweight-Low': '[噪声监狱] 关押残留噪声',
-        'Tier 5a: Rescued-Keep': '[二次拯救] 锚点KNN拯救Keep',
-        'Tier 5b: Rescued-Flip': '[二次拯救] 锚点KNN拯救Flip',
-        'Dropped (Low CL)': '[已丢弃] CL信心过低',
-        'Dropped': '[已丢弃]'
-    }
-    
-    logger.info(f"{'Tier':<30s} | {'权重':>6s} | {'样本数':>8s} | {'纯度':>8s} | {'含噪数':>8s} | 角色定位")
-    logger.info("-" * 90)
-    
-    total_weighted_correct = 0
-    total_weighted_count = 0
-    
-    for tier in tier_order:
-        if tier in tier_counts:
-            count = tier_counts[tier]
-            correct = tier_correct.get(tier, 0)
-            weight = tier_weights.get(tier, 0)
-            purity = 100 * correct / count if count > 0 else 0
-            noise_count = count - correct
-            role = role_map.get(tier, '')
-            
-            logger.info(f"{tier:<30s} | {weight:>6.2f} | {count:>8d} | {purity:>7.1f}% | {noise_count:>8d} | {role}")
-            
-            if 'Dropped' not in tier:
-                total_weighted_correct += correct * weight
-                total_weighted_count += count * weight
-    
-    logger.info("-" * 90)
-    
-    if total_weighted_count > 0:
-        weighted_purity = 100 * total_weighted_correct / total_weighted_count
-        logger.info(f"📈 加权纯度: {weighted_purity:.2f}%")
-    
-    logger.info("="*90)
+    # 两阶段策略不使用Tier统计，删除无用输出
 
 
 def generate_sample_analysis_document(results, y_true, noise_mask, save_path, logger, noise_pct=None):
@@ -480,6 +429,15 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
     iter_cl_probs = results.get('iter_cl_probs', None)
     anchor_votes = results.get('anchor_votes', None)
     anchor_consistency = results.get('anchor_consistency', None)
+
+    # Phase1 矫正后重算的 Stage2 指标（如果存在）
+    stage2_aum_scores = results.get('stage2_aum_scores', None)
+    stage2_knn_neighbor_labels = results.get('stage2_knn_neighbor_labels', None)
+    stage2_knn_neighbor_consistency = results.get('stage2_knn_neighbor_consistency', None)
+    stage2_cl_suspected_noise = results.get('stage2_cl_suspected_noise', None)
+    stage2_cl_pred_labels = results.get('stage2_cl_pred_labels', None)
+    stage2_cl_pred_probs = results.get('stage2_cl_pred_probs', None)
+    phase2_actions = results.get('phase2_actions', None)
     
     # Prepare data for DataFrame
     data = []
@@ -500,22 +458,65 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
         cl_pred_prob_benign = float(results['cl_pred_probs'][i, 0])
         cl_pred_prob_malicious = float(results['cl_pred_probs'][i, 1])
         
-        # MADE (Density Estimation) results
-        made_is_dense = bool(results['made_is_dense'][i])
-        made_density_score = float(results['made_density_scores'][i])
+        aum_scores = results.get('aum_scores', None)
+        aum_score = float(aum_scores[i]) if aum_scores is not None and hasattr(aum_scores, '__getitem__') and len(aum_scores) > i else 0.0
         
         # KNN (Semantic Voting) results
         knn_neighbor_label = int(results['knn_neighbor_labels'][i])
         knn_neighbor_label_name = "正常" if knn_neighbor_label == 0 else "恶意"
         knn_consistency = float(results['knn_neighbor_consistency'][i])
         
-        # Iterative CL results (if available)
+        corrected_label = int(results['clean_labels'][i])
+
+        # Iterative CL results (if available) - computed on corrected labels
         if iter_cl_probs is not None:
-            iter_cl_current = float(iter_cl_probs[i, noisy_label])
-            iter_cl_target = float(iter_cl_probs[i, 1 - noisy_label])
+            iter_cl_current = float(iter_cl_probs[i, corrected_label])
+            iter_cl_target = float(iter_cl_probs[i, 1 - corrected_label])
         else:
             iter_cl_current = None
             iter_cl_target = None
+
+        # Stage2 metrics (if available)
+        if stage2_aum_scores is not None and hasattr(stage2_aum_scores, '__getitem__') and len(stage2_aum_scores) > i:
+            stage2_aum = float(stage2_aum_scores[i])
+        else:
+            stage2_aum = None
+
+        if stage2_knn_neighbor_labels is not None and hasattr(stage2_knn_neighbor_labels, '__getitem__') and len(stage2_knn_neighbor_labels) > i:
+            stage2_knn_label = int(stage2_knn_neighbor_labels[i])
+            stage2_knn_label_name = "正常" if stage2_knn_label == 0 else "恶意"
+        else:
+            stage2_knn_label = None
+            stage2_knn_label_name = None
+
+        if stage2_knn_neighbor_consistency is not None and hasattr(stage2_knn_neighbor_consistency, '__getitem__') and len(stage2_knn_neighbor_consistency) > i:
+            stage2_knn_cons = float(stage2_knn_neighbor_consistency[i])
+        else:
+            stage2_knn_cons = None
+
+        if stage2_cl_suspected_noise is not None and hasattr(stage2_cl_suspected_noise, '__getitem__') and len(stage2_cl_suspected_noise) > i:
+            stage2_cl_noise_flag = bool(stage2_cl_suspected_noise[i])
+        else:
+            stage2_cl_noise_flag = None
+
+        if stage2_cl_pred_labels is not None and hasattr(stage2_cl_pred_labels, '__getitem__') and len(stage2_cl_pred_labels) > i:
+            stage2_cl_pred_label = int(stage2_cl_pred_labels[i])
+            stage2_cl_pred_label_name = "正常" if stage2_cl_pred_label == 0 else "恶意"
+        else:
+            stage2_cl_pred_label = None
+            stage2_cl_pred_label_name = None
+
+        if stage2_cl_pred_probs is not None and hasattr(stage2_cl_pred_probs, '__getitem__') and len(stage2_cl_pred_probs) > i:
+            stage2_cl_pred_prob_benign = float(stage2_cl_pred_probs[i, 0])
+            stage2_cl_pred_prob_malicious = float(stage2_cl_pred_probs[i, 1])
+        else:
+            stage2_cl_pred_prob_benign = None
+            stage2_cl_pred_prob_malicious = None
+
+        if phase2_actions is not None and hasattr(phase2_actions, '__getitem__') and len(phase2_actions) > i:
+            phase2_action = str(phase2_actions[i])
+        else:
+            phase2_action = ''
         
         # Anchor KNN results (if available)
         if anchor_votes is not None:
@@ -531,7 +532,6 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
         action = int(results['action_mask'][i])
         action_names = ['保持', '翻转', '丢弃', '重加权']
         action_name = action_names[action]
-        corrected_label = int(results['clean_labels'][i])
         corrected_label_name = "正常" if corrected_label == 0 else "恶意"
         confidence = float(results['confidence'][i])
         correction_weight = float(results['correction_weight'][i])
@@ -562,11 +562,7 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
             'CL恶意概率': cl_pred_prob_malicious,
             'CL当前标签置信度': cl_pred_prob_benign if noisy_label == 0 else cl_pred_prob_malicious,
             'CL目标标签置信度': cl_pred_prob_malicious if noisy_label == 0 else cl_pred_prob_benign,
-            
-            # MADE (Density Estimation) 详细结果
-            'MADE高密度': '是' if made_is_dense else '否',
-            'MADE密度分数': made_density_score,
-            'MADE密度等级': 'High' if made_density_score > 60 else ('Medium' if made_density_score > 0 else 'Low'),
+            'AUM分数': aum_score,
             
             # KNN (Semantic Voting) 详细结果
             'KNN邻居标签': knn_neighbor_label_name,
@@ -575,6 +571,32 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
             'KNN是否支持当前标签': '是' if knn_neighbor_label == noisy_label else '否',
             'KNN一致性等级': 'High' if knn_consistency >= 0.7 else ('Medium' if knn_consistency >= 0.5 else 'Low'),
         }
+
+        # Add Stage2 metrics if available
+        if stage2_aum is not None:
+            row['stage2_AUM分数'] = stage2_aum
+        if stage2_knn_label is not None:
+            row['stage2_KNN邻居标签'] = stage2_knn_label_name
+            row['stage2_KNN邻居标签值'] = stage2_knn_label
+        if stage2_knn_cons is not None:
+            row['stage2_KNN一致性'] = stage2_knn_cons
+            # stage2_KNN是否支持当前标签：应该基于Phase1矫正后的标签判断
+            # 这里先用corrected_label，后续在阶段2sheet中会重新计算
+            row['stage2_KNN是否支持当前标签'] = '是' if stage2_knn_label == corrected_label else '否'
+
+        if stage2_cl_noise_flag is not None:
+            # numeric 0/1 for easier pandas operations
+            row['stage2_CL疑似噪声'] = 1 if stage2_cl_noise_flag else 0
+        
+        # Add stage2_CL预测标签 if available
+        if stage2_cl_pred_label is not None:
+            row['stage2_CL预测标签'] = stage2_cl_pred_label_name
+            row['stage2_CL预测标签值'] = stage2_cl_pred_label
+            if stage2_cl_pred_prob_benign is not None:
+                # 计算基于Phase1矫正后标签的CL置信度
+                phase1_corrected_label = corrected_label  # 这里corrected_label就是Phase1矫正后的标签
+                row['stage2_CL当前标签置信度'] = stage2_cl_pred_prob_benign if phase1_corrected_label == 0 else stage2_cl_pred_prob_malicious
+                row['stage2_CL目标标签置信度'] = stage2_cl_pred_prob_malicious if phase1_corrected_label == 0 else stage2_cl_pred_prob_benign
         
         # Add iterative CL columns if available
         if iter_cl_current is not None:
@@ -587,7 +609,7 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
             row['anchor_KNN投票'] = anchor_vote_name
             row['anchor_KNN投票值'] = anchor_vote
             row['anchor_KNN一致性'] = anchor_cons
-            row['anchor_KNN是否支持当前'] = '是' if anchor_vote == noisy_label else '否'
+            row['anchor_KNN是否支持当前'] = '是' if anchor_vote == corrected_label else '否'
         
         # 最终决策详细信息
         row.update({
@@ -595,10 +617,11 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
             '矫正动作值': action,
             '矫正后标签': corrected_label_name,
             '矫正后标签值': corrected_label,
+            'Phase2_Action': phase2_action,
             '系统置信度': confidence,
             '样本权值': correction_weight,
             'Tier分级': tier,
-            'Tier阶段': 'Phase 1' if 'Tier 1' in tier else ('Phase 2' if any(t in tier for t in ['Tier 2', 'Tier 3', 'Tier 4']) else ('Phase 3' if 'Tier 5' in tier else 'Dropped')),
+            'Tier阶段': 'Dropped' if action == 2 else ('Phase 2' if action in (1, 3) else 'Phase 1'),
             '决策理由': decision_reason,
             
             # 矫正结果评估
@@ -619,11 +642,13 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
     df = pd.DataFrame(data)
     
     # Save to CSV (基础版本，所有数据在一个文件)
-    # 确保文件名包含噪声率
+    # 新策略版本化：确保文件名包含噪声率与策略标识，避免覆盖旧结果
     if noise_pct is not None:
         base_name = save_path.replace('.txt', '').replace('.log', '')
         if f'_{noise_pct}pct' not in base_name:
             base_name = f"{base_name}_{noise_pct}pct"
+        if '_cl_aum_knn' not in base_name:
+            base_name = f"{base_name}_cl_aum_knn"
         csv_path = f"{base_name}.csv"
     else:
         csv_path = save_path.replace('.txt', '.csv').replace('.log', '.csv')
@@ -759,12 +784,20 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
                     '样本ID', '矫正是否正确', '错误类型', 'Tier分级', 'Tier阶段',
                     '是否噪声', '真实标签', '真实标签值', '噪声标签', '噪声标签值',
                     '矫正后标签', '矫正后标签值', '矫正动作', '决策理由',
-                    '系统置信度', '样本权值', '是否翻转', '是否丢弃', '标签是否改变'
+                    'Phase2_Action',
+                    '系统置信度', '样本权值',
+                    'CL疑似噪声', 'CL当前标签置信度', 'CL目标标签置信度',
+                    'AUM分数',
+                    'KNN邻居标签', 'KNN一致性', 'KNN是否支持当前标签',
+                    'iter_CL当前标签置信度', 'iter_CL目标标签置信度', 'iter_CL置信度差值',
+                    'stage2_CL疑似噪声',
+                    'stage2_AUM分数',
+                    'stage2_KNN邻居标签', 'stage2_KNN一致性', 'stage2_KNN是否支持当前标签',
+                    '是否翻转', '是否丢弃', '标签是否改变'
                 ]
                 # 只选择存在的列
                 existing_key_columns = [col for col in key_columns if col in df.columns]
-                other_columns = [col for col in df.columns if col not in existing_key_columns]
-                df_reordered = df[existing_key_columns + other_columns]
+                df_reordered = df[existing_key_columns].copy()
                 
                 # Sheet 1: 总览统计
                 tier_summary = []
@@ -800,97 +833,334 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
                     # 已丢弃 - 灰色
                     ws.cell(row=row, column=5).fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
                 
-                # Sheet 2: 所有样本（完整数据）
-                df_reordered.to_excel(writer, sheet_name='所有样本', index=False)
-                ws_all = writer.sheets['所有样本']
+                # ========================================
+                # Sheet: 所有样本统计（阶段1和阶段2）
+                # ========================================
+                all_samples_stats = []
                 
-                # 为所有样本添加条件格式
-                for row in range(2, len(df_reordered) + 2):
-                    correction_status = df_reordered.iloc[row-2]['矫正是否正确']
-                    if correction_status == '正确':
-                        # 整行浅绿色
-                        for col in range(1, len(df_reordered.columns) + 1):
-                            ws_all.cell(row=row, column=col).fill = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")
-                    elif correction_status == '错误':
-                        # 整行浅红色
-                        for col in range(1, len(df_reordered.columns) + 1):
-                            ws_all.cell(row=row, column=col).fill = PatternFill(start_color="FFEBEE", end_color="FFEBEE", fill_type="solid")
+                # 计算Phase1矫正后的标签（用于阶段1统计）
+                phase1_labels = []
+                for i in range(len(df_reordered)):
+                    noisy_label_val = df_reordered.iloc[i]['噪声标签值']
+                    phase2_action = df_reordered.iloc[i].get('Phase2_Action', '')
+                    final_label_val = df_reordered.iloc[i]['矫正后标签值']
+                    
+                    # 从phase2_action反推phase1的标签
+                    if phase2_action == 'UndoFlip':
+                        phase1_label = 1 - noisy_label_val
+                    elif phase2_action == 'LateFlip':
+                        phase1_label = noisy_label_val
+                    else:
+                        if final_label_val != noisy_label_val:
+                            phase1_label = final_label_val
+                        else:
+                            phase1_label = noisy_label_val
+                    phase1_labels.append(phase1_label)
                 
-                # Sheet 3-N: 每个Tier的详细数据（按策略分组）
-                tier_order = [
-                    'Tier 1: Core',
-                    'Tier 2: Flip',
-                    'Tier 3: Keep',
-                    'Tier 4: Reweight',
-                    'Tier 5a: Rescued-Keep',
-                    'Tier 5b: Rescued-Flip',
-                    'Tier 5b: Rescued-Flip (Drop前拯救)',
-                    'Dropped'
+                df_reordered['Phase1矫正后标签值'] = phase1_labels
+                df_reordered['Phase1是否正确'] = (df_reordered['Phase1矫正后标签值'] == df_reordered['真实标签值']).apply(lambda x: '正确' if x else '错误')
+                
+                # 阶段1统计
+                total_samples = len(df_reordered)
+                phase1_correct = len(df_reordered[df_reordered['Phase1是否正确'] == '正确'])
+                phase1_error = len(df_reordered[df_reordered['Phase1是否正确'] == '错误'])
+                phase1_accuracy = (phase1_correct / total_samples * 100) if total_samples > 0 else 0
+                
+                # 阶段1动作统计
+                phase1_flip = len(df_reordered[df_reordered['矫正动作'] == 'Flip'])
+                phase1_keep = len(df_reordered[df_reordered['矫正动作'] == 'Keep'])
+                
+                # 阶段1指标统计
+                phase1_cl_mean = df_reordered['CL当前标签置信度'].mean() if 'CL当前标签置信度' in df_reordered.columns else 0
+                phase1_aum_mean = df_reordered['AUM分数'].mean() if 'AUM分数' in df_reordered.columns else 0
+                phase1_knn_mean = df_reordered['KNN一致性'].mean() if 'KNN一致性' in df_reordered.columns else 0
+                
+                # 阶段2统计（如果有Phase2）
+                if 'Phase2_Action' in df_reordered.columns and df_reordered['Phase2_Action'].notna().any():
+                    phase2_correct = len(df_reordered[df_reordered['矫正是否正确'] == '正确'])
+                    phase2_error = len(df_reordered[df_reordered['矫正是否正确'] == '错误'])
+                    phase2_accuracy = (phase2_correct / total_samples * 100) if total_samples > 0 else 0
+                    
+                    # 阶段2动作统计
+                    phase2_undo = len(df_reordered[df_reordered['Phase2_Action'] == 'UndoFlip'])
+                    phase2_late = len(df_reordered[df_reordered['Phase2_Action'] == 'LateFlip'])
+                    phase2_nochange = len(df_reordered[df_reordered['Phase2_Action'] == 'NoChange'])
+                    
+                    # 阶段2指标统计
+                    phase2_cl_mean = df_reordered['stage2_CL当前标签置信度'].mean() if 'stage2_CL当前标签置信度' in df_reordered.columns else 0
+                    phase2_aum_mean = df_reordered['stage2_AUM分数'].mean() if 'stage2_AUM分数' in df_reordered.columns else 0
+                    phase2_knn_mean = df_reordered['stage2_KNN一致性'].mean() if 'stage2_KNN一致性' in df_reordered.columns else 0
+                else:
+                    phase2_correct = 0
+                    phase2_error = 0
+                    phase2_accuracy = 0
+                    phase2_undo = 0
+                    phase2_late = 0
+                    phase2_nochange = total_samples
+                    phase2_cl_mean = 0
+                    phase2_aum_mean = 0
+                    phase2_knn_mean = 0
+                
+                # 原始标签统计
+                original_correct = len(df_reordered[df_reordered['是否噪声'] == '否'])
+                original_error = len(df_reordered[df_reordered['是否噪声'] == '是'])
+                original_accuracy = (original_correct / total_samples * 100) if total_samples > 0 else 0
+                
+                # 构建统计表
+                all_samples_stats.append({
+                    '统计项': '总样本数',
+                    '数值': total_samples,
+                    '阶段1': '',
+                    '阶段2': ''
+                })
+                all_samples_stats.append({
+                    '统计项': '原始标签准确率',
+                    '数值': f"{original_accuracy:.2f}%",
+                    '阶段1': f"正确: {original_correct}, 错误: {original_error}",
+                    '阶段2': ''
+                })
+                all_samples_stats.append({
+                    '统计项': '阶段1准确率',
+                    '数值': f"{phase1_accuracy:.2f}%",
+                    '阶段1': f"正确: {phase1_correct}, 错误: {phase1_error}",
+                    '阶段2': ''
+                })
+                all_samples_stats.append({
+                    '统计项': '阶段2准确率',
+                    '数值': f"{phase2_accuracy:.2f}%" if phase2_accuracy > 0 else 'N/A',
+                    '阶段1': '',
+                    '阶段2': f"正确: {phase2_correct}, 错误: {phase2_error}" if phase2_accuracy > 0 else 'N/A'
+                })
+                all_samples_stats.append({
+                    '统计项': '阶段1动作',
+                    '数值': '',
+                    '阶段1': f"Flip: {phase1_flip}, Keep: {phase1_keep}",
+                    '阶段2': ''
+                })
+                all_samples_stats.append({
+                    '统计项': '阶段2动作',
+                    '数值': '',
+                    '阶段1': '',
+                    '阶段2': f"UndoFlip: {phase2_undo}, LateFlip: {phase2_late}, NoChange: {phase2_nochange}" if phase2_accuracy > 0 else 'N/A'
+                })
+                all_samples_stats.append({
+                    '统计项': '阶段1平均CL置信度',
+                    '数值': f"{phase1_cl_mean:.4f}",
+                    '阶段1': '',
+                    '阶段2': ''
+                })
+                all_samples_stats.append({
+                    '统计项': '阶段1平均AUM分数',
+                    '数值': f"{phase1_aum_mean:.4f}",
+                    '阶段1': '',
+                    '阶段2': ''
+                })
+                all_samples_stats.append({
+                    '统计项': '阶段1平均KNN一致性',
+                    '数值': f"{phase1_knn_mean:.4f}",
+                    '阶段1': '',
+                    '阶段2': ''
+                })
+                all_samples_stats.append({
+                    '统计项': '阶段2平均CL置信度',
+                    '数值': f"{phase2_cl_mean:.4f}" if phase2_cl_mean > 0 else 'N/A',
+                    '阶段1': '',
+                    '阶段2': ''
+                })
+                all_samples_stats.append({
+                    '统计项': '阶段2平均AUM分数',
+                    '数值': f"{phase2_aum_mean:.4f}" if phase2_aum_mean > 0 else 'N/A',
+                    '阶段1': '',
+                    '阶段2': ''
+                })
+                all_samples_stats.append({
+                    '统计项': '阶段2平均KNN一致性',
+                    '数值': f"{phase2_knn_mean:.4f}" if phase2_knn_mean > 0 else 'N/A',
+                    '阶段1': '',
+                    '阶段2': ''
+                })
+                all_samples_stats.append({
+                    '统计项': '阶段1提升',
+                    '数值': f"{phase1_accuracy - original_accuracy:+.2f}%",
+                    '阶段1': '',
+                    '阶段2': ''
+                })
+                all_samples_stats.append({
+                    '统计项': '阶段2提升',
+                    '数值': f"{phase2_accuracy - phase1_accuracy:+.2f}%" if phase2_accuracy > 0 else 'N/A',
+                    '阶段1': '',
+                    '阶段2': ''
+                })
+                all_samples_stats.append({
+                    '统计项': '总提升',
+                    '数值': f"{phase2_accuracy - original_accuracy:+.2f}%" if phase2_accuracy > 0 else f"{phase1_accuracy - original_accuracy:+.2f}%",
+                    '阶段1': '',
+                    '阶段2': ''
+                })
+                
+                stats_df = pd.DataFrame(all_samples_stats)
+                stats_df.to_excel(writer, sheet_name='📊所有样本统计', index=False)
+                
+                # 为统计表添加格式
+                ws_stats = writer.sheets['📊所有样本统计']
+                # 设置标题行格式
+                for col in range(1, len(stats_df.columns) + 1):
+                    ws_stats.cell(row=1, column=col).font = Font(bold=True)
+                    ws_stats.cell(row=1, column=col).fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+                    ws_stats.cell(row=1, column=col).font = Font(bold=True, color="FFFFFF")
+                
+                logger.info(f"  ✓ 所有样本统计: 已生成统计表")
+                
+                # ========================================
+                # Sheet: 阶段1指标（所有样本）
+                # ========================================
+                
+                # Phase1矫正后的标签已经在统计部分计算过了，这里直接使用
+                if 'Phase1矫正后标签值' not in df_reordered.columns:
+                    # 如果还没有计算，则计算一次
+                    phase1_labels = []
+                    for i in range(len(df_reordered)):
+                        noisy_label_val = df_reordered.iloc[i]['噪声标签值']
+                        phase2_action = df_reordered.iloc[i].get('Phase2_Action', '')
+                        final_label_val = df_reordered.iloc[i]['矫正后标签值']
+                        
+                        # 从phase2_action反推phase1的标签
+                        if phase2_action == 'UndoFlip':
+                            phase1_label = 1 - noisy_label_val
+                        elif phase2_action == 'LateFlip':
+                            phase1_label = noisy_label_val
+                        else:
+                            if final_label_val != noisy_label_val:
+                                phase1_label = final_label_val
+                            else:
+                                phase1_label = noisy_label_val
+                        phase1_labels.append(phase1_label)
+                    df_reordered['Phase1矫正后标签值'] = phase1_labels
+                
+                if 'Phase1矫正后标签' not in df_reordered.columns:
+                    df_reordered['Phase1矫正后标签'] = df_reordered['Phase1矫正后标签值'].apply(lambda x: '正常' if x == 0 else '恶意')
+                
+                # 确保Phase1是否正确列已计算
+                if 'Phase1是否正确' not in df_reordered.columns:
+                    df_reordered['Phase1是否正确'] = (df_reordered['Phase1矫正后标签值'] == df_reordered['真实标签值']).apply(lambda x: '正确' if x else '错误')
+                
+                # Sheet: 阶段1指标
+                phase1_columns = [
+                    '样本ID', '是否噪声', '真实标签', '真实标签值', 
+                    '噪声标签', '噪声标签值',
+                    'Phase1矫正后标签', 'Phase1矫正后标签值',
+                    'CL疑似噪声', 'CL当前标签置信度', 'CL目标标签置信度', 'CL预测标签',
+                    'AUM分数',
+                    'KNN邻居标签', 'KNN一致性', 'KNN是否支持当前标签',
+                    '矫正动作', '系统置信度', '样本权值', '决策理由'
                 ]
+                phase1_existing_cols = [col for col in phase1_columns if col in df_reordered.columns]
+                phase1_df = df_reordered[phase1_existing_cols].copy()
                 
-                for tier in tier_order:
-                    tier_data = df_reordered[df_reordered['Tier分级'] == tier]
+                # 添加Phase1是否正确列（如果还没有）
+                if 'Phase1是否正确' not in phase1_df.columns:
+                    phase1_df['Phase1是否正确'] = (phase1_df['Phase1矫正后标签值'] == phase1_df['真实标签值']).apply(lambda x: '正确' if x else '错误')
+                
+                # 重新排列列顺序，只选择存在的列
+                phase1_column_order = [
+                    '样本ID', '是否噪声', '真实标签', '真实标签值', 
+                    '噪声标签', '噪声标签值',
+                    'Phase1矫正后标签', 'Phase1矫正后标签值', 'Phase1是否正确',
+                    'CL疑似噪声', 'CL当前标签置信度', 'CL目标标签置信度', 'CL预测标签',
+                    'AUM分数',
+                    'KNN邻居标签', 'KNN一致性', 'KNN是否支持当前标签',
+                    '矫正动作', '系统置信度', '样本权值', '决策理由'
+                ]
+                # 只选择存在的列，保持顺序
+                phase1_final_cols = [col for col in phase1_column_order if col in phase1_df.columns]
+                phase1_df = phase1_df[phase1_final_cols]
+                
+                phase1_df.to_excel(writer, sheet_name='📊阶段1指标', index=False)
+                ws_phase1 = writer.sheets['📊阶段1指标']
+                
+                # 为阶段1添加颜色标记
+                for row in range(2, len(phase1_df) + 2):
+                    phase1_correct = phase1_df.iloc[row-2]['Phase1是否正确']
+                    if phase1_correct == '正确':
+                        for col in range(1, len(phase1_df.columns) + 1):
+                            ws_phase1.cell(row=row, column=col).fill = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")
+                    elif phase1_correct == '错误':
+                        for col in range(1, len(phase1_df.columns) + 1):
+                            ws_phase1.cell(row=row, column=col).fill = PatternFill(start_color="FFEBEE", end_color="FFEBEE", fill_type="solid")
+                
+                logger.info(f"  ✓ 阶段1指标: {len(phase1_df)}个样本（所有样本）")
+                
+                # ========================================
+                # Sheet: 阶段2指标（所有样本，基于Phase1矫正后标签重新训练的模型）
+                # ========================================
+                phase2_columns = [
+                    '样本ID', '是否噪声', '真实标签', '真实标签值',
+                    '噪声标签', '噪声标签值',  # 添加噪声标签，方便对比
+                    'Phase1矫正后标签', 'Phase1矫正后标签值',  # 阶段2的输入标签
+                    '矫正后标签', '矫正后标签值',  # 阶段2的输出标签（最终标签）
+                    'Phase2_Action',
+                    'iter_CL当前标签置信度', 'iter_CL目标标签置信度', 'iter_CL置信度差值',
+                    'stage2_CL预测噪声', 'stage2_CL疑似噪声', 'stage2_CL预测标签', 'stage2_CL预测标签值',  # 添加stage2_CL预测噪声（文本格式）和stage2_CL预测标签
+                    'stage2_CL当前标签置信度', 'stage2_CL目标标签置信度',  # 添加stage2_CL置信度
+                    'stage2_AUM分数',
+                    'stage2_KNN邻居标签', 'stage2_KNN邻居标签值', 'stage2_KNN一致性', 'stage2_KNN是否支持当前标签',
+                    'Phase2是否正确',  # 添加Phase2是否正确（类似Phase1是否正确）
+                    '矫正是否正确', '系统置信度', '样本权值', '决策理由'  # 添加决策理由
+                ]
+                phase2_existing_cols = [col for col in phase2_columns if col in df_reordered.columns]
+                phase2_df = df_reordered[phase2_existing_cols].copy()
+                
+                # 添加Phase2是否正确列（基于最终矫正后标签）
+                if '矫正后标签值' in phase2_df.columns and '真实标签值' in phase2_df.columns:
+                    phase2_df['Phase2是否正确'] = (phase2_df['矫正后标签值'] == phase2_df['真实标签值']).apply(lambda x: '正确' if x else '错误')
+                
+                # 修复阶段2的"KNN是否支持当前标签"：应该基于Phase1矫正后的标签判断
+                if 'stage2_KNN邻居标签值' in phase2_df.columns and 'Phase1矫正后标签值' in phase2_df.columns:
+                    phase2_df['stage2_KNN是否支持当前标签'] = (
+                        phase2_df['stage2_KNN邻居标签值'] == phase2_df['Phase1矫正后标签值']
+                    ).apply(lambda x: '是' if x else '否')
+                
+                # 将stage2_CL疑似噪声从数值转换为文本格式（'是'/'否'），与阶段1保持一致
+                if 'stage2_CL疑似噪声' in phase2_df.columns:
+                    phase2_df['stage2_CL预测噪声'] = phase2_df['stage2_CL疑似噪声'].apply(
+                        lambda x: '是' if (x == 1 or x == True) else ('否' if (x == 0 or x == False) else 'N/A')
+                    )
+                
+                # 重新排列列顺序，只选择存在的列
+                phase2_column_order = [
+                    '样本ID', '是否噪声', '真实标签', '真实标签值',
+                    '噪声标签', '噪声标签值',
+                    'Phase1矫正后标签', 'Phase1矫正后标签值',
+                    '矫正后标签', '矫正后标签值',
+                    'Phase2_Action', 'Phase2是否正确',
+                    'iter_CL当前标签置信度', 'iter_CL目标标签置信度', 'iter_CL置信度差值',
+                    'stage2_CL预测噪声', 'stage2_CL疑似噪声', 'stage2_CL预测标签', 'stage2_CL预测标签值',
+                    'stage2_CL当前标签置信度', 'stage2_CL目标标签置信度',
+                    'stage2_AUM分数',
+                    'stage2_KNN邻居标签', 'stage2_KNN邻居标签值', 'stage2_KNN一致性', 'stage2_KNN是否支持当前标签',
+                    '矫正是否正确', '系统置信度', '样本权值', '决策理由'
+                ]
+                phase2_final_cols = [col for col in phase2_column_order if col in phase2_df.columns]
+                phase2_df = phase2_df[phase2_final_cols]
+                
+                # 显示所有样本（阶段2指标基于重新训练的模型）
+                if len(phase2_df) > 0:
+                    phase2_df.to_excel(writer, sheet_name='📊阶段2指标', index=False)
+                    ws_phase2 = writer.sheets['📊阶段2指标']
                     
-                    if len(tier_data) == 0:
-                        # 尝试模糊匹配
-                        tier_base = tier.split('(')[0].strip()
-                        tier_data = df_reordered[df_reordered['Tier分级'].str.contains(tier_base, na=False, regex=False)]
+                    # 为阶段2添加颜色标记（基于Phase2是否正确）
+                    for row in range(2, len(phase2_df) + 2):
+                        phase2_correct = phase2_df.iloc[row-2].get('Phase2是否正确', '')
+                        if phase2_correct == '正确':
+                            for col in range(1, len(phase2_df.columns) + 1):
+                                ws_phase2.cell(row=row, column=col).fill = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")
+                        elif phase2_correct == '错误':
+                            for col in range(1, len(phase2_df.columns) + 1):
+                                ws_phase2.cell(row=row, column=col).fill = PatternFill(start_color="FFEBEE", end_color="FFEBEE", fill_type="solid")
                     
-                    if len(tier_data) > 0:
-                        # 分离正确和错误处理的样本
-                        correct_samples = tier_data[tier_data['矫正是否正确'] == '正确']
-                        error_samples = tier_data[tier_data['矫正是否正确'] == '错误']
-                        dropped_samples = tier_data[tier_data['矫正是否正确'] == '不适用(已丢弃)']
-                        
-                        # 创建sheet名称（Excel限制31字符）
-                        sheet_name = tier.replace(':', '').replace('(', '').replace(')', '').replace(' ', '_')[:28]
-                        
-                        # 合并数据：正确的在前，错误的在后
-                        combined_data = pd.concat([correct_samples, error_samples, dropped_samples])
-                        combined_data.to_excel(writer, sheet_name=sheet_name, index=False)
-                        
-                        # 添加颜色标记
-                        ws = writer.sheets[sheet_name]
-                        current_row = 2
-                        
-                        # 正确样本 - 绿色背景
-                        for _ in range(len(correct_samples)):
-                            for col in range(1, len(combined_data.columns) + 1):
-                                ws.cell(row=current_row, column=col).fill = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")
-                            current_row += 1
-                        
-                        # 错误样本 - 红色背景
-                        for _ in range(len(error_samples)):
-                            for col in range(1, len(combined_data.columns) + 1):
-                                ws.cell(row=current_row, column=col).fill = PatternFill(start_color="FFEBEE", end_color="FFEBEE", fill_type="solid")
-                            current_row += 1
-                        
-                        # 丢弃样本 - 灰色背景
-                        for _ in range(len(dropped_samples)):
-                            for col in range(1, len(combined_data.columns) + 1):
-                                ws.cell(row=current_row, column=col).fill = PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid")
-                            current_row += 1
-                        
-                        logger.info(f"  ✓ {sheet_name}: {len(correct_samples)}正确 / {len(error_samples)}错误 / {len(dropped_samples)}丢弃")
-                
-                # 额外的分析sheet
-                # Sheet: 所有错误样本汇总
-                error_samples = df_reordered[df_reordered['矫正是否正确'] == '错误']
-                if len(error_samples) > 0:
-                    error_samples.to_excel(writer, sheet_name='❌所有错误样本', index=False)
-                    logger.info(f"  ✓ 错误样本汇总: {len(error_samples)}个")
-                
-                # Sheet: 误杀分析（被错误处理的干净样本）
-                false_positive = df_reordered[(df_reordered['是否噪声'] == '否') & (df_reordered['矫正是否正确'] == '错误')]
-                if len(false_positive) > 0:
-                    false_positive.to_excel(writer, sheet_name='⚠️误杀干净样本', index=False)
-                    logger.info(f"  ✓ 误杀样本: {len(false_positive)}个")
-                
-                # Sheet: 漏网之鱼（未被矫正的噪声）
-                false_negative = df_reordered[(df_reordered['是否噪声'] == '是') & (df_reordered['矫正是否正确'] == '错误')]
-                if len(false_negative) > 0:
-                    false_negative.to_excel(writer, sheet_name='🐟漏网噪声', index=False)
-                    logger.info(f"  ✓ 漏网噪声: {len(false_negative)}个")
+                    logger.info(f"  ✓ 阶段2指标: {len(phase2_df)}个样本（所有样本，基于重新训练的模型）")
+                else:
+                    logger.info(f"  ✓ 阶段2指标: 0个样本（无数据）")
             
             logger.info(f"✓ Excel文件已保存（多sheet，带颜色标记）: {excel_path}")
             logger.info(f"  包含 {len(pd.ExcelFile(excel_path).sheet_names)} 个工作表")
@@ -987,76 +1257,52 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
         else:  # 不适用(已丢弃)
             tier_groups[tier]['dropped'].append(row)
     
-    # 定义Tier顺序和角色说明（包含详细路径）
+    # 定义Tier顺序和角色说明（CL+AUM+KNN 新策略）
     tier_order = [
-        'Tier 1: Core',
-        'Tier 2: Flip',
-        'Tier 3: Keep',
-        'Tier 4: Reweight',
-        'Tier 5a: Rescued-Keep',
-        'Tier 5b: Rescued-Flip',
-        'Tier 5b: Rescued-Flip (Drop前拯救)',
+        'Keep',
+        'Flip',
+        'Reweight',
+        'Drop',
         'Dropped'
     ]
     
     role_map = {
-        'Tier 1: Core': 'Phase 1 - 定海神针：绝对纯净的基石数据',
-        'Tier 2: Flip': 'Phase 2 - 智能翻转：基于CL差值(≥0.15)和MADE密度的零误杀翻转',
-        'Tier 3: Keep': 'Phase 2 - 保持样本：高质量保持',
-        'Tier 4: Reweight': 'Phase 2 - 重加权样本：不确定样本降权',
-        'Tier 5a: Rescued-Keep': 'Phase 3 - 锚点拯救：拯救的保持样本',
-        'Tier 5b: Rescued-Flip': 'Phase 3 - 锚点拯救：拯救的翻转样本',
-        'Tier 5b: Rescued-Flip (Drop前拯救)': 'Phase 3 - 锚点拯救：Drop前拯救的翻转样本',
-        'Dropped': '已丢弃：质量过低'
+        'Keep': 'Keep：CL与AUM均支持，保持原标签（高权重）',
+        'Flip': 'Flip：疑似噪声样本，KNN 强支持翻转（高权重）',
+        'Reweight': 'Reweight：不确定样本，保持但降权',
+        'Drop': 'Drop：疑似噪声样本且不满足翻转条件（丢弃）',
+        'Dropped': 'Dropped：已丢弃样本'
     }
     
     # 策略详细说明
     strategy_details = {
-        'Tier 1: Core': {
-            'phase': 'Phase 1: 核心严选',
-            'condition': 'CL置信度≥阈值 或 KNN一致性≥阈值',
+        'Keep': {
+            'phase': 'Phase 1: Keep',
+            'condition': 'CL≥阈值 且 AUM≥阈值',
             'action': '保持原标签',
             'weight': '1.0'
         },
-        'Tier 2: Flip': {
-            'phase': 'Phase 2: 智能翻转',
-            'condition': 'CL差值≥0.15 + 正常样本(CL≤0.95且密度≤35翻转) / 恶意样本(密度≥15且CL≥0.5翻转)',
+        'Flip': {
+            'phase': 'Phase 2: Flip',
+            'condition': '候选噪声( CL<阈值 或 AUM<阈值 ) 且 KNN一致性>阈值 且 KNN投票指向目标类',
             'action': '翻转标签',
-            'weight': '1.0'
+            'weight': '0.9'
         },
-        'Tier 3: Keep': {
-            'phase': 'Phase 2: 分级挽救 - Keep策略',
-            'condition': 'KNN支持 + 原CL≥0.55 + KNN≥0.55 + MADE正常',
-            'action': '保持原标签',
-            'weight': '0.8-1.0'
-        },
-        'Tier 4: Reweight': {
-            'phase': 'Phase 2: 分级挽救 - Reweight策略',
-            'condition': '未达到Core/Flip/Keep标准',
+        'Reweight': {
+            'phase': 'Phase 2: Reweight',
+            'condition': '候选噪声但不满足翻转条件，保持但降权',
             'action': '保持原标签但降权',
             'weight': '0.5'
         },
-        'Tier 5a: Rescued-Keep': {
-            'phase': 'Phase 3: 锚点拯救',
-            'condition': 'iter_T≥0.6 + anchor强支持当前(≥0.6)',
-            'action': '保持原标签',
-            'weight': '0.85'
-        },
-        'Tier 5b: Rescued-Flip': {
-            'phase': 'Phase 3: 锚点拯救',
-            'condition': 'iter_T≥0.6 + anchor强反对当前(≥0.6)',
-            'action': '翻转标签',
-            'weight': '0.75'
-        },
-        'Tier 5b: Rescued-Flip (Drop前拯救)': {
-            'phase': 'Phase 3: 锚点拯救（Drop前）',
-            'condition': 'iter_T≥0.6 + anchor支持目标≥0.6 + orig_KNN支持目标≥0.55',
-            'action': '翻转标签（避免Drop）',
-            'weight': '1.0'
+        'Drop': {
+            'phase': 'Phase 3: Drop',
+            'condition': '候选噪声且不满足翻转条件（仅当启用Drop）',
+            'action': '丢弃样本',
+            'weight': '0.0'
         },
         'Dropped': {
-            'phase': 'Phase 3: 最终清理',
-            'condition': 'iter_CL<0.48 或 (iter_CL<0.55 + anchor<0.55)',
+            'phase': 'Phase 3: Drop',
+            'condition': '已丢弃样本',
             'action': '丢弃样本',
             'weight': '0.0'
         }
@@ -1316,15 +1562,16 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
             f.write(f"📊 漏网的噪声样本详情 (共{len(missed_noise)}个):\n")
             f.write("-"*120 + "\n")
             f.write(f"  {'样本ID':>8s} | {'真实':>4s} | {'噪声':>4s} | {'动作':>4s} | "
-                   f"{'CL置信':>7s} | {'KNN一致':>7s} | {'MADE密度':>9s} | 原因\n")
+                   f"{'CL置信':>7s} | {'AUM':>7s} | {'KNN一致':>7s} | 原因\n")
             f.write("-"*120 + "\n")
             
             for row in missed_noise[:20]:  # 显示前20个
                 cl_conf = row['CL正常概率'] if row['噪声标签']=='正常' else row['CL恶意概率']
                 reason = "未被CL检测" if row['CL疑似噪声'] == '否' else "KNN支持错误标签"
+                aum_val = row.get('AUM分数', 'N/A')
                 f.write(f"  {row['样本ID']:>8d} | {str(row['真实标签']):>4} | {str(row['噪声标签']):>4} | "
-                       f"{str(row['矫正动作']):>4} | {str(cl_conf):>7} | "
-                       f"{str(row['KNN一致性']):>7} | {str(row['MADE密度分数']):>9} | {reason}\n")
+                       f"{str(row['矫正动作']):>4} | {str(cl_conf):>7} | {str(aum_val)[:7]:>7} | "
+                       f"{str(row['KNN一致性']):>7} | {reason}\n")
             
             if len(missed_noise) > 20:
                 f.write(f"  ... 还有 {len(missed_noise) - 20} 个漏网样本（详见CSV文件）\n")
@@ -1643,12 +1890,12 @@ def main(args):
     logger.handlers = []  # 清除handlers，使用root的
     logger.propagate = True  # 传播到root logger
     
-    logger.info("="*70)
-    logger.info(f"MEDAL-Lite 标签矫正分析 - 噪声率 {noise_pct}%")
-    logger.info("="*70)
-    logger.info(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"设备: {config.DEVICE}")
-    logger.info(f"噪声率: {noise_pct}%")
+    # 简洁的标题
+    logger.info("")
+    logger.info("╔" + "═"*68 + "╗")
+    logger.info("║" + f"  MEDAL-Lite 标签矫正分析 - 噪声率 {noise_pct}%".center(68) + "║")
+    logger.info("╚" + "═"*68 + "╝")
+    logger.info(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  设备: {config.DEVICE}")
     logger.info("")
     
     # Override config with arguments
@@ -1658,23 +1905,17 @@ def main(args):
     # ========================
     # 1. Load Dataset
     # ========================
-    logger.info("="*70)
-    logger.info("Step 1: 加载数据集")
-    logger.info("="*70)
-    logger.info(f"正常训练数据:    {config.BENIGN_TRAIN}")
-    logger.info(f"恶意训练数据:    {config.MALICIOUS_TRAIN}")
-    logger.info(f"序列长度:        {config.SEQUENCE_LENGTH}")
-    logger.info("")
+    logger.info("┌─ Step 1: 加载数据集")
+    logger.info(f"│  数据路径: {config.BENIGN_TRAIN} | {config.MALICIOUS_TRAIN}")
+    logger.info(f"│  序列长度: {config.SEQUENCE_LENGTH}")
     
     # 优先使用预处理好的数据
     if check_preprocessed_exists('train'):
-        logger.info("✓ 发现预处理文件，直接加载...")
+        logger.info("│  ✓ 使用预处理文件")
         X_train, y_train_clean, train_files = load_preprocessed('train')
-        logger.info(f"  从预处理文件加载: {X_train.shape[0]} 个样本")
     else:
         # 从PCAP文件加载
-        logger.info("开始加载训练数据集（从PCAP文件）...")
-        logger.info("💡 提示: 运行 'python scripts/utils/preprocess.py --train_only' 可预处理训练集，加速后续分析")
+        logger.info("│  ⚠ 从PCAP文件加载（建议先预处理以加速）")
         X_train, y_train_clean, train_files = load_dataset(
             benign_dir=config.BENIGN_TRAIN,
             malicious_dir=config.MALICIOUS_TRAIN,
@@ -1682,40 +1923,29 @@ def main(args):
         )
     
     if X_train is None:
-        logger.error("❌ 数据集加载失败!")
+        logger.error("│  ❌ 数据集加载失败!")
         return
     
-    logger.info("✓ 数据集加载完成")
-    logger.info(f"  数据形状:     {X_train.shape}")
-    logger.info(f"  正常样本:     {(y_train_clean==0).sum()}")
-    logger.info(f"  恶意样本:     {(y_train_clean==1).sum()}")
+    logger.info(f"└─ ✓ 完成: {X_train.shape[0]} 个样本 | 正常={(y_train_clean==0).sum()} | 恶意={(y_train_clean==1).sum()}")
     logger.info("")
     
     # ========================
     # 2. Inject Label Noise
     # ========================
-    logger.info("="*70)
-    logger.info("Step 2: 注入标签噪声")
-    logger.info("="*70)
-    logger.info(f"噪声率: {config.LABEL_NOISE_RATE*100:.0f}%")
+    logger.info("┌─ Step 2: 注入标签噪声")
+    logger.info(f"│  噪声率: {config.LABEL_NOISE_RATE*100:.0f}%")
     
     # 固定随机种子，确保相同噪声率的结果可复现
     set_seed(config.SEED)
     y_train_noisy, noise_mask = inject_label_noise(y_train_clean, config.LABEL_NOISE_RATE)
     
-    logger.info(f"✓ 噪声注入完成: {noise_mask.sum()} 个标签被翻转")
-    logger.info(f"  原始: 正常={(y_train_clean==0).sum()}, 恶意={(y_train_clean==1).sum()}")
-    logger.info(f"  噪声后: 正常={(y_train_noisy==0).sum()}, 恶意={(y_train_noisy==1).sum()}")
+    logger.info(f"└─ ✓ 完成: {noise_mask.sum()} 个标签被翻转 | 原始纯度: {100*(y_train_clean==y_train_noisy).mean():.1f}%")
     logger.info("")
     
     # ========================
     # 3. Extract Features
     # ========================
-    logger.info("="*70)
-    logger.info("Step 3: 提取特征")
-    logger.info("="*70)
-    
-    backbone = build_backbone(config)
+    logger.info("┌─ Step 3: 提取特征")
     
     # 确定backbone路径：优先使用命令行参数，否则使用默认路径
     if args.backbone_path:
@@ -1725,39 +1955,37 @@ def main(args):
     
     # Try to load pre-trained backbone
     if os.path.exists(backbone_path) and not args.retrain_backbone:
-        logger.info(f"加载预训练backbone: {backbone_path}")
-        state = torch.load(backbone_path, map_location=config.DEVICE)
-        try:
-            backbone.load_state_dict(state)
-        except RuntimeError as e:
-            logger.warning(f"⚠ 骨干网络检查点与当前结构不完全匹配，将使用 strict=False 加载: {e}")
-            missing, unexpected = backbone.load_state_dict(state, strict=False)
-            if missing:
-                logger.warning(f"  missing_keys: {missing}")
-            if unexpected:
-                logger.warning(f"  unexpected_keys: {unexpected}")
-        logger.info("✓ Backbone加载完成")
+        logger.info(f"│  加载预训练backbone: {os.path.basename(backbone_path)}")
+        # 使用安全的模型加载函数（自动处理兼容性）
+        from MoudleCode.utils.model_loader import load_backbone_safely
+        backbone = load_backbone_safely(
+            backbone_path=backbone_path,
+            config=config,
+            device=config.DEVICE,
+            logger=logger
+        )
+        logger.info("│  ✓ Backbone加载完成")
     else:
+        # 构建新模型
+        backbone = build_backbone(config)
         if args.retrain_backbone:
-            logger.warning("⚠ 指定了--retrain_backbone，将使用随机初始化的backbone")
+            logger.info("│  ⚠ 使用随机初始化的backbone")
         else:
-            logger.warning(f"⚠ 未找到预训练backbone: {backbone_path}")
-            logger.warning("  将使用随机初始化的backbone")
+            logger.info(f"│  ⚠ 未找到预训练backbone，使用随机初始化")
+        logger.info("│  ✓ Backbone初始化完成")
     
     features = extract_features_with_backbone(backbone, X_train, config, logger)
     
     # Save features
     features_path = os.path.join(analysis_dir, "extracted_features.npy")
     np.save(features_path, features)
-    logger.info(f"✓ 特征已保存: {features_path}")
+    logger.info(f"└─ ✓ 完成: 特征维度 {features.shape} | 已保存")
     logger.info("")
     
     # ========================
     # 4. Run Hybrid Court Label Correction
     # ========================
-    logger.info("="*70)
-    logger.info("Step 4: 运行 Hybrid Court 标签矫正")
-    logger.info("="*70)
+    logger.info("┌─ Step 4: 运行 Hybrid Court 标签矫正")
     
     results = run_hybrid_court_with_detailed_tracking(features, y_train_noisy, config, logger, y_true=y_train_clean)
     
@@ -1775,69 +2003,71 @@ def main(args):
              cl_suspected_noise=results['cl_suspected_noise'],
              cl_pred_labels=results['cl_pred_labels'],
              cl_pred_probs=results['cl_pred_probs'],
-             made_is_dense=results['made_is_dense'],
-             made_density_scores=results['made_density_scores'],
+             aum_scores=results['aum_scores'],
              knn_neighbor_labels=results['knn_neighbor_labels'],
              knn_neighbor_consistency=results['knn_neighbor_consistency'],
              tier_info=np.array(results.get('tier_info', []), dtype=object))
-    logger.info(f"✓ 矫正结果已保存: {results_path}")
+    
+    # 计算关键指标
+    action_mask = results['action_mask']
+    keep_mask = action_mask != 2
+    correction_accuracy = (results['clean_labels'][keep_mask] == y_train_clean[keep_mask]).mean()
+    original_purity = (y_train_clean == y_train_noisy).mean()
+    final_purity = (results['clean_labels'][keep_mask] == y_train_clean[keep_mask]).mean()
+    improvement = final_purity - original_purity
+    
+    logger.info(f"└─ ✓ 完成: 原始纯度 {original_purity*100:.1f}% → 最终纯度 {final_purity*100:.1f}% (提升 +{improvement*100:.1f}%)")
     logger.info("")
     
     # ========================
     # 5. Generate Analysis Document
     # ========================
-    logger.info("="*70)
-    logger.info("Step 5: 生成样本分析文档")
-    logger.info("="*70)
-    
-    doc_path = os.path.join(analysis_dir, "documents", f"sample_analysis_{noise_pct}pct.log")
+    logger.info("┌─ Step 5: 生成样本分析文档")
+    doc_path = os.path.join(analysis_dir, "documents", f"sample_analysis_{noise_pct}pct_cl_aum_knn.log")
     df_analysis = generate_sample_analysis_document(
         results, y_train_clean, noise_mask, doc_path, logger, noise_pct=noise_pct
     )
+    logger.info(f"└─ ✓ 完成: CSV/Excel/LOG 已生成")
     logger.info("")
     
     # ========================
     # 6. Generate Feature Distribution Plots
     # ========================
-    logger.info("="*70)
-    logger.info("Step 6: 生成特征分布图")
-    logger.info("="*70)
-    
+    logger.info("┌─ Step 6: 生成特征分布图")
     plot_dir = os.path.join(analysis_dir, "figures")
     plot_feature_distributions(results, y_train_clean, noise_mask, plot_dir, logger)
+    logger.info(f"└─ ✓ 完成: 5 张图表已生成")
     logger.info("")
     
     # ========================
     # Summary
     # ========================
-    logger.info("="*70)
-    logger.info(f"🎉 噪声率 {noise_pct}% 标签矫正分析完成!")
-    logger.info("="*70)
+    logger.info("╔" + "═"*68 + "╗")
+    logger.info("║" + f"  ✓ 噪声率 {noise_pct}% 分析完成".center(68) + "║")
+    logger.info("╚" + "═"*68 + "╝")
     logger.info("")
-    logger.info("📁 输出文件:")
-    logger.info(f"  分析目录:       {analysis_dir}")
-    logger.info(f"  矫正结果:       {results_path}")
-    logger.info(f"  样本分析CSV:    {doc_path.replace('.log', '.csv')}")
-    logger.info(f"  样本分析LOG:    {doc_path}")
-    logger.info(f"  特征分布图:     {plot_dir}")
-    logger.info(f"  日志文件:       {os.path.join(log_dir, log_filename)}")
-    logger.info("")
-    logger.info("📊 统计摘要:")
+    
+    # 关键统计摘要（紧凑格式）
     n_samples = len(y_train_clean)
     action_mask = results['action_mask']
-    logger.info(f"  总样本数:           {n_samples}")
-    logger.info(f"  噪声注入:           {noise_mask.sum()} ({100*noise_mask.sum()/n_samples:.1f}%)")
-    logger.info(f"  Keep (core):        {(action_mask==0).sum()} ({100*(action_mask==0).sum()/n_samples:.1f}%)")
-    logger.info(f"  Flip (corrected):   {(action_mask==1).sum()} ({100*(action_mask==1).sum()/n_samples:.1f}%)")
-    logger.info(f"  Drop (noise):       {(action_mask==2).sum()} ({100*(action_mask==2).sum()/n_samples:.1f}%)")
-    logger.info(f"  Reweight (tail):    {(action_mask==3).sum()} ({100*(action_mask==3).sum()/n_samples:.1f}%)")
-    
-    # Correction accuracy
     keep_mask = action_mask != 2
     correction_accuracy = (results['clean_labels'][keep_mask] == y_train_clean[keep_mask]).mean()
-    logger.info(f"  矫正准确率:         {correction_accuracy*100:.2f}%")
+    original_purity = (y_train_clean == y_train_noisy).mean()
+    final_purity = correction_accuracy
+    improvement = final_purity - original_purity
+    
+    logger.info("📊 关键指标:")
+    logger.info(f"   原始纯度: {original_purity*100:.1f}%  →  最终纯度: {final_purity*100:.1f}%  (提升: +{improvement*100:.1f}%)")
+    logger.info(f"   动作分布: 未翻转 {(action_mask==0).sum()} ({100*(action_mask==0).sum()/n_samples:.1f}%) | "
+                f"翻转 {(action_mask==1).sum()} ({100*(action_mask==1).sum()/n_samples:.1f}%) | "
+                f"丢弃 {(action_mask==2).sum()} ({100*(action_mask==2).sum()/n_samples:.1f}%)")
     logger.info("")
-    logger.info("="*70)
+    
+    # 输出可解析的摘要行（供Shell脚本提取）
+    logger.info(f"SUMMARY: noise_rate={noise_pct}% | original_purity={original_purity*100:.2f}% | "
+                f"final_purity={final_purity*100:.2f}% | improvement={improvement*100:.2f}% | "
+                f"flip_count={(action_mask==1).sum()} | keep_count={(action_mask==0).sum()}")
+    logger.info("")
     
     # 清理root logger的handlers
     for handler in root_logger.handlers[:]:

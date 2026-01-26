@@ -217,9 +217,11 @@ run_analysis() {
         # 运行Python脚本并捕获输出
         local temp_output=$(mktemp)
         if python "$PYTHON_SCRIPT" $cmd_args 2>&1 | tee "$temp_output"; then
-            # 提取摘要信息
-            local summary_line=$(grep "^SUMMARY:" "$temp_output" | tail -1)
+            # 提取摘要信息（从日志中提取SUMMARY行）
+            local summary_line=$(grep "SUMMARY:" "$temp_output" | grep "noise_rate=" | tail -1)
             if [ -n "$summary_line" ]; then
+                # 移除日志前缀（如 "16:15:41 - INFO - " 或类似格式）
+                summary_line=$(echo "$summary_line" | sed -E 's/^[0-9: -]*(INFO|WARNING|ERROR)[ -]*//' | sed 's/^[[:space:]]*//')
                 results_summary["${noise_pct}"]="$summary_line"
             fi
             
@@ -244,33 +246,120 @@ run_analysis() {
     echo "  结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
     echo ""
     
-    # 显示每个噪声率的关键指标
+    # 显示每个噪声率的关键指标汇总表
+    echo "┌──────────────────────────────────────────────────────────────────────────────────────┐"
+    echo "│                          各噪声率标签矫正结果汇总表                                  │"
+    echo "├──────────────────────────────────────────────────────────────────────────────────────┤"
+    printf "│  %-8s │ %-12s │ %-12s │ %-12s │ %-10s │ %-8s │\n" "噪声率" "原始纯度" "最终纯度" "提升幅度" "翻转数" "保持数"
+    echo "├──────────────────────────────────────────────────────────────────────────────────────┤"
+    
+    for noise_rate in "${rates_array[@]}"; do
+        local noise_pct=$(printf "%.0f" $(awk "BEGIN {printf \"%.0f\", $noise_rate * 100}"))
+        local summary="${results_summary["${noise_pct}"]}"
+        if [ -n "$summary" ]; then
+            # 解析摘要行（使用更健壮的方法，兼容不同的grep版本）
+            local orig_purity=$(echo "$summary" | sed -n 's/.*original_purity=\([0-9.]*\).*/\1/p')
+            local final_purity=$(echo "$summary" | sed -n 's/.*final_purity=\([0-9.]*\).*/\1/p')
+            local improvement=$(echo "$summary" | sed -n 's/.*improvement=\([0-9.+-]*\).*/\1/p')
+            local flip_count=$(echo "$summary" | sed -n 's/.*flip_count=\([0-9]*\).*/\1/p')
+            local keep_count=$(echo "$summary" | sed -n 's/.*keep_count=\([0-9]*\).*/\1/p')
+            
+            # 格式化显示
+            if [ -n "$orig_purity" ] && [ -n "$final_purity" ] && [ -n "$improvement" ]; then
+                printf "│  %-8s │ %-12s │ %-12s │ %-12s │ %-10s │ %-8s │\n" \
+                    "${noise_pct}%" "${orig_purity}%" "${final_purity}%" "+${improvement}%" "${flip_count}" "${keep_count}"
+            else
+                printf "│  %-8s │ %-12s │ %-12s │ %-12s │ %-10s │ %-8s │\n" \
+                    "${noise_pct}%" "解析失败" "解析失败" "解析失败" "-" "-"
+            fi
+        else
+            printf "│  %-8s │ %-12s │ %-12s │ %-12s │ %-10s │ %-8s │\n" \
+                "${noise_pct}%" "-" "-" "-" "-" "-"
+        fi
+    done
+    echo "└──────────────────────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    
+    # 显示阶段3统计信息表
+    echo "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
+    echo "│                                    阶段3权重分配统计表                                                          │"
+    echo "├──────────────────────────────────────────────────────────────────────────────────────────────────────────────┤"
+    printf "│  %-8s │ %-20s │ %-20s │ %-20s │\n" "噪声率" "核心干净(权重1.0)" "噪声样本(权重0.5)" "剩余数据(丢弃)"
+    echo "├──────────────────────────────────────────────────────────────────────────────────────────────────────────────┤"
+    
+    for noise_rate in "${rates_array[@]}"; do
+        local noise_pct=$(printf "%.0f" $(awk "BEGIN {printf \"%.0f\", $noise_rate * 100}"))
+        local summary="${results_summary["${noise_pct}"]}"
+        if [ -n "$summary" ]; then
+            # 解析阶段3信息
+            local phase3_core_clean=$(echo "$summary" | sed -n 's/.*phase3_core_clean=\([0-9]*\).*/\1/p')
+            local phase3_core_clean_acc=$(echo "$summary" | sed -n 's/.*phase3_core_clean_acc=\([0-9.]*\)%.*/\1/p')
+            local phase3_noise=$(echo "$summary" | sed -n 's/.*phase3_noise=\([0-9]*\).*/\1/p')
+            local phase3_noise_acc=$(echo "$summary" | sed -n 's/.*phase3_noise_acc=\([0-9.]*\)%.*/\1/p')
+            local phase3_remaining=$(echo "$summary" | sed -n 's/.*phase3_remaining=\([0-9]*\).*/\1/p')
+            local phase3_remaining_acc=$(echo "$summary" | sed -n 's/.*phase3_remaining_acc=\([0-9.]*\)%.*/\1/p')
+            
+            # 格式化显示（数量 + 准确率百分比）
+            if [ -n "$phase3_core_clean" ] && [ -n "$phase3_noise" ] && [ -n "$phase3_remaining" ]; then
+                local core_clean_str="${phase3_core_clean}"
+                local noise_str="${phase3_noise}"
+                local remaining_str="${phase3_remaining}"
+                
+                if [ -n "$phase3_core_clean_acc" ]; then
+                    core_clean_str="${phase3_core_clean} (${phase3_core_clean_acc}%)"
+                fi
+                if [ -n "$phase3_noise_acc" ]; then
+                    noise_str="${phase3_noise} (${phase3_noise_acc}%)"
+                fi
+                if [ -n "$phase3_remaining_acc" ]; then
+                    remaining_str="${phase3_remaining} (${phase3_remaining_acc}%)"
+                fi
+                
+                printf "│  %-8s │ %-20s │ %-20s │ %-20s │\n" \
+                    "${noise_pct}%" "${core_clean_str}" "${noise_str}" "${remaining_str}"
+            else
+                printf "│  %-8s │ %-20s │ %-20s │ %-20s │\n" \
+                    "${noise_pct}%" "-" "-" "-"
+            fi
+        else
+            printf "│  %-8s │ %-20s │ %-20s │ %-20s │\n" \
+                "${noise_pct}%" "-" "-" "-"
+        fi
+    done
+    echo "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    
+    # 计算总体统计
     if [ ${#results_summary[@]} -gt 0 ]; then
-        echo "┌────────────────────────────────────────────────────────────────┐"
-        echo "│  结果摘要                                                       │"
-        echo "├────────────────────────────────────────────────────────────────┤"
-        printf "│  %-8s │ %-12s │ %-12s │ %-10s │ %-8s │\n" "噪声率" "原始纯度" "最终纯度" "提升" "翻转数"
-        echo "├────────────────────────────────────────────────────────────────┤"
-        
+        local improvements_list=""
+        local count=0
         for noise_rate in "${rates_array[@]}"; do
             local noise_pct=$(printf "%.0f" $(awk "BEGIN {printf \"%.0f\", $noise_rate * 100}"))
             local summary="${results_summary["${noise_pct}"]}"
             if [ -n "$summary" ]; then
-                # 解析摘要行
-                local orig_purity=$(echo "$summary" | grep -oP 'original_purity=\K[0-9.]+')
-                local final_purity=$(echo "$summary" | grep -oP 'final_purity=\K[0-9.]+')
-                local improvement=$(echo "$summary" | grep -oP 'improvement=\K[0-9.+-]+')
-                local flip_count=$(echo "$summary" | grep -oP 'flip_count=\K[0-9]+')
-                
-                printf "│  %-8s │ %-12s │ %-12s │ %-10s │ %-8s │\n" \
-                    "${noise_pct}%" "${orig_purity}%" "${final_purity}%" "+${improvement}%" "${flip_count}"
-            else
-                printf "│  %-8s │ %-12s │ %-12s │ %-10s │ %-8s │\n" \
-                    "${noise_pct}%" "-" "-" "-" "-"
+                local improvement=$(echo "$summary" | sed -n 's/.*improvement=\([0-9.+-]*\).*/\1/p')
+                if [ -n "$improvement" ]; then
+                    if [ -z "$improvements_list" ]; then
+                        improvements_list="$improvement"
+                    else
+                        improvements_list="$improvements_list $improvement"
+                    fi
+                    count=$((count + 1))
+                fi
             fi
         done
-        echo "└────────────────────────────────────────────────────────────────┘"
-        echo ""
+        
+        if [ $count -gt 0 ] && [ -n "$improvements_list" ]; then
+            local avg_improvement=$(awk "BEGIN {
+                sum=0; 
+                n=0; 
+                split(\"$improvements_list\", arr, \" \"); 
+                for(i in arr) {sum+=arr[i]; n++} 
+                printf \"%.2f\", sum/n
+            }")
+            echo "  📊 平均提升幅度: ${avg_improvement}%"
+            echo ""
+        fi
     fi
     
     echo "  输出目录: ${OUTPUT_DIR}/label_correction/analysis/"

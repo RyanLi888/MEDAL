@@ -184,7 +184,7 @@ class Config:
     # 1.2 早停机制
     PRETRAIN_EARLY_STOPPING = True          # 启用早停
     PRETRAIN_ES_WARMUP_EPOCHS = 50          # 预热轮数（前50轮不触发早停）
-    PRETRAIN_ES_PATIENCE = 30               # 耐心值（30轮不改善则停止）
+    PRETRAIN_ES_PATIENCE = 50               # 耐心值（30轮不改善则停止）
     PRETRAIN_ES_MIN_DELTA = 0.005           # 改善阈值（0.5%）
     
     # 1.3 SimMTM 参数（掩码重建任务）

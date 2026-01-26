@@ -124,6 +124,66 @@ class ConfidentLearning:
         
         logger.info(f"CL: Identified {suspected_noise_mask.sum()} / {n_samples} suspected noise")
         return suspected_noise_mask, pred_labels, pred_probs
+    
+    def fit(self, features, labels):
+        """
+        使用核心样本训练CL模型（不进行交叉验证）
+        Args:
+            features: (N, D) - 核心样本的特征向量
+            labels: (N,) - 核心样本的标签
+        """
+        n_classes = len(np.unique(labels))
+        
+        # 如果使用投影头，先投影特征
+        if self.use_projection_head and self.projection_head is not None:
+            features_tensor = torch.FloatTensor(features).to(self.device)
+            with torch.no_grad():
+                features_projected = self.projection_head(features_tensor).cpu().numpy()
+            features_for_cl = features_projected
+        else:
+            features_for_cl = features
+        
+        # 训练一个完整的模型（不使用交叉验证）
+        self.clf = LogisticRegression(max_iter=1000, random_state=42)
+        self.clf.fit(features_for_cl, labels)
+        self.n_classes = n_classes
+    
+    def predict(self, features, labels):
+        """
+        使用训练好的CL模型对所有样本进行预测
+        Args:
+            features: (N, D) - 所有样本的特征向量
+            labels: (N,) - 所有样本的标签（用于计算suspected_noise）
+        Returns:
+            suspected_noise_mask: (N,) - 疑似噪声的掩码
+            pred_labels: (N,) - 预测的标签
+            pred_probs: (N, n_classes) - 预测的概率
+        """
+        n_samples = len(labels)
+        
+        # 如果使用投影头，先投影特征
+        if self.use_projection_head and self.projection_head is not None:
+            features_tensor = torch.FloatTensor(features).to(self.device)
+            with torch.no_grad():
+                features_projected = self.projection_head(features_tensor).cpu().numpy()
+            features_for_cl = features_projected
+        else:
+            features_for_cl = features
+        
+        # 使用训练好的模型进行预测
+        pred_probs = self.clf.predict_proba(features_for_cl)
+        
+        # 计算suspected_noise
+        label_issues = find_label_issues(labels=labels, pred_probs=pred_probs)
+        suspected_noise_mask = label_issues.astype(bool)
+        pred_labels = np.argmax(pred_probs, axis=1)
+        
+        self.last_suspected_noise = suspected_noise_mask
+        self.last_pred_labels = pred_labels
+        self.last_pred_probs = pred_probs
+        
+        logger.info(f"CL: Identified {suspected_noise_mask.sum()} / {n_samples} suspected noise")
+        return suspected_noise_mask, pred_labels, pred_probs
 
 
 class KNNSemanticVoting:
@@ -304,23 +364,6 @@ class HybridCourt:
             phase1_malicious_cl_low=phase1_malicious_cl_low,
             phase1_benign_aum_threshold=phase1_benign_aum_threshold,
             phase1_benign_knn_threshold=phase1_benign_knn_threshold,
-            phase2_enable=phase2_enable,
-            phase2_independent=phase2_independent,
-            phase2_malicious_aum_threshold=phase2_malicious_aum_threshold,
-            phase2_malicious_cl_threshold=phase2_malicious_cl_threshold,
-            phase2_malicious_knn_cons_threshold=phase2_malicious_knn_cons_threshold,
-            phase2_benign_aum_threshold=phase2_benign_aum_threshold,
-            phase2_benign_knn_threshold=phase2_benign_knn_threshold,
-            phase2_late_flip_aum_threshold=phase2_late_flip_aum_threshold,
-            phase2_late_flip_knn_threshold=phase2_late_flip_knn_threshold,
-            phase2_late_flip_cl_threshold=phase2_late_flip_cl_threshold,
-            phase2_undo_flip_aum_threshold=phase2_undo_flip_aum_threshold,
-            phase2_undo_flip_cl_threshold=phase2_undo_flip_cl_threshold,
-            phase2_undo_flip_use_and=phase2_undo_flip_use_and,
-            phase2_undo_flip_p1_aum_hesitant=phase2_undo_flip_p1_aum_hesitant,
-            phase2_undo_flip_p1_aum_strong=phase2_undo_flip_p1_aum_strong,
-            phase2_undo_flip_p2_aum_weak=phase2_undo_flip_p2_aum_weak,
-            recompute_stage2_metrics=recompute_stage2_metrics,
         )
 
         return clean_labels, action_mask, confidence, correction_weight, aum_scores, neighbor_consistency, pred_probs

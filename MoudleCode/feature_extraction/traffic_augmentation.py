@@ -198,11 +198,12 @@ class TrafficAugmentation:
     
     def _temporal_jitter(self, x):
         """
-        策略B: 时序抖动
+        策略B: 时序抖动（特征特定噪声增强）
         
         物理意义：
         - 模拟真实网络环境中的网络抖动（Jitter）
         - 模型必须学会忽略微小的传输延迟，抓住核心的"节奏感"
+        - 对IAT应用泊松噪声，对包长应用高斯噪声
         
         Args:
             x: (B, L, D)
@@ -210,7 +211,48 @@ class TrafficAugmentation:
         Returns:
             x_jitter: (B, L, D)
         """
-        return x
+        x_jitter = x.clone()
+        B, L, D = x.shape
+        
+        # 获取有效掩码
+        valid = None
+        if self.valid_mask_index is not None:
+            try:
+                vm_idx = int(self.valid_mask_index)
+                if 0 <= vm_idx < D:
+                    valid = x[:, :, vm_idx] > 0.5
+            except Exception:
+                valid = None
+        
+        # 应用特征特定噪声（如果启用）
+        use_feature_specific = getattr(self.config, 'USE_FEATURE_SPECIFIC_NOISE', False)
+        
+        if use_feature_specific:
+            # 1. 包长：0.1倍标准差的高斯噪声
+            if self.length_index is not None and 0 <= self.length_index < D:
+                length_noise_std = float(getattr(self.config, 'PRETRAIN_LENGTH_NOISE_STD', 0.1))
+                length_std = x[:, :, self.length_index].std(dim=-1, keepdim=True).clamp_min(1e-6)
+                n = torch.randn_like(x_jitter[:, :, self.length_index]) * length_noise_std * length_std
+                if valid is not None:
+                    x_jitter[:, :, self.length_index] = torch.where(valid, x_jitter[:, :, self.length_index] + n, x_jitter[:, :, self.length_index])
+                else:
+                    x_jitter[:, :, self.length_index] = x_jitter[:, :, self.length_index] + n
+            
+            # 2. IAT (LogIAT)：0.05倍的泊松噪声
+            log_iat_index = getattr(self.config, 'LOG_IAT_INDEX', getattr(self.config, 'IAT_INDEX', None))
+            if log_iat_index is not None and 0 <= log_iat_index < D:
+                iat_poisson_lambda = float(getattr(self.config, 'PRETRAIN_IAT_POISSON_LAMBDA', 0.05))
+                iat_values = x[:, :, log_iat_index]
+                poisson_scale = iat_poisson_lambda * torch.abs(iat_values).clamp_min(1e-6)
+                poisson_mean = poisson_scale
+                poisson_std = torch.sqrt(poisson_scale.clamp_min(1e-6))
+                poisson_noise = torch.randn_like(iat_values) * poisson_std + (poisson_mean - poisson_scale)
+                if valid is not None:
+                    x_jitter[:, :, log_iat_index] = torch.where(valid, x_jitter[:, :, log_iat_index] + poisson_noise, x_jitter[:, :, log_iat_index])
+                else:
+                    x_jitter[:, :, log_iat_index] = x_jitter[:, :, log_iat_index] + poisson_noise
+        
+        return x_jitter
     
     def _channel_mask(self, x):
         """

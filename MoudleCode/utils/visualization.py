@@ -25,6 +25,12 @@ sns.set_style("whitegrid")
 
 
 def _configure_matplotlib_chinese_fonts():
+    """Configure matplotlib to use Chinese fonts and suppress warnings if unavailable."""
+    import warnings
+    # Suppress font warnings globally if no Chinese font is available
+    warnings.filterwarnings('ignore', category=UserWarning, 
+                          message='.*Glyph.*missing from font.*')
+    
     try:
         preferred = [
             'Noto Sans CJK SC',
@@ -55,6 +61,7 @@ def _configure_matplotlib_chinese_fonts():
 
         mpl.rcParams['axes.unicode_minus'] = False
     except Exception:
+        # If font configuration fails, warnings are already suppressed above
         pass
 
 

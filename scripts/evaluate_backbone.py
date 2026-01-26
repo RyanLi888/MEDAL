@@ -26,9 +26,14 @@ from tqdm import tqdm
 from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone, build_backbone
 from MoudleCode.utils.config import Config
 from MoudleCode.utils.visualization import _configure_matplotlib_chinese_fonts
+import warnings
 
-# 配置matplotlib中文字体
+# 配置matplotlib中文字体（会自动抑制字体警告）
 _configure_matplotlib_chinese_fonts()
+
+# 额外确保抑制matplotlib字体警告
+warnings.filterwarnings('ignore', category=UserWarning, 
+                       message='.*Glyph.*missing from font.*')
 
 
 class BackboneEvaluator:

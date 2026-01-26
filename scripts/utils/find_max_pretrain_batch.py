@@ -7,7 +7,7 @@ batch size that does not OOM.
 
 Usage examples:
   MEDAL_GPU_ID=0 python scripts/utils/find_max_pretrain_batch.py
-  MEDAL_GPU_ID=0 MEDAL_CONTRASTIVE_METHOD=nnclr python scripts/utils/find_max_pretrain_batch.py --max 256
+  MEDAL_GPU_ID=0 MEDAL_CONTRASTIVE_METHOD=infonce python scripts/utils/find_max_pretrain_batch.py --max 256
 """
 
 from __future__ import annotations
@@ -130,7 +130,7 @@ def main() -> int:
 
     print(f"\nMax batch size (in this test): {best}")
     print("Tip: If you want more negatives without increasing peak activation memory, keep batch fixed and set:")
-    print("  MEDAL_PRETRAIN_GRADIENT_ACCUMULATION_STEPS=2/4 and/or MEDAL_CONTRASTIVE_METHOD=nnclr with MEDAL_NNCLR_QUEUE_SIZE=8192+")
+    print("  MEDAL_PRETRAIN_GRADIENT_ACCUMULATION_STEPS=2/4 (if needed)")
     return 0
 
 

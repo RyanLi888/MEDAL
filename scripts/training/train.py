@@ -198,13 +198,8 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
     best_state = None
     no_improve = 0
     
-    # 梯度累积配置
-    use_gradient_accumulation = (
-        use_instance_contrastive and
-        str(contrastive_method).lower() == 'nnclr' and
-        int(getattr(config, 'PRETRAIN_GRADIENT_ACCUMULATION_STEPS', 1)) > 1
-    )
-    gradient_accumulation_steps = int(getattr(config, 'PRETRAIN_GRADIENT_ACCUMULATION_STEPS', 2)) if use_gradient_accumulation else 1
+    # 梯度累积配置（InfoNCE不需要特殊处理）
+    gradient_accumulation_steps = 1
     
     log_subsection_header(logger, "开始训练")
 
@@ -1487,16 +1482,8 @@ def main(args):
     # Stage 1: 预训练骨干网络
     if start_stage <= 1:
         logger.info(f"🔧 RNG指纹(Stage1调用前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
-        use_instance_contrastive = getattr(config, 'USE_INSTANCE_CONTRASTIVE', False)
-        contrastive_method = getattr(config, 'CONTRASTIVE_METHOD', 'infonce')
-        
-        method_lower = str(contrastive_method).lower()
-        if use_instance_contrastive and method_lower == 'nnclr':
-            batch_size = getattr(config, 'PRETRAIN_BATCH_SIZE_NNCLR', 64)
-        elif use_instance_contrastive and method_lower == 'simsiam':
-            batch_size = getattr(config, 'PRETRAIN_BATCH_SIZE_SIMSIAM', config.PRETRAIN_BATCH_SIZE)
-        else:
-            batch_size = config.PRETRAIN_BATCH_SIZE
+        # 只支持InfoNCE，使用标准批次大小
+        batch_size = config.PRETRAIN_BATCH_SIZE
         
         dataset = TensorDataset(torch.FloatTensor(X_train))
         train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)

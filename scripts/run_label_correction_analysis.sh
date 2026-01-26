@@ -199,7 +199,7 @@ run_analysis() {
     declare -A results_summary
     
     for noise_rate in "${rates_array[@]}"; do
-        local noise_pct=$(printf "%.0f" $(echo "$noise_rate * 100" | bc))
+        local noise_pct=$(printf "%.0f" $(awk "BEGIN {printf \"%.0f\", $noise_rate * 100}"))
         
         echo "┌────────────────────────────────────────────────────────────────┐"
         echo "│  噪声率: ${noise_pct}%  ($((completed+1))/${total})"
@@ -253,7 +253,7 @@ run_analysis() {
         echo "├────────────────────────────────────────────────────────────────┤"
         
         for noise_rate in "${rates_array[@]}"; do
-            local noise_pct=$(printf "%.0f" $(echo "$noise_rate * 100" | bc))
+            local noise_pct=$(printf "%.0f" $(awk "BEGIN {printf \"%.0f\", $noise_rate * 100}"))
             local summary="${results_summary["${noise_pct}"]}"
             if [ -n "$summary" ]; then
                 # 解析摘要行
@@ -302,7 +302,7 @@ case $RUN_MODE in
         echo "各噪声率的详细日志将保存到:"
         read -ra RATES_ARRAY <<< "$NOISE_RATES"
         for noise_rate in "${RATES_ARRAY[@]}"; do
-            noise_pct=$(printf "%.0f" $(echo "$noise_rate * 100" | bc))
+            noise_pct=$(printf "%.0f" $(awk "BEGIN {printf \"%.0f\", $noise_rate * 100}"))
             echo "  ${noise_pct}%: ${LOG_DIR}/noise_${noise_pct}pct_analysis_*.log"
         done
         echo ""

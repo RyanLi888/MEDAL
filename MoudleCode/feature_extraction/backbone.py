@@ -643,24 +643,63 @@ class SimMTMLoss(nn.Module):
         if valid_mask_idx is not None and 0 <= int(valid_mask_idx) < D:
             x_masked[:, :pkt_len, int(valid_mask_idx)] = x_original[:, :pkt_len, int(valid_mask_idx)]
 
-        if self.noise_std > 0:
-            # Noise is only applied to continuous channels (e.g., Length/BurstSize) on
-            # unmasked valid positions. Do NOT perturb Direction/ValidMask.
-            noise_apply = (~mask_pos_pkt.squeeze(-1))
-            if valid is not None:
-                noise_apply = noise_apply & valid
+        # 应用噪声增强（特征特定或全局）
+        use_feature_specific = getattr(cfg, 'USE_FEATURE_SPECIFIC_NOISE', False)
+        noise_apply = (~mask_pos_pkt.squeeze(-1))
+        if valid is not None:
+            noise_apply = noise_apply & valid
 
+        if use_feature_specific:
+            # 特征特定噪声增强（优化版）
+            # 1. 包长：0.1倍标准差的高斯噪声
             length_idx = getattr(cfg, 'LENGTH_INDEX', None)
             if length_idx is not None and 0 <= int(length_idx) < D:
                 li = int(length_idx)
-                n = torch.randn_like(x_masked[:, :pkt_len, li]) * self.noise_std
+                length_noise_std = float(getattr(cfg, 'PRETRAIN_LENGTH_NOISE_STD', 0.1))
+                # 计算包长的标准差（基于当前批次）
+                length_std = x_original[:, :pkt_len, li].std(dim=-1, keepdim=True).clamp_min(1e-6)
+                n = torch.randn_like(x_masked[:, :pkt_len, li]) * length_noise_std * length_std
                 x_masked[:, :pkt_len, li] = torch.where(noise_apply, x_masked[:, :pkt_len, li] + n, x_masked[:, :pkt_len, li])
-
+            
+            # 2. IAT (LogIAT)：0.05倍的泊松噪声
+            # 泊松噪声模拟网络延迟的随机性，适用于IAT特征
+            iat_idx = getattr(cfg, 'LOG_IAT_INDEX', getattr(cfg, 'IAT_INDEX', None))
+            if iat_idx is not None and 0 <= int(iat_idx) < D:
+                ii = int(iat_idx)
+                iat_poisson_lambda = float(getattr(cfg, 'PRETRAIN_IAT_POISSON_LAMBDA', 0.05))
+                iat_values = x_original[:, :pkt_len, ii]
+                # 泊松噪声：使用泊松分布生成噪声，强度为原始值的0.05倍
+                # 对于log空间的IAT，我们使用乘性泊松噪声的近似
+                # 泊松噪声强度 = lambda * |原始值|
+                poisson_scale = iat_poisson_lambda * torch.abs(iat_values).clamp_min(1e-6)
+                # 生成泊松随机数（lambda = poisson_scale），然后转换为加性噪声
+                # 使用正态近似：泊松(lambda) ≈ N(lambda, sqrt(lambda))
+                poisson_mean = poisson_scale
+                poisson_std = torch.sqrt(poisson_scale.clamp_min(1e-6))
+                poisson_noise = torch.randn_like(iat_values) * poisson_std + (poisson_mean - poisson_scale)
+                # 应用噪声（保持log空间的连续性）
+                x_masked[:, :pkt_len, ii] = torch.where(noise_apply, x_masked[:, :pkt_len, ii] + poisson_noise, x_masked[:, :pkt_len, ii])
+            
+            # 3. BurstSize：使用全局噪声（保持兼容性）
             burst_idx = getattr(cfg, 'BURST_SIZE_INDEX', None)
             if burst_idx is not None and 0 <= int(burst_idx) < D:
                 bi = int(burst_idx)
                 n = torch.randn_like(x_masked[:, :pkt_len, bi]) * self.noise_std
                 x_masked[:, :pkt_len, bi] = torch.where(noise_apply, x_masked[:, :pkt_len, bi] + n, x_masked[:, :pkt_len, bi])
+        else:
+            # 全局噪声（向后兼容）
+            if self.noise_std > 0:
+                length_idx = getattr(cfg, 'LENGTH_INDEX', None)
+                if length_idx is not None and 0 <= int(length_idx) < D:
+                    li = int(length_idx)
+                    n = torch.randn_like(x_masked[:, :pkt_len, li]) * self.noise_std
+                    x_masked[:, :pkt_len, li] = torch.where(noise_apply, x_masked[:, :pkt_len, li] + n, x_masked[:, :pkt_len, li])
+
+                burst_idx = getattr(cfg, 'BURST_SIZE_INDEX', None)
+                if burst_idx is not None and 0 <= int(burst_idx) < D:
+                    bi = int(burst_idx)
+                    n = torch.randn_like(x_masked[:, :pkt_len, bi]) * self.noise_std
+                    x_masked[:, :pkt_len, bi] = torch.where(noise_apply, x_masked[:, :pkt_len, bi] + n, x_masked[:, :pkt_len, bi])
 
         # ===== encode & decode =====
         z_seq = backbone(x_masked, return_sequence=True)  # (B, L, d)

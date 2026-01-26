@@ -175,8 +175,6 @@ class Config:
     # 1.1 基础训练参数
     PRETRAIN_EPOCHS = 500                   # 最大训练轮数
     PRETRAIN_BATCH_SIZE = 64                # 批次大小（适配10.75GB显存）
-    PRETRAIN_BATCH_SIZE_NNCLR = 32          # NNCLR专用批次（显存占用高）
-    PRETRAIN_BATCH_SIZE_SIMSIAM = 64        # SimSiam批次
     PRETRAIN_GRADIENT_ACCUMULATION_STEPS = 2  # 梯度累积（有效批次=64*2=128）
     PRETRAIN_LR = 1e-3                      # 学习率
     PRETRAIN_WEIGHT_DECAY = 1e-4            # 权重衰减
@@ -191,7 +189,13 @@ class Config:
     
     # 1.3 SimMTM 参数（掩码重建任务）
     SIMMTM_MASK_RATE = 0.5                  # 掩码率（50%）
-    PRETRAIN_NOISE_STD = 0.05               # 高斯噪声标准差
+    PRETRAIN_NOISE_STD = 0.05               # 高斯噪声标准差（全局，用于BurstSize等）
+    
+    # 特征特定噪声增强（优化版）
+    PRETRAIN_LENGTH_NOISE_STD = 0.1         # 包长高斯噪声标准差（0.1倍标准差）
+    PRETRAIN_IAT_POISSON_LAMBDA = 0.05      # IAT泊松噪声强度（0.05倍原始值）
+    USE_FEATURE_SPECIFIC_NOISE = True        # 启用特征特定噪声（True时使用上述参数，False时使用全局PRETRAIN_NOISE_STD）
+    
     PRETRAIN_RECON_WEIGHT = 1.0             # 重建损失权重
     PRETRAIN_LENGTH_WEIGHT = 1.0            # Length特征权重
     PRETRAIN_BURST_WEIGHT = 1.0             # BurstSize特征权重
@@ -203,14 +207,10 @@ class Config:
 
     # 1.4 InfoNCE 对比学习参数（最优配置）
     USE_INSTANCE_CONTRASTIVE = True         # 启用实例对比学习
-    CONTRASTIVE_METHOD = "infonce"          # 对比学习方法: infonce/nnclr/simsiam
+    CONTRASTIVE_METHOD = "infonce"          # 对比学习方法: infonce (仅支持InfoNCE)
     INFONCE_TEMPERATURE = 0.25              # 温度系数τ（从0.2提升至0.25，改善小数据集对比学习）
-    INFONCE_LAMBDA = 0.5                    # 对比学习损失权重
+    INFONCE_LAMBDA = 0.6                    # 对比学习损失权重
     
-    # NNCLR 参数（备选）
-    NNCLR_QUEUE_SIZE = 4096                 # 队列大小
-    NNCLR_MIN_SIMILARITY = 0.2              # 最小相似度
-    NNCLR_WARMUP_EPOCHS = 10                # 预热轮数
     
     # SupCon 参数（Legacy，保留兼容性）
     SUPCON_TEMPERATURE = 0.1
@@ -606,7 +606,13 @@ class Config:
             logger.info("")
             logger.info("🔧 SimMTM 配置:")
             logger.info(f"  - 掩码率: {self.SIMMTM_MASK_RATE}")
-            logger.info(f"  - 噪声标准差: {self.PRETRAIN_NOISE_STD}")
+            if getattr(self, 'USE_FEATURE_SPECIFIC_NOISE', False):
+                logger.info(f"  - 特征特定噪声增强: 已启用")
+                logger.info(f"    - 包长高斯噪声标准差: {getattr(self, 'PRETRAIN_LENGTH_NOISE_STD', 0.1)}")
+                logger.info(f"    - IAT泊松噪声强度: {getattr(self, 'PRETRAIN_IAT_POISSON_LAMBDA', 0.05)}")
+                logger.info(f"    - BurstSize全局噪声: {self.PRETRAIN_NOISE_STD}")
+            else:
+                logger.info(f"  - 全局噪声标准差: {self.PRETRAIN_NOISE_STD}")
             logger.info(f"  - 特征权重: Length={self.PRETRAIN_LENGTH_WEIGHT}, Burst={self.PRETRAIN_BURST_WEIGHT}, Dir={self.PRETRAIN_DIRECTION_WEIGHT}, LogIAT={self.PRETRAIN_LOG_IAT_WEIGHT}, VM={self.PRETRAIN_VALIDMASK_WEIGHT}")
             logger.info("")
             if self.USE_INSTANCE_CONTRASTIVE:

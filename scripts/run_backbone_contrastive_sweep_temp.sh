@@ -3,8 +3,8 @@
 # MEDAL-Lite 骨干网络对比学习扫描脚本 (重构版)
 # ============================================================
 # 说明：
-# - 依次训练 SimMTM + {InfoNCE, SimSiam, NNCLR}
-# - 自动评估每个骨干网络的特征质量
+# - 训练 SimMTM + InfoNCE
+# - 自动评估骨干网络的特征质量
 # - 使用 config.py 中的配置
 # ============================================================
 
@@ -105,62 +105,56 @@ fi
 # 训练和评估
 # ============================================================
 
-declare -a METHODS=("infonce" "simsiam" "nnclr")
-TOTAL=${#METHODS[@]}
-
 echo -e "${BLUE}=========================================="
-echo "骨干网络对比学习扫描"
+echo "骨干网络对比学习训练"
 echo "=========================================="
-echo "方法: ${METHODS[*]}"
+echo "方法: InfoNCE"
 echo "输出: $MODEL_DIR"
 echo "评估: $EVAL_ROOT"
 echo -e "==========================================${NC}"
 echo ""
 
-for i in "${!METHODS[@]}"; do
-    method="${METHODS[$i]}"
-    idx=$((i+1))
-    
-    echo -e "${BLUE}=========================================="
-    echo "[$idx/$TOTAL] 训练: SimMTM + ${method^^}"
-    echo -e "==========================================${NC}"
-    
-    LOG_FILE="$LOG_DIR/backbone_${method}_${TS}.log"
-    
-    # 训练
-    MEDAL_CONTRASTIVE_METHOD="$method" \
-        python scripts/training/train.py --start_stage 1 --end_stage 1 2>&1 | tee "$LOG_FILE"
-    
-    if [ ${PIPESTATUS[0]} -ne 0 ]; then
-        echo -e "${RED}❌ 训练失败${NC}"
-        continue
-    fi
-    
-    # 保存模型
-    PRETRAINED="$MODEL_DIR/backbone_pretrained.pth"
-    SAVED_BACKBONE="$MODEL_DIR/backbone_SimMTM_${method^^}_${TS}.pth"
-    
-    if [ -f "$PRETRAINED" ]; then
-        cp -f "$PRETRAINED" "$SAVED_BACKBONE"
-        echo -e "${GREEN}✓ 保存: $SAVED_BACKBONE${NC}"
-    fi
-    
-    # 评估
-    echo -e "${BLUE}=========================================="
-    echo "[$idx/$TOTAL] 评估: ${method^^}"
-    echo -e "==========================================${NC}"
-    
-    EVAL_DIR="$EVAL_ROOT/${method}_${TS}"
-    mkdir -p "$EVAL_DIR"
-    
-    python scripts/evaluate_backbone.py \
-        --backbone "$SAVED_BACKBONE" \
-        --data_root "$DATA_ROOT" \
-        --output "$EVAL_DIR" 2>&1 | tee "$EVAL_DIR/evaluation.log"
-    
-    echo -e "${GREEN}✓ 评估完成: $EVAL_DIR${NC}"
-    echo ""
-done
+method="infonce"
+
+echo -e "${BLUE}=========================================="
+echo "训练: SimMTM + InfoNCE"
+echo -e "==========================================${NC}"
+
+LOG_FILE="$LOG_DIR/backbone_${method}_${TS}.log"
+
+# 训练
+MEDAL_CONTRASTIVE_METHOD="$method" \
+    python scripts/training/train.py --start_stage 1 --end_stage 1 2>&1 | tee "$LOG_FILE"
+
+if [ ${PIPESTATUS[0]} -ne 0 ]; then
+    echo -e "${RED}❌ 训练失败${NC}"
+    exit 1
+fi
+
+# 保存模型
+PRETRAINED="$MODEL_DIR/backbone_pretrained.pth"
+SAVED_BACKBONE="$MODEL_DIR/backbone_SimMTM_${method^^}_${TS}.pth"
+
+if [ -f "$PRETRAINED" ]; then
+    cp -f "$PRETRAINED" "$SAVED_BACKBONE"
+    echo -e "${GREEN}✓ 保存: $SAVED_BACKBONE${NC}"
+fi
+
+# 评估
+echo -e "${BLUE}=========================================="
+echo "评估: InfoNCE"
+echo -e "==========================================${NC}"
+
+EVAL_DIR="$EVAL_ROOT/${method}_${TS}"
+mkdir -p "$EVAL_DIR"
+
+python scripts/evaluate_backbone.py \
+    --backbone "$SAVED_BACKBONE" \
+    --data_root "$DATA_ROOT" \
+    --output "$EVAL_DIR" 2>&1 | tee "$EVAL_DIR/evaluation.log"
+
+echo -e "${GREEN}✓ 评估完成: $EVAL_DIR${NC}"
+echo ""
 
 echo -e "${GREEN}=========================================="
 echo "全部完成"

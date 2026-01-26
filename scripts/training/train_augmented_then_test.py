@@ -214,10 +214,8 @@ def main():
             use_instance_contrastive = getattr(config, 'USE_INSTANCE_CONTRASTIVE', False)
             contrastive_method = getattr(config, 'CONTRASTIVE_METHOD', 'infonce')
             method_lower = str(contrastive_method).lower()
-            if use_instance_contrastive and method_lower == 'nnclr':
-                batch_size = getattr(config, 'PRETRAIN_BATCH_SIZE_NNCLR', 64)
-            elif use_instance_contrastive and method_lower == 'simsiam':
-                batch_size = getattr(config, 'PRETRAIN_BATCH_SIZE_SIMSIAM', config.PRETRAIN_BATCH_SIZE)
+            # 只支持InfoNCE，使用标准批次大小
+            batch_size = config.PRETRAIN_BATCH_SIZE
             else:
                 batch_size = config.PRETRAIN_BATCH_SIZE
 

@@ -277,7 +277,7 @@ case $choice in
     5)
         echo ""
         echo "骨干网络评估 - 对比不同对比学习方法"
-        echo "将依次训练并评估: InfoNCE, NNCLR, SimSiam"
+        echo "将训练并评估: InfoNCE"
         echo ""
         CMD="python scripts/evaluate_backbone.py"
         MODE="骨干网络评估 (对比不同方法)"

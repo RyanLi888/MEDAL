@@ -395,8 +395,9 @@ def correct_labels_cl_aum(
             logger.info("="*70)
             logger.info("高噪声超限方案: 焦土政策 + 强力修补")
             logger.info("="*70)
-            logger.info("  Phase1参数（统一规则）:")
-            logger.info("    CL差值>=0.05 且 AUM<=0.20 且 KNN一致性>=0.55 → 翻转")
+            logger.info("  Phase1参数（统一规则 - 优化版）:")
+            logger.info("    AUM < -0.09 或 CL差值 > 0.40 → 翻转")
+            logger.info("    (使用'或'逻辑，降低KNN权重，基于数据分析优化)")
             logger.info("  Phase2参数（强力修补）:")
             logger.info("    救援(UndoFlip): Stage2_AUM < -0.8")
             logger.info("    补刀(LateFlip): Stage2_AUM < -0.4")
@@ -405,8 +406,9 @@ def correct_labels_cl_aum(
             logger.info("="*70)
             logger.info("高噪声方案: 保守优化策略")
             logger.info("="*70)
-            logger.info("  Phase1参数（统一规则）:")
-            logger.info("    CL差值>=0.05 且 AUM<=0.20 且 KNN一致性>=0.55 → 翻转")
+            logger.info("  Phase1参数（统一规则 - 优化版）:")
+            logger.info("    AUM < -0.09 或 CL差值 > 0.40 → 翻转")
+            logger.info("    (使用'或'逻辑，降低KNN权重，基于数据分析优化)")
             logger.info("  Phase2参数:")
             logger.info(f"    LateFlip: AUM<{phase2_late_flip_aum_threshold} 且 KNN>{phase2_late_flip_knn_threshold} 且 CL<{phase2_late_flip_cl_threshold}")
             logger.info(f"    UndoFlip: AUM<{phase2_undo_flip_aum_threshold} 或 CL<{phase2_undo_flip_cl_threshold} (OR条件)")
@@ -430,10 +432,13 @@ def correct_labels_cl_aum(
             
             do_flip = False
             
-            # 高噪声方案 Phase1 统一规则
+            # 高噪声方案 Phase1 统一规则（优化版：基于分析结果）
+            # 优化策略：使用"或"逻辑，AUM < -0.09 或 CL差值 > 0.40 即翻转
+            # 降低KNN权重（KNN区分能力弱，仅作为辅助指标）
             cl_target = float(pred_probs[i, target_label])
             cl_gap = cl_target - cl_cur
-            if (cl_gap >= 0.05) and (aum_val <= 0.20) and (knn_cons >= 0.55):
+            # 新规则：AUM < -0.09 或 CL差值 > 0.40
+            if (aum_val < -0.09) or (cl_gap > 0.40):
                 do_flip = True
             
             if do_flip:

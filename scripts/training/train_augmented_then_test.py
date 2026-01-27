@@ -216,8 +216,6 @@ def main():
             method_lower = str(contrastive_method).lower()
             # 只支持InfoNCE，使用标准批次大小
             batch_size = config.PRETRAIN_BATCH_SIZE
-            else:
-                batch_size = config.PRETRAIN_BATCH_SIZE
 
             dataset = TensorDataset(torch.FloatTensor(X_train))
             logger.info(f"🔧 RNG指纹(Stage1-DataLoader创建前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")

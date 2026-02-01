@@ -33,7 +33,7 @@ try:
 except Exception:
     PREPROCESS_AVAILABLE = False
 
-from scripts.training.train import stage1_pretrain_backbone, stage2_label_correction_and_augmentation, stage3_finetune_classifier
+from scripts.training.train import stage1_pretrain_backbone, stage2_label_correction, stage3_data_augmentation, stage4_finetune_classifier
 from scripts.testing.test import main as test_main
 
 # 导入标签矫正模块
@@ -230,34 +230,28 @@ def main():
         backbone.to(config.DEVICE)
         backbone.freeze()
         
-        # Stage 2: 标签矫正（直接复用完整流程的函数，但禁用TabDDPM）
+        # Stage 2: 标签矫正
         logger.info(f"🔧 RNG指纹(Stage2调用前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
-        
-        # 直接调用完整流程的stage2函数，通过config.STAGE2_USE_TABDDPM=False跳过数据增强
-        Z_augmented, y_augmented, sample_weights, correction_stats, tabddpm, n_original = stage2_label_correction_and_augmentation(
+        features, y_corrected, correction_weight, correction_stats, n_original = stage2_label_correction(
             backbone, X_train, y_train_noisy, y_train_clean, config, logger
         )
-        
         logger.info(f"🔧 RNG指纹(Stage2返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
-        
-        # 由于禁用了TabDDPM，Z_augmented实际上是特征，y_augmented是矫正后的标签
-        # 我们需要使用原始序列X_train进行Stage3训练
-        logger.info(f"✓ Stage2完成: 特征形状={Z_augmented.shape}, 标签形状={y_augmented.shape}")
+        logger.info(f"✓ Stage2完成: 特征形状={features.shape}, 标签形状={y_corrected.shape}")
         logger.info(f"✓ 矫正准确率: {correction_stats['accuracy']*100:.2f}%")
         
-        # Stage 3需要原始序列，不是特征
-        # 所以我们传入X_train（原始序列）和y_augmented（矫正后的标签）
-        X_for_stage3 = X_train
-        y_for_stage3 = y_augmented
-        weights_for_stage3 = sample_weights
+        # Stage 3: 数据增强（跳过，直接使用特征）
+        logger.info("⏭️ 跳过Stage 3数据增强，直接使用Stage 2的特征")
+        Z_augmented = features
+        y_augmented = y_corrected
+        sample_weights = correction_weight
         
-        # Stage 3: 分类器训练
-        logger.info(f"🔧 RNG指纹(Stage3调用前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
-        stage3_finetune_classifier(
-            backbone, X_for_stage3, y_for_stage3, weights_for_stage3,
+        # Stage 4: 分类器训练（使用特征）
+        logger.info(f"🔧 RNG指纹(Stage4调用前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
+        stage4_finetune_classifier(
+            backbone, Z_augmented, y_augmented, sample_weights,
             config, logger, n_original=n_original, backbone_path=backbone_path
         )
-        logger.info(f"🔧 RNG指纹(Stage3返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
+        logger.info(f"🔧 RNG指纹(Stage4返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
 
         # 测试
         log_section_header(logger, "🧪 测试评估")

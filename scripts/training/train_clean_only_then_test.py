@@ -33,7 +33,7 @@ try:
 except Exception:
     PREPROCESS_AVAILABLE = False
 
-from scripts.training.train import stage3_finetune_classifier
+from scripts.training.train import stage4_finetune_classifier
 from scripts.testing.test import main as test_main
 
 
@@ -200,13 +200,13 @@ def main():
             logger.warning('⚠ 使用随机初始化骨干网络')
             backbone.freeze()
         
-        # Stage 3: 分类器训练
-        logger.info(f"🔧 RNG指纹(Stage3调用前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
-        stage3_finetune_classifier(
+        # Stage 4: 分类器训练
+        logger.info(f"🔧 RNG指纹(Stage4调用前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
+        stage4_finetune_classifier(
             backbone, X_train, y_corrected, correction_weight,
             config, logger, n_original=len(X_train), backbone_path=backbone_path
         )
-        logger.info(f"🔧 RNG指纹(Stage3返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
+        logger.info(f"🔧 RNG指纹(Stage4返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
 
         # 测试
         log_section_header(logger, "🧪 测试评估")

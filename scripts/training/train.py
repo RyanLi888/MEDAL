@@ -316,9 +316,9 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
     return backbone, history
 
 
-def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y_train_clean, config, logger, stage2_mode='standard'):
+def stage2_label_correction(backbone, X_train, y_train_noisy, y_train_clean, config, logger, stage2_mode='standard'):
     """
-    Stage 2: 标签矫正 + 数据增强
+    Stage 2: 标签矫正
     
     Args:
         backbone: 预训练的骨干网络（冻结）
@@ -330,14 +330,13 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
         stage2_mode: 'standard' 或 'clean_augment_only'
         
     Returns:
-        Z_augmented: 增强后的特征
-        y_augmented: 增强后的标签
-        sample_weights: 样本权重
+        features: 提取的特征
+        y_corrected: 矫正后的标签
+        correction_weight: 样本权重
         correction_stats: 矫正统计
-        tabddpm: TabDDPM模型
         n_original: 原始样本数
     """
-    log_stage_start(logger, "STAGE 2: 标签矫正 + 数据增强", "矫正标签噪声并生成增强样本")
+    log_stage_start(logger, "STAGE 2: 标签矫正", "矫正标签噪声")
     config.log_stage_config(logger, "Stage 2")
     
     log_input_paths(logger, {
@@ -484,32 +483,56 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
     except Exception as e:
         logger.warning(f"⚠ 无法保存原始序列: {e}")
     
-    stage2_use_tabddpm = bool(getattr(config, 'STAGE2_USE_TABDDPM', True))
-
-    if not stage2_use_tabddpm:
-        logger.info("")
-
-        logger.info("步骤 2.2: TabDDPM 数据增强（已跳过）")
-        Z_augmented = Z_all
-        y_augmented = y_all
-        sample_weights = weights_all
-        n_train_original = int(Z_all.shape[0])
-        return Z_augmented, y_augmented, sample_weights, correction_stats, None, n_train_original
+    log_output_paths(logger, {
+        "矫正结果": correction_results_path
+    })
     
-    # TabDDPM 数据增强
-    log_subsection_header(logger, "步骤 2.2: TabDDPM 数据增强 (Feature Space)")
-    logger.info(f"  目标: 在骨干网络特征空间中训练/生成")
+    log_stage_end(logger, "Stage 2", {
+        "原始样本": len(X_train),
+        "矫正准确率": f"{correction_accuracy*100:.2f}%"
+    })
 
+    n_original = len(X_train)
+    return features, y_corrected, correction_weight, correction_stats, n_original
+
+
+def stage3_data_augmentation(backbone, features, y_corrected, correction_weight, config, logger):
+    """
+    Stage 3: 数据增强 (TabDDPM)
+    
+    Args:
+        backbone: 预训练的骨干网络（冻结）
+        features: (N, D) 特征向量（来自Stage 2）
+        y_corrected: (N,) 矫正后的标签
+        correction_weight: (N,) 样本权重
+        config: 配置对象
+        logger: 日志记录器
+        
+    Returns:
+        Z_augmented: 增强后的特征
+        y_augmented: 增强后的标签
+        sample_weights: 样本权重
+        tabddpm: 训练好的TabDDPM模型
+        n_original: 原始样本数
+    """
+    log_stage_start(logger, "STAGE 3: 数据增强", "使用TabDDPM在特征空间进行数据增强")
+    config.log_stage_config(logger, "Stage 3")
+    
+    log_input_paths(logger, {
+        "矫正结果": os.path.join(config.LABEL_CORRECTION_DIR, "models", "correction_results.npz"),
+        "骨干网络模型": os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    })
+    
     # 数据增强仅使用高权重数据（来自标签矫正权重）
     try:
-        aug_min_w = float(getattr(config, 'STAGE2_AUGMENT_MIN_WEIGHT', getattr(config, 'STAGE2_FEATURE_TIER2_MIN_WEIGHT', 0.7)))
+        aug_min_w = float(getattr(config, 'STAGE3_AUGMENT_MIN_WEIGHT', getattr(config, 'STAGE2_AUGMENT_MIN_WEIGHT', 0.7)))
     except Exception:
         aug_min_w = 0.7
-    aug_mask = (np.asarray(weights_all) >= float(aug_min_w))
-    Z_clean = Z_all[aug_mask]
-    y_clean = np.asarray(y_all)[aug_mask]
-    weights_clean = np.asarray(weights_all)[aug_mask]
-    logger.info(f"🧪 TabDDPM训练/增强仅使用高权重样本: {int(aug_mask.sum())}/{len(Z_all)} (threshold={aug_min_w})")
+    aug_mask = (np.asarray(correction_weight) >= float(aug_min_w))
+    Z_clean = features[aug_mask]
+    y_clean = np.asarray(y_corrected)[aug_mask]
+    weights_clean = np.asarray(correction_weight)[aug_mask]
+    logger.info(f"🧪 TabDDPM训练/增强仅使用高权重样本: {int(aug_mask.sum())}/{len(features)} (threshold={aug_min_w})")
     try:
         if len(weights_clean) > 0:
             logger.info(
@@ -518,7 +541,7 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
     except Exception:
         pass
     
-    logger.info(f"🔧 RNG指纹(Stage2-TabDDPM训练前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
+    logger.info(f"🔧 RNG指纹(Stage3-TabDDPM训练前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     
     tabddpm = TabDDPM(
         config,
@@ -533,7 +556,7 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
     ddpm_lr = float(getattr(config, 'DDPM_LR', 5e-4))
     optimizer_ddpm = optim.AdamW(tabddpm.parameters(), lr=ddpm_lr)
     
-    # 学习率调度器（v2.3新增）
+    # 学习率调度器
     ddpm_lr_scheduler_type = getattr(config, 'DDPM_LR_SCHEDULER', None)
     ddpm_scheduler = None
     if ddpm_lr_scheduler_type == 'cosine':
@@ -553,9 +576,9 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
     ddpm_es_smooth_window = int(getattr(config, 'DDPM_ES_SMOOTH_WINDOW', 5))
 
     dataset_ddpm = TensorDataset(torch.FloatTensor(Z_clean), torch.LongTensor(y_clean))
-    logger.info(f"🔧 RNG指纹(Stage2-TabDDPM DataLoader创建前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
+    logger.info(f"🔧 RNG指纹(Stage3-TabDDPM DataLoader创建前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     loader_ddpm = DataLoader(dataset_ddpm, batch_size=2048, shuffle=True)
-    logger.info(f"🔧 RNG指纹(Stage2-TabDDPM DataLoader创建后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
+    logger.info(f"🔧 RNG指纹(Stage3-TabDDPM DataLoader创建后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
 
     ddpm_best_loss = float('inf')
     ddpm_best_epoch = -1
@@ -589,7 +612,7 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
         else:
             smoothed_loss = avg_loss
         
-        # 学习率调度（v2.3新增）
+        # 学习率调度
         if ddpm_scheduler is not None:
             ddpm_scheduler.step()
             current_lr = optimizer_ddpm.param_groups[0]['lr']
@@ -619,23 +642,23 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
         tabddpm.to(config.DEVICE)
 
     # 生成增强特征
-    logger.info("步骤 2.3: 生成增强特征")
+    logger.info("生成增强特征")
     Z_syn, y_syn, w_syn = tabddpm.augment_feature_dataset(Z_clean, y_clean, weights_clean)
 
-    n_train_original = int(Z_all.shape[0])
+    n_train_original = int(features.shape[0])
     n_syn = int(Z_syn.shape[0] - int(Z_clean.shape[0]))
     if n_syn > 0:
         Z_syn_only = Z_syn[-n_syn:]
         y_syn_only = y_syn[-n_syn:]
         w_syn_only = np.ones((len(y_syn_only),), dtype=np.float32)
     else:
-        Z_syn_only = np.zeros((0, Z_all.shape[1]), dtype=Z_all.dtype)
-        y_syn_only = np.zeros((0,), dtype=np.asarray(y_all).dtype)
-        w_syn_only = np.zeros((0,), dtype=np.asarray(weights_all).dtype)
+        Z_syn_only = np.zeros((0, features.shape[1]), dtype=features.dtype)
+        y_syn_only = np.zeros((0,), dtype=np.asarray(y_corrected).dtype)
+        w_syn_only = np.zeros((0,), dtype=np.asarray(correction_weight).dtype)
 
-    Z_augmented = np.concatenate([Z_all, Z_syn_only], axis=0)
-    y_augmented = np.concatenate([np.asarray(y_all), np.asarray(y_syn_only)], axis=0)
-    sample_weights = np.concatenate([np.asarray(weights_all, dtype=np.float32), np.asarray(w_syn_only, dtype=np.float32)], axis=0)
+    Z_augmented = np.concatenate([features, Z_syn_only], axis=0)
+    y_augmented = np.concatenate([np.asarray(y_corrected), np.asarray(y_syn_only)], axis=0)
+    sample_weights = np.concatenate([np.asarray(correction_weight, dtype=np.float32), np.asarray(w_syn_only, dtype=np.float32)], axis=0)
     logger.info(f"✓ 特征增强完成: 原始={n_train_original} + 合成={len(Z_syn_only)} → 总计={len(Z_augmented)}")
 
     # 保存模型和数据
@@ -649,24 +672,23 @@ def stage2_label_correction_and_augmentation(backbone, X_train, y_train_noisy, y
              is_original=is_original_mask, n_original=n_train_original, sample_weights=sample_weights)
     
     log_output_paths(logger, {
-        "矫正结果": correction_results_path,
         "TabDDPM模型": tabddpm_path,
         "增强特征": augmented_data_path
     })
     
-    log_stage_end(logger, "Stage 2", {
+    log_stage_end(logger, "Stage 3", {
         "原始样本": n_train_original,
         "增强后样本": len(Z_augmented),
         "合成样本": n_syn
     })
 
-    return Z_augmented, y_augmented, sample_weights, correction_stats, tabddpm, n_train_original
+    return Z_augmented, y_augmented, sample_weights, tabddpm, n_train_original
 
 
-def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, config, logger, 
+def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, config, logger, 
                                n_original=None, backbone_path=None, X_train_real=None, use_mixed_stream=None):
     """
-    Stage 3: 分类器微调
+    Stage 4: 分类器微调
     
     Args:
         backbone: 预训练的骨干网络
@@ -685,8 +707,8 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         history: 训练历史
         optimal_threshold: 最优阈值
     """
-    log_stage_start(logger, "STAGE 3: 分类器微调", "训练双流MLP分类器进行最终威胁检测")
-    config.log_stage_config(logger, "Stage 3")
+    log_stage_start(logger, "STAGE 4: 分类器微调", "训练双流MLP分类器进行最终威胁检测")
+    config.log_stage_config(logger, "Stage 4")
     
     # 确定输入类型
     if use_mixed_stream is None:
@@ -1247,7 +1269,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         progress = (epoch + 1) / config.FINETUNE_EPOCHS * 100
         if val_f1 is not None:
             msg = (
-                f"[Stage 3] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
+                f"[Stage 4] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
                 f"Loss: {epoch_loss:.4f} | "
                 f"L(total={epoch_losses['total']:.4f}, sup={epoch_losses['supervision']:.4f}, a={epoch_losses['stream_a']:.4f}, b={epoch_losses['stream_b']:.4f}) | "
                 f"TrF1: {train_f1:.4f} | ValF1*: {val_f1:.4f} | Th: {val_threshold:.4f}"
@@ -1259,7 +1281,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             train_f1_star_disp = float(train_f1_star) if train_f1_star is not None else float('nan')
             train_th_star_disp = float(train_threshold_star) if train_threshold_star is not None else float('nan')
             msg = (
-                f"[Stage 3] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
+                f"[Stage 4] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
                 f"Loss: {epoch_loss:.4f} | "
                 f"L(total={epoch_losses['total']:.4f}, sup={epoch_losses['supervision']:.4f}, a={epoch_losses['stream_a']:.4f}, b={epoch_losses['stream_b']:.4f}) | "
                 f"TrF1: {train_f1:.4f} | TrF1*: {train_f1_star_disp:.4f} | Th: {train_th_star_disp:.4f}"
@@ -1284,7 +1306,7 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
 
     # 输出阶段总结
     actual_epochs = len(history['train_loss'])
-    log_stage_end(logger, "Stage 3", {
+    log_stage_end(logger, "Stage 4", {
         "最终损失": f"{history['train_loss'][-1]:.4f}",
         "最终F1": f"{history['train_f1'][-1]:.4f}",
         "最佳F1": f"{best_f1:.4f} (epoch {best_epoch})" if best_epoch > 0 else "N/A",
@@ -1308,9 +1330,9 @@ def stage3_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
                 features_list.append(z_batch.cpu().numpy())
             train_features = np.concatenate(features_list, axis=0)
     
-    feature_dist_path = os.path.join(config.CLASSIFICATION_DIR, "figures", "feature_distribution_stage3.png")
+    feature_dist_path = os.path.join(config.CLASSIFICATION_DIR, "figures", "feature_distribution_stage4.png")
     plot_feature_space(train_features, y_train, feature_dist_path,
-                      title="Stage 3: Feature Distribution", method='tsne')
+                      title="Stage 4: Feature Distribution", method='tsne')
     
     optimal_threshold = float(best_threshold)
     
@@ -1407,7 +1429,7 @@ def main(args):
     
     # 获取阶段范围
     start_stage = getattr(args, 'start_stage', 1)
-    end_stage = getattr(args, 'end_stage', 3)
+    end_stage = getattr(args, 'end_stage', 4)
     
     if isinstance(start_stage, str):
         try:
@@ -1432,7 +1454,7 @@ def main(args):
     y_train_clean = None
     y_train_noisy = None
     
-    if start_stage <= 3:
+    if start_stage <= 4:
         log_section_header(logger, "📦 数据集加载")
         logger.info(f"🔧 RNG指纹(加载训练数据前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         log_data_stats(logger, {
@@ -1466,7 +1488,7 @@ def main(args):
             "恶意样本": (y_train_clean==1).sum()
         }, "训练数据集")
         
-        if start_stage >= 2 and start_stage != 3:
+        if start_stage >= 2 and start_stage != 3 and start_stage != 4:
             logger.info(f"🔀 注入标签噪声 ({config.LABEL_NOISE_RATE*100:.0f}%)...")
             y_train_noisy, noise_mask = inject_label_noise(y_train_clean, config.LABEL_NOISE_RATE)
             logger.info(f"✓ 噪声标签创建完成: {noise_mask.sum()} 个标签被翻转")
@@ -1522,7 +1544,13 @@ def main(args):
             logger.error(f"❌ 找不到骨干网络: {backbone_path}")
             return
     
-    # Stage 2: 标签矫正 + 数据增强
+    # Stage 2: 标签矫正
+    features = None
+    y_corrected = None
+    correction_weight = None
+    correction_stats = None
+    n_original = None
+    
     if start_stage <= 2 and end_stage >= 2:
         logger.info(f"🔧 RNG指纹(Stage2调用前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         if y_train_noisy is None and y_train_clean is not None:
@@ -1531,7 +1559,7 @@ def main(args):
             logger.info(f"✓ 噪声标签创建完成: {noise_mask.sum()} 个标签被翻转")
         
         stage2_mode = getattr(args, 'stage2_mode', 'standard')
-        X_augmented, y_augmented, sample_weights, correction_stats, tabddpm, n_original = stage2_label_correction_and_augmentation(
+        features, y_corrected, correction_weight, correction_stats, n_original = stage2_label_correction(
             backbone, X_train, y_train_noisy, y_train_clean, config, logger, stage2_mode=stage2_mode
         )
         logger.info(f"🔧 RNG指纹(Stage2返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
@@ -1540,42 +1568,88 @@ def main(args):
             logger.info("✅ 已完成到 Stage 2")
             return backbone
     elif end_stage >= 3:
-        # 跳过Stage 2
-        augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_features.npz")
-        finetune_backbone_enabled = bool(getattr(config, 'FINETUNE_BACKBONE', False))
-        
-        if int(start_stage) == 3 and X_train is not None:
-            logger.info("✅ Stage 3-only: 跳过 Stage 2")
-            
-            if finetune_backbone_enabled:
-                X_augmented = X_train
-                y_augmented = y_train_clean
-                sample_weights = np.ones(len(X_train), dtype=np.float32)
-                n_original = len(X_train)
-                logger.info(f"✓ 使用原始序列: {len(X_train)} 个样本")
-            else:
-                X_train_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
+        # 加载Stage 2的结果
+        correction_results_path = os.path.join(config.LABEL_CORRECTION_DIR, "models", "correction_results.npz")
+        if os.path.exists(correction_results_path):
+            logger.info(f"✓ 加载标签矫正结果: {correction_results_path}")
+            data = np.load(correction_results_path)
+            y_corrected = data['y_corrected']
+            correction_weight = data['correction_weight']
+            # 需要重新提取特征
+            if X_train is not None:
+                backbone.to(config.DEVICE)
+                backbone.freeze()
+                backbone.eval()
                 with torch.no_grad():
-                    Z_clean = backbone(X_train_tensor, return_sequence=False).detach().cpu().numpy().astype(np.float32)
-                X_augmented = Z_clean
-                y_augmented = y_train_clean
-                sample_weights = np.ones(len(Z_clean), dtype=np.float32)
-                n_original = len(Z_clean)
-                logger.info(f"✓ 使用特征向量: {len(Z_clean)} 个样本")
-        elif os.path.exists(augmented_data_path):
+                    X_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
+                    features_list = []
+                    batch_size = 64
+                    for i in range(0, len(X_tensor), batch_size):
+                        X_batch = X_tensor[i:i+batch_size]
+                        z_batch = backbone(X_batch, return_sequence=False)
+                        features_list.append(z_batch.cpu().numpy())
+                    features = np.concatenate(features_list, axis=0)
+                n_original = len(X_train)
+        else:
+            logger.warning("⚠️ 找不到标签矫正结果，将使用原始标签")
+            if X_train is not None:
+                backbone.to(config.DEVICE)
+                backbone.freeze()
+                backbone.eval()
+                with torch.no_grad():
+                    X_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
+                    features_list = []
+                    batch_size = 64
+                    for i in range(0, len(X_tensor), batch_size):
+                        X_batch = X_tensor[i:i+batch_size]
+                        z_batch = backbone(X_batch, return_sequence=False)
+                        features_list.append(z_batch.cpu().numpy())
+                    features = np.concatenate(features_list, axis=0)
+                y_corrected = y_train_clean if y_train_clean is not None else np.zeros(len(X_train))
+                correction_weight = np.ones(len(X_train), dtype=np.float32)
+                n_original = len(X_train)
+    
+    # Stage 3: 数据增强
+    Z_augmented = None
+    y_augmented = None
+    sample_weights = None
+    tabddpm = None
+    
+    if start_stage <= 3 and end_stage >= 3:
+        if features is None or y_corrected is None or correction_weight is None:
+            logger.error("❌ Stage 3需要Stage 2的输出，请先运行Stage 2")
+            return
+        
+        logger.info(f"🔧 RNG指纹(Stage3调用前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
+        Z_augmented, y_augmented, sample_weights, tabddpm, n_original = stage3_data_augmentation(
+            backbone, features, y_corrected, correction_weight, config, logger
+        )
+        logger.info(f"🔧 RNG指纹(Stage3返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
+        
+        if end_stage <= 3:
+            logger.info("✅ 已完成到 Stage 3")
+            return backbone
+    elif end_stage >= 4:
+        # 加载Stage 3的结果
+        augmented_data_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_features.npz")
+        if os.path.exists(augmented_data_path):
             logger.info(f"✓ 加载增强特征: {augmented_data_path}")
             data = np.load(augmented_data_path)
-            X_augmented = data['Z_augmented']
+            Z_augmented = data['Z_augmented']
             y_augmented = data['y_augmented']
-            sample_weights = data['sample_weights'] if 'sample_weights' in data else np.ones(len(X_augmented))
-            n_original = int(data['n_original']) if 'n_original' in data else len(X_augmented)
+            sample_weights = data['sample_weights'] if 'sample_weights' in data else np.ones(len(Z_augmented))
+            n_original = int(data['n_original']) if 'n_original' in data else len(Z_augmented)
         else:
             logger.error(f"❌ 找不到增强数据: {augmented_data_path}")
             return
 
-    # Stage 3: 分类器微调
-    if end_stage >= 3 and start_stage <= 3:
-        logger.info(f"🔧 RNG指纹(Stage3调用前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
+    # Stage 4: 分类器微调
+    if end_stage >= 4 and start_stage <= 4:
+        if Z_augmented is None or y_augmented is None or sample_weights is None:
+            logger.error("❌ Stage 4需要Stage 3的输出，请先运行Stage 3")
+            return
+        
+        logger.info(f"🔧 RNG指纹(Stage4调用前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         if hasattr(args, 'backbone_path') and args.backbone_path:
             actual_backbone_path = args.backbone_path
         else:
@@ -1590,14 +1664,14 @@ def main(args):
         except Exception:
             X_train_real = None
 
-        classifier, finetune_history, optimal_threshold = stage3_finetune_classifier(
-            backbone, X_augmented, y_augmented, sample_weights, config, logger,
+        classifier, finetune_history, optimal_threshold = stage4_finetune_classifier(
+            backbone, Z_augmented, y_augmented, sample_weights, config, logger,
             n_original=n_original, backbone_path=actual_backbone_path, X_train_real=X_train_real,
             use_mixed_stream=bool(getattr(config, 'STAGE3_MIXED_STREAM', True))  # 默认启用混合训练
         )
-        logger.info(f"🔧 RNG指纹(Stage3返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
+        logger.info(f"🔧 RNG指纹(Stage4返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     else:
-        logger.info("⏭️ 跳过 Stage 3")
+        logger.info("⏭️ 跳过 Stage 4")
         return backbone
     
     # 绘制训练历史
@@ -1607,8 +1681,9 @@ def main(args):
     # 最终总结
     log_final_summary(logger, "训练完成", {
         "Stage 1": f"骨干网络预训练 - {config.PRETRAIN_EPOCHS} epochs",
-        "Stage 2": "标签矫正+数据增强 - 完成",
-        "Stage 3": f"分类器微调 - {config.FINETUNE_EPOCHS} epochs"
+        "Stage 2": "标签矫正 - 完成",
+        "Stage 3": "数据增强 - 完成",
+        "Stage 4": f"分类器微调 - {config.FINETUNE_EPOCHS} epochs"
     }, {
         "特征提取": config.FEATURE_EXTRACTION_DIR,
         "标签矫正": config.LABEL_CORRECTION_DIR,
@@ -1623,8 +1698,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MEDAL-Lite 训练脚本")
     
     parser.add_argument("--noise_rate", type=float, default=None, help="标签噪声率（默认使用config.LABEL_NOISE_RATE）")
-    parser.add_argument("--start_stage", type=str, default="1", choices=["1", "2", "3"], help="起始阶段")
-    parser.add_argument("--end_stage", type=str, default="3", choices=["1", "2", "3"], help="结束阶段")
+    parser.add_argument("--start_stage", type=str, default="1", choices=["1", "2", "3", "4"], help="起始阶段")
+    parser.add_argument("--end_stage", type=str, default="4", choices=["1", "2", "3", "4"], help="结束阶段")
     parser.add_argument("--backbone_path", type=str, default=None, help="骨干网络路径")
     parser.add_argument("--retrain_backbone", action="store_true", help="重新训练骨干网络")
     parser.add_argument("--stage2_mode", type=str, default="standard", choices=["standard", "clean_augment_only"], help="Stage 2模式")

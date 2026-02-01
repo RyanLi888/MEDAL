@@ -34,7 +34,7 @@ try:
 except Exception:
     PREPROCESS_AVAILABLE = False
 
-from scripts.training.train import stage1_pretrain_backbone, stage2_label_correction_and_augmentation, stage3_finetune_classifier
+from scripts.training.train import stage1_pretrain_backbone, stage2_label_correction, stage3_data_augmentation, stage4_finetune_classifier
 from scripts.testing.test import main as test_main
 
 
@@ -266,16 +266,23 @@ def main():
                 logger.warning('⚠ 使用随机初始化骨干网络')
                 backbone.freeze()
         
-        # Stage 2: 数据增强（跳过标签矫正）
+        # Stage 2: 标签矫正（跳过，使用干净标签）
         logger.info(f"🔧 RNG指纹(Stage2调用前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
-        Z_aug, y_aug, w_aug, correction_stats, tabddpm, n_original = stage2_label_correction_and_augmentation(
+        features, y_corrected_stage2, correction_weight, correction_stats, n_original_stage2 = stage2_label_correction(
             backbone, X_train, y_corrected, y_corrected, config, logger,
             stage2_mode='clean_augment_only'
         )
         logger.info(f"🔧 RNG指纹(Stage2返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
 
-        # Stage 3: 分类器训练
+        # Stage 3: 数据增强
         logger.info(f"🔧 RNG指纹(Stage3调用前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
+        Z_aug, y_aug, w_aug, tabddpm, n_original = stage3_data_augmentation(
+            backbone, features, y_corrected_stage2, correction_weight, config, logger
+        )
+        logger.info(f"🔧 RNG指纹(Stage3返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
+
+        # Stage 4: 分类器训练
+        logger.info(f"🔧 RNG指纹(Stage4调用前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
         # 加载原始序列用于混合训练
         real_kept_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "real_kept_data.npz")
         X_real = None
@@ -290,12 +297,12 @@ def main():
             use_mixed_stream = False
             logger.info('⚠️ 混合训练模式已禁用')
 
-        stage3_finetune_classifier(
+        stage4_finetune_classifier(
             backbone, Z_aug, y_aug, w_aug, config, logger,
             n_original=n_original, backbone_path=backbone_path,
             X_train_real=X_real, use_mixed_stream=use_mixed_stream
         )
-        logger.info(f"🔧 RNG指纹(Stage3返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
+        logger.info(f"🔧 RNG指纹(Stage4返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
 
         # 测试
         log_section_header(logger, "🧪 测试评估")

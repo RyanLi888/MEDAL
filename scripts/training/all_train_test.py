@@ -14,11 +14,12 @@ import argparse
 from datetime import datetime
 import hashlib
 import random
+import json
 
 from MoudleCode.utils.config import config
 from MoudleCode.utils.helpers import set_seed, setup_logger
 from MoudleCode.utils.logging_utils import (
-    log_section_header, log_data_stats, log_final_summary
+    log_section_header, log_data_stats, log_final_summary, log_output_paths
 )
 
 import numpy as np
@@ -32,6 +33,11 @@ try:
     PREPROCESS_AVAILABLE = True
 except ImportError:
     PREPROCESS_AVAILABLE = False
+
+
+def _safe_makedirs(path: str) -> None:
+    """安全创建目录"""
+    os.makedirs(path, exist_ok=True)
 
 
 def main(args):
@@ -72,7 +78,78 @@ def main(args):
     set_seed(seed)
     rng_fp_after_seed = _rng_fingerprint_short()
     config.create_dirs()
-    logger = setup_logger(os.path.join(config.OUTPUT_ROOT, "logs"), name='all_train_test')
+    
+    # 如果指定了实验目录（用于测试），加载实验元数据并设置输出目录
+    if getattr(args, 'experiment_dir', None):
+        experiment_dir = args.experiment_dir
+        metadata_path = os.path.join(experiment_dir, 'experiment_metadata.json')
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                experiment_metadata = json.load(f)
+            dirs = experiment_metadata.get('directories', {})
+            config.FEATURE_EXTRACTION_DIR = dirs.get('feature_extraction', config.FEATURE_EXTRACTION_DIR)
+            config.LABEL_CORRECTION_DIR = dirs.get('label_correction', config.LABEL_CORRECTION_DIR)
+            config.DATA_AUGMENTATION_DIR = dirs.get('data_augmentation', config.DATA_AUGMENTATION_DIR)
+            config.CLASSIFICATION_DIR = dirs.get('classification', config.CLASSIFICATION_DIR)
+            config.RESULT_DIR = dirs.get('result', config.RESULT_DIR)
+            run_tag = experiment_metadata.get('run_tag', os.path.basename(experiment_dir))
+        else:
+            logger.warning(f"⚠ 实验元数据不存在: {metadata_path}")
+            logger.warning("  使用默认输出目录")
+            run_tag = os.path.basename(experiment_dir)
+    else:
+        # 创建新的实验文件夹（基于时间戳）
+        run_tag = getattr(args, 'run_tag', None) or datetime.now().strftime('%Y%m%d_%H%M%S')
+        experiment_dir = os.path.join(config.OUTPUT_ROOT, 'experiments', run_tag)
+        _safe_makedirs(experiment_dir)
+        
+        # 保存原始输出目录
+        original_feature_extraction_dir = config.FEATURE_EXTRACTION_DIR
+        original_label_correction_dir = config.LABEL_CORRECTION_DIR
+        original_data_augmentation_dir = config.DATA_AUGMENTATION_DIR
+        original_classification_dir = config.CLASSIFICATION_DIR
+        original_result_dir = config.RESULT_DIR
+        
+        # 修改输出目录，使其指向实验文件夹
+        config.FEATURE_EXTRACTION_DIR = os.path.join(experiment_dir, 'feature_extraction')
+        config.LABEL_CORRECTION_DIR = os.path.join(experiment_dir, 'label_correction')
+        config.DATA_AUGMENTATION_DIR = os.path.join(experiment_dir, 'data_augmentation')
+        config.CLASSIFICATION_DIR = os.path.join(experiment_dir, 'classification')
+        config.RESULT_DIR = os.path.join(experiment_dir, 'result')
+        
+        # 创建实验文件夹下的子目录
+        for module_dir in [config.FEATURE_EXTRACTION_DIR, config.LABEL_CORRECTION_DIR,
+                          config.DATA_AUGMENTATION_DIR, config.CLASSIFICATION_DIR, config.RESULT_DIR]:
+            _safe_makedirs(module_dir)
+            _safe_makedirs(os.path.join(module_dir, 'models'))
+            _safe_makedirs(os.path.join(module_dir, 'figures'))
+            _safe_makedirs(os.path.join(module_dir, 'logs'))
+        
+        # 保存实验元数据
+        experiment_metadata = {
+            'run_tag': run_tag,
+            'experiment_dir': experiment_dir,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'seed': seed,
+            'start_stage': getattr(args, 'start_stage', '1'),
+            'backbone_path': getattr(args, 'backbone_path', None),
+            'noise_rate': config.LABEL_NOISE_RATE,
+            'directories': {
+                'feature_extraction': config.FEATURE_EXTRACTION_DIR,
+                'label_correction': config.LABEL_CORRECTION_DIR,
+                'data_augmentation': config.DATA_AUGMENTATION_DIR,
+                'classification': config.CLASSIFICATION_DIR,
+                'result': config.RESULT_DIR,
+            }
+        }
+        metadata_path = os.path.join(experiment_dir, 'experiment_metadata.json')
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(experiment_metadata, f, ensure_ascii=False, indent=2)
+    
+    # 创建日志目录
+    log_dir = os.path.join(experiment_dir, 'logs')
+    _safe_makedirs(log_dir)
+    logger = setup_logger(log_dir, name='all_train_test')
 
     logger.info(f"🔧 RNG指纹(seed前): {rng_fp_before_seed}")
     logger.info(f"🔧 RNG指纹(seed后): {rng_fp_after_seed} (args.seed={seed} | config.SEED={int(getattr(config, 'SEED', -1))} | torch.initial_seed={int(torch.initial_seed()) if hasattr(torch, 'initial_seed') else 'N/A'})")
@@ -80,6 +157,8 @@ def main(args):
     log_section_header(logger, "🚀 MEDAL-Lite 完整流程: 训练 + 测试")
     logger.info(f"设备: {config.DEVICE}")
     logger.info(f"时间戳: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"实验目录: {experiment_dir}")
+    logger.info(f"实验标签: {run_tag}")
     
     # 输出配置摘要
     logger.info("")
@@ -88,6 +167,10 @@ def main(args):
     logger.info(f"  测试集: {config.BENIGN_TEST}, {config.MALICIOUS_TEST}")
     logger.info(f"  标签噪声率: {config.LABEL_NOISE_RATE*100:.0f}%")
     logger.info("")
+    
+    if not getattr(args, 'experiment_dir', None):
+        logger.info(f"✓ 实验元数据已保存: {metadata_path}")
+        logger.info("")
     
     start_stage = getattr(args, 'start_stage', '1')
     
@@ -120,6 +203,25 @@ def main(args):
     log_section_header(logger, "🧪 PHASE 2: 测试阶段")
     
     try:
+        # 确保测试时使用实验目录中的模型
+        # 如果backbone_path未指定，尝试从实验目录加载
+        if not getattr(args, 'backbone_path', None):
+            # 尝试从分类器元数据中获取backbone路径
+            classifier_metadata_path = os.path.join(config.CLASSIFICATION_DIR, 'models', 'model_metadata.json')
+            if os.path.exists(classifier_metadata_path):
+                with open(classifier_metadata_path, 'r', encoding='utf-8') as f:
+                    classifier_metadata = json.load(f)
+                backbone_path_from_meta = classifier_metadata.get('backbone_path')
+                if backbone_path_from_meta and os.path.exists(backbone_path_from_meta):
+                    args.backbone_path = backbone_path_from_meta
+                    logger.info(f"✓ 从分类器元数据获取骨干网络路径: {backbone_path_from_meta}")
+                else:
+                    # 尝试使用实验目录中的backbone
+                    experiment_backbone = os.path.join(config.FEATURE_EXTRACTION_DIR, 'models', 'backbone_pretrained.pth')
+                    if os.path.exists(experiment_backbone):
+                        args.backbone_path = experiment_backbone
+                        logger.info(f"✓ 使用实验目录中的骨干网络: {experiment_backbone}")
+        
         metrics = test_main(args)
         logger.info("✓ 测试阶段完成!")
     except Exception as e:
@@ -136,10 +238,22 @@ def main(args):
         "F1分数": metrics['f1_pos'],
         "AUC": metrics.get('auc', 'N/A')
     }, {
-        "模型文件": config.CHECKPOINT_DIR,
+        "实验目录": experiment_dir,
+        "骨干网络": os.path.join(config.FEATURE_EXTRACTION_DIR, 'models'),
+        "标签矫正": os.path.join(config.LABEL_CORRECTION_DIR, 'models'),
+        "数据增强": os.path.join(config.DATA_AUGMENTATION_DIR, 'models'),
+        "分类器": os.path.join(config.CLASSIFICATION_DIR, 'models'),
         "测试结果": config.RESULT_DIR,
-        "训练日志": os.path.join(config.OUTPUT_ROOT, 'logs')
+        "训练日志": log_dir
     })
+    
+    # 恢复原始输出目录（如果需要）
+    # 注意：这里不恢复，因为后续可能还需要使用实验目录
+    # config.FEATURE_EXTRACTION_DIR = original_feature_extraction_dir
+    # config.LABEL_CORRECTION_DIR = original_label_correction_dir
+    # config.DATA_AUGMENTATION_DIR = original_data_augmentation_dir
+    # config.CLASSIFICATION_DIR = original_classification_dir
+    # config.RESULT_DIR = original_result_dir
 
 
 if __name__ == "__main__":
@@ -151,6 +265,8 @@ if __name__ == "__main__":
     parser.add_argument("--backbone_path", type=str, default=None, help="骨干网络路径")
     parser.add_argument("--finetune_backbone", action="store_true", help="启用骨干微调")
     parser.add_argument("--seed", type=int, default=None, help="随机种子（覆盖config.SEED）")
+    parser.add_argument("--run_tag", type=str, default=None, help="实验标签（默认使用时间戳）")
+    parser.add_argument("--experiment_dir", type=str, default=None, help="实验目录路径（用于测试时指定）")
     
     args = parser.parse_args()
     if args.noise_rate is not None:

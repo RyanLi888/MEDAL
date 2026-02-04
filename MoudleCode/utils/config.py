@@ -99,7 +99,7 @@ class Config:
     # ============================================================
     # 数据集基础配置
     # ============================================================
-    LABEL_NOISE_RATE = 0.30  # 标签噪声率（30%）
+    LABEL_NOISE_RATE = 0.20  # 标签噪声率（30%）
     LABEL_BENIGN = 0         # 正常流量标签
     LABEL_MALICIOUS = 1      # 恶意流量标签
     
@@ -599,6 +599,10 @@ class Config:
             logger.info("📊 训练参数:")
             logger.info(f"  - 最大轮数: {self.PRETRAIN_EPOCHS}")
             logger.info(f"  - 批次大小: {self.PRETRAIN_BATCH_SIZE}")
+            gradient_accumulation = getattr(self, 'PRETRAIN_GRADIENT_ACCUMULATION_STEPS', 1)
+            if gradient_accumulation > 1:
+                effective_batch_size = self.PRETRAIN_BATCH_SIZE * gradient_accumulation
+                logger.info(f"  - 梯度累积步数: {gradient_accumulation} (有效批次大小: {effective_batch_size})")
             logger.info(f"  - 学习率: {self.PRETRAIN_LR} → {self.PRETRAIN_MIN_LR}")
             logger.info(f"  - 权重衰减: {self.PRETRAIN_WEIGHT_DECAY}")
             logger.info(f"  - 调度器: {self.LR_SCHEDULER}")
@@ -640,15 +644,41 @@ class Config:
                 logger.info(f"  - 增强倍数: {self.STAGE2_FEATURE_AUG_MULTIPLIER}x")
                 logger.info(f"  - 训练轮数: {self.DDPM_EPOCHS}")
                 logger.info(f"  - 学习率: {self.DDPM_LR}")
+                logger.info(f"  - 最小学习率: {getattr(self, 'DDPM_MIN_LR', 1e-5)}")
+                logger.info(f"  - 学习率调度器: {getattr(self, 'DDPM_LR_SCHEDULER', 'cosine')}")
                 logger.info(f"  - 扩散步数: {self.DDPM_TIMESTEPS}")
                 logger.info(f"  - 采样步数: {self.DDPM_SAMPLING_STEPS}")
+                logger.info(f"  - 最小权重阈值: {getattr(self, 'STAGE2_AUGMENT_MIN_WEIGHT', 0.8)}")
                 logger.info("")
                 logger.info("⏹️ TabDDPM 早停:")
                 logger.info(f"  - 启用: {self.DDPM_EARLY_STOPPING}")
                 logger.info(f"  - 预热轮数: {self.DDPM_ES_WARMUP_EPOCHS}")
                 logger.info(f"  - 耐心值: {self.DDPM_ES_PATIENCE}")
+                if hasattr(self, 'DDPM_ES_MIN_DELTA') and self.DDPM_ES_MIN_DELTA > 0:
+                    logger.info(f"  - 改善阈值: {self.DDPM_ES_MIN_DELTA}")
             
-        elif stage == "Stage 3" or stage == "finetune":
+        elif stage == "Stage 3" or stage == "augmentation":
+            logger.info("🎯 目标: 数据增强 (TabDDPM)")
+            logger.info("")
+            logger.info("📊 TabDDPM 配置:")
+            logger.info(f"  - 增强空间: {getattr(self, 'STAGE3_TABDDPM_SPACE', getattr(self, 'STAGE2_TABDDPM_SPACE', 'feature'))}")
+            logger.info(f"  - 增强倍数: {getattr(self, 'STAGE3_FEATURE_AUG_MULTIPLIER', getattr(self, 'STAGE2_FEATURE_AUG_MULTIPLIER', 2))}x")
+            logger.info(f"  - 训练轮数: {self.DDPM_EPOCHS}")
+            logger.info(f"  - 学习率: {self.DDPM_LR}")
+            logger.info(f"  - 最小学习率: {getattr(self, 'DDPM_MIN_LR', 1e-5)}")
+            logger.info(f"  - 学习率调度器: {getattr(self, 'DDPM_LR_SCHEDULER', 'cosine')}")
+            logger.info(f"  - 扩散步数: {self.DDPM_TIMESTEPS}")
+            logger.info(f"  - 采样步数: {self.DDPM_SAMPLING_STEPS}")
+            logger.info(f"  - 最小权重阈值: {getattr(self, 'STAGE3_AUGMENT_MIN_WEIGHT', getattr(self, 'STAGE2_AUGMENT_MIN_WEIGHT', 0.8))}")
+            logger.info("")
+            logger.info("⏹️ TabDDPM 早停:")
+            logger.info(f"  - 启用: {self.DDPM_EARLY_STOPPING}")
+            logger.info(f"  - 预热轮数: {self.DDPM_ES_WARMUP_EPOCHS}")
+            logger.info(f"  - 耐心值: {self.DDPM_ES_PATIENCE}")
+            if hasattr(self, 'DDPM_ES_MIN_DELTA') and self.DDPM_ES_MIN_DELTA > 0:
+                logger.info(f"  - 改善阈值: {self.DDPM_ES_MIN_DELTA}")
+            
+        elif stage == "Stage 4" or stage == "finetune":
             logger.info("🎯 目标: 分类器微调")
             logger.info("")
             logger.info("📊 训练参数:")
@@ -679,12 +709,12 @@ class Config:
             logger.info(f"  - 平衡采样: {self.USE_BALANCED_SAMPLING}")
             logger.info(f"  - 目标比例: {self.BALANCED_SAMPLING_RATIO}:1")
             logger.info("")
-            if self.STAGE3_MIXED_STREAM:
+            if getattr(self, 'STAGE3_MIXED_STREAM', False) or getattr(self, 'STAGE4_MIXED_STREAM', False):
                 logger.info("🔧 混合训练配置:")
-                logger.info(f"  - 原始序列批次: {self.STAGE3_MIXED_REAL_BATCH_SIZE}")
-                logger.info(f"  - 增强特征批次: {self.STAGE3_MIXED_SYN_BATCH_SIZE}")
-                logger.info(f"  - 原始损失权重: {self.STAGE3_MIXED_REAL_LOSS_SCALE}")
-                logger.info(f"  - 增强损失权重: {self.STAGE3_MIXED_SYN_LOSS_SCALE}")
+                logger.info(f"  - 原始序列批次: {getattr(self, 'STAGE3_MIXED_REAL_BATCH_SIZE', getattr(self, 'STAGE4_MIXED_REAL_BATCH_SIZE', 64))}")
+                logger.info(f"  - 增强特征批次: {getattr(self, 'STAGE3_MIXED_SYN_BATCH_SIZE', getattr(self, 'STAGE4_MIXED_SYN_BATCH_SIZE', 64))}")
+                logger.info(f"  - 原始损失权重: {getattr(self, 'STAGE3_MIXED_REAL_LOSS_SCALE', getattr(self, 'STAGE4_MIXED_REAL_LOSS_SCALE', 3.0))}")
+                logger.info(f"  - 增强损失权重: {getattr(self, 'STAGE3_MIXED_SYN_LOSS_SCALE', getattr(self, 'STAGE4_MIXED_SYN_LOSS_SCALE', 0.8))}")
             logger.info("")
             logger.info("⏹️ 早停配置:")
             logger.info(f"  - 启用: {self.FINETUNE_EARLY_STOPPING}")

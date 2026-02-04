@@ -32,7 +32,6 @@ from MoudleCode.utils.visualization import (
 from MoudleCode.preprocessing.pcap_parser import load_dataset
 from MoudleCode.feature_extraction.backbone import MicroBiMambaBackbone, build_backbone
 from MoudleCode.classification.dual_stream import MEDAL_Classifier
-from MoudleCode.utils.checkpoint import load_state_dict_shape_safe
 
 # 导入预处理模块
 try:
@@ -85,24 +84,53 @@ def _seed_snapshot() -> str:
 
 
 def _load_classifier_checkpoint(classifier, state_dict, logger=None):
-    """Load classifier checkpoint saved either as full classifier.state_dict or as classifier.dual_mlp.state_dict."""
+    """
+    Load classifier checkpoint (new architecture only: 32 → 16 → 8 → 2).
+    
+    Supports loading either:
+    - Full classifier.state_dict (with 'backbone.' and 'dual_mlp.' prefixes)
+    - Only dual_mlp.state_dict (with or without 'dual_mlp.' prefix)
+    
+    Raises RuntimeError if model architecture doesn't match (old models not supported).
+    """
     if not isinstance(state_dict, dict):
         raise TypeError(f"Expected state_dict to be a dict, got {type(state_dict)}")
 
+    # 尝试加载完整模型
     try:
         classifier.load_state_dict(state_dict, strict=True)
+        if logger is not None:
+            logger.info("✓ 完整模型加载成功")
         return
     except Exception as e:
         if logger is not None:
-            logger.warning(f"⚠ 整模型加载失败，将尝试仅加载分类头(dual_mlp): {e}")
+            logger.info(f"整模型加载失败，尝试仅加载分类头(dual_mlp): {str(e)[:100]}...")
 
+    # 处理带有 'dual_mlp.' 前缀的键（可能同时包含backbone和dual_mlp的键）
     keys = list(state_dict.keys())
-    if keys and all(isinstance(k, str) and k.startswith('dual_mlp.') for k in keys):
-        stripped = {k[len('dual_mlp.'):]: v for k, v in state_dict.items()}
+    dual_mlp_keys = [k for k in keys if isinstance(k, str) and k.startswith('dual_mlp.')]
+    
+    if dual_mlp_keys:
+        # 过滤出dual_mlp的键并去除前缀
+        stripped = {k[len('dual_mlp.'):]: v for k, v in state_dict.items() if k.startswith('dual_mlp.')}
         classifier.dual_mlp.load_state_dict(stripped, strict=True)
+        if logger is not None:
+            logger.info("✓ 分类头(dual_mlp)加载成功")
         return
 
+    # 尝试直接加载到 dual_mlp（无前缀，且没有backbone键）
+    # 如果state_dict包含backbone键，说明是完整模型，不应该走这里
+    has_backbone_keys = any(isinstance(k, str) and k.startswith('backbone.') for k in keys)
+    if has_backbone_keys:
+        raise RuntimeError(
+            f"模型文件包含backbone键，但完整模型加载失败。"
+            f"这通常意味着模型架构不匹配（可能是旧架构32-32-16-2）。"
+            f"请使用新架构（32-16-8-2）重新训练模型。"
+        )
+    
     classifier.dual_mlp.load_state_dict(state_dict, strict=True)
+    if logger is not None:
+        logger.info("✓ 分类头(dual_mlp)加载成功")
 
 def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
     """
@@ -553,14 +581,19 @@ def main(args):
         if os.path.isdir(models_dir):
             for fn in os.listdir(models_dir):
                 if isinstance(fn, str) and fn.startswith("classifier_last10_minloss_epoch") and fn.endswith(".pth"):
-                    minloss_candidates.append(os.path.join(models_dir, fn))
+                    full_path = os.path.join(models_dir, fn)
+                    minloss_candidates.append(full_path)
     except Exception:
         minloss_candidates = []
     
     # 检查哪些模型存在
     has_best = os.path.exists(best_path)
     has_final = os.path.exists(final_path)
-    minloss_path = sorted(minloss_candidates)[-1] if len(minloss_candidates) > 0 else None
+    # 按文件修改时间选择最新的minloss模型（而不是按字符串排序）
+    if len(minloss_candidates) > 0:
+        minloss_path = max(minloss_candidates, key=lambda p: os.path.getmtime(p))
+    else:
+        minloss_path = None
     has_minloss = bool(minloss_path) and os.path.exists(minloss_path)
     
     if not has_best and not has_final and not has_minloss:

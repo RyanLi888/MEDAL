@@ -15,7 +15,8 @@ class DualStreamMLP(nn.Module):
     Dual-Stream MLP with Soft-Orthogonal Constraints
     
     Two parallel MLP classifiers with dynamic loss weighting
-    Enhanced with BatchNorm for better feature scaling (对比学习特征幅度较小)
+    Architecture: 32 → 16 → 8 → 2 (optimized for small datasets <1000 samples)
+    Enhanced with LayerNorm for better feature scaling
     """
     
     def __init__(self, config):
@@ -36,19 +37,19 @@ class DualStreamMLP(nn.Module):
         self.use_layernorm = getattr(config, 'USE_LAYERNORM_IN_CLASSIFIER', True)
 
         self.mlp_a = nn.Sequential(
-            nn.Linear(feature_dim, 32),
+            nn.Linear(feature_dim, 16),
             nn.Tanh(),
-            nn.Linear(32, 16),
+            nn.Linear(16, 8),
             nn.Tanh(),
-            nn.Linear(16, config.CLASSIFIER_OUTPUT_DIM)
+            nn.Linear(8, config.CLASSIFIER_OUTPUT_DIM)
         )
 
         self.mlp_b = nn.Sequential(
-            nn.Linear(feature_dim, 32),
+            nn.Linear(feature_dim, 16),
             nn.Tanh(),
-            nn.Linear(32, 16),
+            nn.Linear(16, 8),
             nn.Tanh(),
-            nn.Linear(16, config.CLASSIFIER_OUTPUT_DIM)
+            nn.Linear(8, config.CLASSIFIER_OUTPUT_DIM)
         )
         
         # Initialize with different random seeds
@@ -75,7 +76,7 @@ class DualStreamMLP(nn.Module):
         Forward pass
         
         Args:
-            z: (B, 64) - features from backbone
+            z: (B, 32) - features from backbone (32-dim feature vector)
             return_separate: bool - if True, return separate logits
             
         Returns:
@@ -295,7 +296,7 @@ class MEDAL_Classifier(nn.Module):
             
         Returns:
             logits: (B, 2) or ((B, 2), (B, 2)) if return_separate
-            z: (B, 64) if return_features
+            z: (B, 32) if return_features (32-dim feature vector from backbone)
         """
         # Determine if input is already features (2D) or sequences (3D)
         is_2d_input = (isinstance(x, torch.Tensor) and x.dim() == 2)

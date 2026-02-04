@@ -166,7 +166,6 @@ class Config:
     MAMBA_CONV_KERNEL = 4                   # 卷积核大小
     MAMBA_DROPOUT = 0.1                     # Dropout率
     MAMBA_FUSION_TYPE = "gate"              # 融合方式: gate/average/concat_project
-    MAMBA_PROJECTION_DIM = 64               # Concat后投影维度
     
     # ============================================================
     # STAGE 1: 自监督预训练 (SimMTM + InfoNCE) - 最优配置
@@ -414,7 +413,7 @@ class Config:
     # ============================================================
     
     # 3.1 分类器架构
-    CLASSIFIER_HIDDEN_DIM = 32              # 隐藏层维度
+    # 注意：分类器实际结构是 32→16→8→2（硬编码在dual_stream.py中）
     CLASSIFIER_OUTPUT_DIM = 2               # 二分类输出
     CLASSIFIER_INPUT_IS_FEATURES = False    # 输入类型（False=序列，True=特征）
     

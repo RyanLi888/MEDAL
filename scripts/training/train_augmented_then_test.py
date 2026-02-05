@@ -267,10 +267,24 @@ def main():
                 backbone.freeze()
         
         # Stage 2: 标签矫正（跳过，使用干净标签）
+        # Stage 2会完全独立运行，复现标签矫正分析的流程
+        # clean_augment_only模式会跳过标签矫正，直接使用真实标签
         logger.info(f"🔧 RNG指纹(Stage2调用前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
+        
+        # 确定backbone路径
+        backbone_path_for_stage2 = args.backbone_path if args.backbone_path else os.path.join(
+            config.FEATURE_EXTRACTION_DIR, 'models', 'backbone_pretrained.pth'
+        )
+        
         features, y_corrected_stage2, correction_weight, correction_stats, n_original_stage2 = stage2_label_correction(
-            backbone, X_train, y_corrected, y_corrected, config, logger,
-            stage2_mode='clean_augment_only'
+            backbone=None,  # 传递None，让Stage 2重新加载以确保状态一致
+            X_train=None,  # 传递None，让Stage 2重新加载以确保流程一致
+            y_train_noisy=None,  # 传递None，clean_augment_only模式会使用真实标签
+            y_train_clean=None,  # 传递None，让Stage 2重新加载以确保流程一致
+            config=config,
+            logger=logger,
+            stage2_mode='clean_augment_only',
+            backbone_path=backbone_path_for_stage2
         )
         logger.info(f"🔧 RNG指纹(Stage2返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
 

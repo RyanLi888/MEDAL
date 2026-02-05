@@ -231,9 +231,24 @@ def main():
         backbone.freeze()
         
         # Stage 2: 标签矫正
+        # Stage 2会完全独立运行，复现标签矫正分析的流程，包括重新加载数据和注入噪声
+        # 因此传递None，让Stage 2自己重新加载以确保流程一致
         logger.info(f"🔧 RNG指纹(Stage2调用前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
+        
+        # 确定backbone路径
+        backbone_path_for_stage2 = args.backbone_path if args.backbone_path else os.path.join(
+            config.FEATURE_EXTRACTION_DIR, 'models', 'backbone_pretrained.pth'
+        )
+        
         features, y_corrected, correction_weight, correction_stats, n_original = stage2_label_correction(
-            backbone, X_train, y_train_noisy, y_train_clean, config, logger
+            backbone=None,  # 传递None，让Stage 2重新加载以确保状态一致
+            X_train=None,  # 传递None，让Stage 2重新加载以确保流程一致
+            y_train_noisy=None,  # 传递None，让Stage 2重新注入噪声以确保流程一致
+            y_train_clean=None,  # 传递None，让Stage 2重新加载以确保流程一致
+            config=config,
+            logger=logger,
+            stage2_mode='standard',
+            backbone_path=backbone_path_for_stage2
         )
         logger.info(f"🔧 RNG指纹(Stage2返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
         logger.info(f"✓ Stage2完成: 特征形状={features.shape}, 标签形状={y_corrected.shape}")

@@ -316,18 +316,19 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
     return backbone, history
 
 
-def stage2_label_correction(backbone, X_train, y_train_noisy, y_train_clean, config, logger, stage2_mode='standard'):
+def stage2_label_correction(backbone, X_train, y_train_noisy, y_train_clean, config, logger, stage2_mode='standard', backbone_path=None):
     """
-    Stage 2: 标签矫正
+    Stage 2: 标签矫正（完全复现标签矫正分析流程）
     
     Args:
-        backbone: 预训练的骨干网络（冻结）
-        X_train: (N, L, D) 训练序列
-        y_train_noisy: (N,) 噪声标签
-        y_train_clean: (N,) 干净标签（仅用于评估）
+        backbone: 预训练的骨干网络（可选，如果为None则重新加载）
+        X_train: (N, L, D) 训练序列（可选，如果为None则重新加载）
+        y_train_noisy: (N,) 噪声标签（可选，如果为None则重新生成）
+        y_train_clean: (N,) 干净标签（可选，如果为None则重新加载）
         config: 配置对象
         logger: 日志记录器
         stage2_mode: 'standard' 或 'clean_augment_only'
+        backbone_path: backbone路径（可选，用于重新加载）
         
     Returns:
         features: 提取的特征
@@ -339,24 +340,92 @@ def stage2_label_correction(backbone, X_train, y_train_noisy, y_train_clean, con
     log_stage_start(logger, "STAGE 2: 标签矫正", "矫正标签噪声")
     config.log_stage_config(logger, "Stage 2")
     
-    log_input_paths(logger, {
-        "训练数据(正常)": config.BENIGN_TRAIN,
-        "训练数据(恶意)": config.MALICIOUS_TRAIN,
-        "骨干网络模型": os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
-    })
+    # ========================
+    # Step 1: 重置随机种子（复现标签矫正分析流程）
+    # ========================
+    logger.info("🔧 重置随机种子以确保可复现性...")
+    set_seed(config.SEED)
+    logger.info(f"🔧 RNG指纹(Stage2重置种子后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     
-    # 冻结骨干网络并提取特征
-    backbone.to(config.DEVICE)
+    # ========================
+    # Step 2: 加载数据集（复现标签矫正分析流程）
+    # ========================
+    logger.info("┌─ Step 1: 加载数据集")
+    logger.info(f"│  数据路径: {config.BENIGN_TRAIN} | {config.MALICIOUS_TRAIN}")
+    logger.info(f"│  序列长度: {config.SEQUENCE_LENGTH}")
+    
+    if X_train is None or y_train_clean is None:
+        # 优先使用预处理好的数据
+        if PREPROCESS_AVAILABLE and check_preprocessed_exists('train'):
+            logger.info("│  ✓ 使用预处理文件")
+            X_train, y_train_clean, train_files = load_preprocessed('train')
+        else:
+            # 从PCAP文件加载
+            logger.info("│  ⚠ 从PCAP文件加载（建议先预处理以加速）")
+            X_train, y_train_clean, train_files = load_dataset(
+                benign_dir=config.BENIGN_TRAIN,
+                malicious_dir=config.MALICIOUS_TRAIN,
+                sequence_length=config.SEQUENCE_LENGTH
+            )
+        
+        if X_train is None:
+            logger.error("│  ❌ 数据集加载失败!")
+            raise RuntimeError("数据集加载失败")
+    
+    logger.info(f"└─ ✓ 完成: {X_train.shape[0]} 个样本 | 正常={(y_train_clean==0).sum()} | 恶意={(y_train_clean==1).sum()}")
+    logger.info("")
+    
+    # ========================
+    # Step 3: 注入标签噪声（复现标签矫正分析流程）
+    # ========================
+    logger.info("┌─ Step 2: 注入标签噪声")
+    logger.info(f"│  噪声率: {config.LABEL_NOISE_RATE*100:.0f}%")
+    
+    if y_train_noisy is None:
+        # 固定随机种子，确保相同噪声率的结果可复现
+        set_seed(config.SEED)
+        y_train_noisy, noise_mask = inject_label_noise(y_train_clean, config.LABEL_NOISE_RATE)
+        logger.info(f"└─ ✓ 完成: {noise_mask.sum()} 个标签被翻转 | 原始纯度: {100*(y_train_clean==y_train_noisy).mean():.1f}%")
+    else:
+        noise_mask = (y_train_clean != y_train_noisy)
+        logger.info(f"└─ ✓ 使用已有噪声标签: {noise_mask.sum()} 个标签被翻转 | 原始纯度: {100*(y_train_clean==y_train_noisy).mean():.1f}%")
+    logger.info("")
+    
+    # ========================
+    # Step 4: 提取特征（复现标签矫正分析流程）
+    # ========================
+    logger.info("┌─ Step 3: 提取特征")
+    
+    # 确定backbone路径（完全复现标签矫正分析流程，总是重新加载backbone以确保状态一致）
+    if backbone_path is None:
+        backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    
+    # 为了确保指纹一致，总是重新加载backbone（即使传入了backbone）
+    # 这样可以确保backbone的状态与标签矫正分析完全一致
+    logger.info(f"│  加载预训练backbone: {os.path.basename(backbone_path)}")
+    from MoudleCode.utils.model_loader import load_backbone_safely
+    backbone = load_backbone_safely(
+        backbone_path=backbone_path,
+        config=config,
+        device=config.DEVICE,
+        logger=logger
+    )
+    logger.info("│  ✓ Backbone加载完成")
+    
+    # 提取特征（使用与标签矫正分析相同的函数逻辑）
+    logger.info("│  Extracting features using backbone...")
+    
     backbone.freeze()
     backbone.eval()
-    logger.info("✓ 骨干网络已冻结，开始特征提取...")
+    backbone.to(config.DEVICE)
+    
+    features_list = []
+    batch_size = 64
+    X_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
+    
+    total_batches = (len(X_tensor) + batch_size - 1) // batch_size
     
     with torch.no_grad():
-        X_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
-        features_list = []
-        batch_size = 64
-        total_batches = (len(X_tensor) + batch_size - 1) // batch_size
-        
         for i in range(0, len(X_tensor), batch_size):
             batch_idx = i // batch_size + 1
             X_batch = X_tensor[i:i+batch_size]
@@ -364,22 +433,29 @@ def stage2_label_correction(backbone, X_train, y_train_noisy, y_train_clean, con
             features_list.append(z_batch.cpu().numpy())
             
             if batch_idx % 10 == 0 or batch_idx == total_batches:
-                log_progress(logger, batch_idx, total_batches, "特征提取")
-        
-        features = np.concatenate(features_list, axis=0)
+                progress = batch_idx / total_batches * 100
+                logger.info(f"│    Feature extraction progress: {batch_idx}/{total_batches} batches ({progress:.1f}%)")
     
-    logger.info(f"✓ 特征提取完成: {features.shape}")
+    features = np.concatenate(features_list, axis=0)
+    logger.info(f"│  ✓ Feature extraction complete: {features.shape}")
     
     # 保存特征
     features_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "train_features.npy")
     np.save(features_path, features)
+    logger.info(f"└─ ✓ 完成: 特征维度 {features.shape} | 已保存")
+    logger.info("")
     
     # 特征可视化
     feature_dist_path = os.path.join(config.LABEL_CORRECTION_DIR, "figures", "feature_distribution_stage2.png")
     plot_feature_space(features, y_train_clean, feature_dist_path,
                       title="Stage 2: Feature Distribution", method='tsne')
     
-    # 标签矫正
+    # ========================
+    # Step 5: 运行 Hybrid Court 标签矫正（复现标签矫正分析流程）
+    # ========================
+    logger.info("┌─ Step 4: 运行 Hybrid Court 标签矫正")
+    logger.info("")
+    
     log_subsection_header(logger, "步骤 2.1: Hybrid Court 标签矫正")
     logger.info(f"  输入: {len(y_train_noisy)} 个样本，噪声率: {config.LABEL_NOISE_RATE*100:.0f}%")
     logger.info(f"  方法: CL (置信学习) + AUM (训练动态) + KNN (语义投票)")
@@ -1553,14 +1629,28 @@ def main(args):
     
     if start_stage <= 2 and end_stage >= 2:
         logger.info(f"🔧 RNG指纹(Stage2调用前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
-        if y_train_noisy is None and y_train_clean is not None:
-            logger.info(f"🔀 注入标签噪声 ({config.LABEL_NOISE_RATE*100:.0f}%)...")
-            y_train_noisy, noise_mask = inject_label_noise(y_train_clean, config.LABEL_NOISE_RATE)
-            logger.info(f"✓ 噪声标签创建完成: {noise_mask.sum()} 个标签被翻转")
         
+        # Stage 2会完全复现标签矫正分析的流程，包括重新加载数据和注入噪声
+        # 因此传递None，让Stage 2自己重新加载以确保流程一致
         stage2_mode = getattr(args, 'stage2_mode', 'standard')
+        
+        # 确定backbone路径
+        backbone_path = None
+        if hasattr(args, 'backbone_path') and args.backbone_path:
+            backbone_path = args.backbone_path
+        else:
+            backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+        
+        # Stage 2完全独立运行，不依赖主流程传入的任何状态，确保与标签矫正分析完全一致
         features, y_corrected, correction_weight, correction_stats, n_original = stage2_label_correction(
-            backbone, X_train, y_train_noisy, y_train_clean, config, logger, stage2_mode=stage2_mode
+            backbone=None,  # 传递None，让Stage 2重新加载以确保状态一致
+            X_train=None,  # 传递None，让Stage 2重新加载以确保流程一致
+            y_train_noisy=None,  # 传递None，让Stage 2重新注入噪声以确保流程一致
+            y_train_clean=None,  # 传递None，让Stage 2重新加载以确保流程一致
+            config=config,
+            logger=logger,
+            stage2_mode=stage2_mode,
+            backbone_path=backbone_path
         )
         logger.info(f"🔧 RNG指纹(Stage2返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         

@@ -528,60 +528,111 @@ def correct_labels_cl_aum(
         logger.info(f"    KNN 一致性范围: [{neighbor_consistency_p3.min():.4f}, {neighbor_consistency_p3.max():.4f}]")
         logger.info(f"    KNN 一致性均值: {neighbor_consistency_p3.mean():.4f}")
         
-        # 阶段3：根据样本类型分配权重
+        # 阶段3：根据样本类型分配权重（低中噪声统一划分方案：10%-30%噪声适用）
         logger.info("")
-        logger.info("  执行阶段3权重分配...")
-        core_clean_count = 0
-        noise_count = 0
+        logger.info("  执行阶段3权重分配（低中噪声统一划分方案）...")
+        logger.info("    策略说明:")
+        logger.info("      - 核心数据分区: 阶段2识别出的原始核心样本（CL≥0.7且KNN≥0.7） → 权重1.0")
+        logger.info("      - 干净非核心数据分区: CL>0.4且AUM>0.0的原始噪声区样本 → 权重0.5")
+        logger.info("      - 噪声区: 不满足上述指标的残留冲突样本 → 权重0.1")
         
-        # 定义阈值
-        cl_high_threshold = 0.7  # CL高置信度阈值
-        knn_consistency_threshold = 0.7  # KNN一致性阈值
+        # 基于阶段2的指标识别原始核心样本
+        # 注意：阶段2的指标（cl_confidence_p2, neighbor_consistency_p2）在阶段3开始时仍然可用
+        phase2_core_cl_threshold = 0.7  # 阶段2核心样本CL阈值
+        phase2_core_knn_threshold = 0.7  # 阶段2核心样本KNN阈值
+        
+        # 识别阶段2的核心样本：使用阶段2的CL和KNN指标
+        phase2_core_mask = np.zeros(n_samples, dtype=bool)
+        # 需要重新获取阶段2的KNN投票（如果可用）
+        # 为了简化，我们使用阶段3的KNN投票，但使用阶段2的CL和KNN一致性指标
+        # 如果阶段2的指标不可用，则使用阶段3的指标但使用更严格的标准
+        try:
+            # 尝试使用阶段2的指标
+            for i in range(n_samples):
+                cl_conf_p2 = float(cl_confidence_p2[i])
+                knn_cons_p2 = float(neighbor_consistency_p2[i])
+                knn_vote_p2 = int(neighbor_labels_p2[i])
+                current_label = int(clean_labels[i])
+                knn_supports = (knn_vote_p2 == current_label)
+                
+                if cl_conf_p2 >= phase2_core_cl_threshold and knn_cons_p2 >= phase2_core_knn_threshold and knn_supports:
+                    phase2_core_mask[i] = True
+        except (NameError, UnboundLocalError):
+            # 如果阶段2的指标不可用，使用阶段3的指标但使用更严格的标准
+            logger.warning("  警告: 阶段2的指标不可用，使用阶段3的指标识别核心样本")
+            for i in range(n_samples):
+                cl_conf_p3 = float(cl_confidence_p3[i])
+                knn_cons_p3 = float(neighbor_consistency_p3[i])
+                knn_vote_p3 = int(neighbor_labels_p3[i])
+                current_label = int(clean_labels[i])
+                knn_supports = (knn_vote_p3 == current_label)
+                
+                if cl_conf_p3 >= phase2_core_cl_threshold and knn_cons_p3 >= phase2_core_knn_threshold and knn_supports:
+                    phase2_core_mask[i] = True
+        
+        core_clean_count = 0
+        clean_non_core_count = 0
+        noise_suppression_count = 0
+        
+        # 定义阈值（低中噪声统一划分方案）
+        cl_recovery_threshold = 0.4  # CL恢复识别阈值（干净非核心区）
+        aum_recovery_threshold = 0.0  # AUM恢复识别阈值（干净非核心区）
         
         for i in range(n_samples):
             cl_conf_p3 = float(cl_confidence_p3[i])
-            knn_cons_p3 = float(neighbor_consistency_p3[i])
-            knn_vote_p3 = int(neighbor_labels_p3[i])
-            current_label = int(clean_labels[i])
-            knn_supports = (knn_vote_p3 == current_label)
+            aum_val = float(aum_scores[i])
             
-            # 核心干净样本：CL高置信度且KNN一致
-            if cl_conf_p3 >= cl_high_threshold and knn_cons_p3 >= knn_consistency_threshold and knn_supports:
+            # 核心数据分区：阶段2识别出的原始核心样本（继承阶段2的权重1.0）
+            if phase2_core_mask[i]:
                 correction_weight[i] = 1.0
                 core_clean_count += 1
-            else:
-                # 噪声样本：CL低置信度或KNN不一致
+            # 干净非核心数据分区：CL>0.4且AUM>0.0的原始噪声区样本
+            elif cl_conf_p3 > cl_recovery_threshold and aum_val > aum_recovery_threshold:
                 correction_weight[i] = 0.5
-                noise_count += 1
+                clean_non_core_count += 1
+            # 噪声区：不满足上述指标的残留冲突样本
+            else:
+                correction_weight[i] = 0.1
+                noise_suppression_count += 1
         
         logger.info("")
-        logger.info("  📊 Phase3 权重分配统计:")
-        logger.info(f"    核心干净样本 (权重1.0): {core_clean_count:5d} ({100*core_clean_count/n_samples:.1f}%)")
-        logger.info(f"    噪声样本 (权重0.5): {noise_count:5d} ({100*noise_count/n_samples:.1f}%)")
+        logger.info("  📊 Phase3 权重分配统计（低中噪声统一划分方案）:")
+        logger.info(f"    核心数据分区 (权重1.0): {core_clean_count:5d} ({100*core_clean_count/n_samples:.1f}%)")
+        logger.info(f"    干净非核心数据分区 (权重0.5): {clean_non_core_count:5d} ({100*clean_non_core_count/n_samples:.1f}%)")
+        logger.info(f"    噪声区 (权重0.1): {noise_suppression_count:5d} ({100*noise_suppression_count/n_samples:.1f}%)")
         
         if y_true is not None:
             # 验证权重分配的准确性
             core_clean_correct = 0
             core_clean_total = 0
-            noise_correct = 0
-            noise_total = 0
+            clean_non_core_correct = 0
+            clean_non_core_total = 0
+            noise_suppression_correct = 0
+            noise_suppression_total = 0
             
             for i in range(n_samples):
                 if correction_weight[i] == 1.0:
                     core_clean_total += 1
                     if int(clean_labels[i]) == int(y_true[i]):
                         core_clean_correct += 1
-                else:
-                    noise_total += 1
+                elif correction_weight[i] == 0.5:
+                    clean_non_core_total += 1
                     if int(clean_labels[i]) == int(y_true[i]):
-                        noise_correct += 1
+                        clean_non_core_correct += 1
+                elif correction_weight[i] == 0.1:
+                    noise_suppression_total += 1
+                    if int(clean_labels[i]) == int(y_true[i]):
+                        noise_suppression_correct += 1
             
             if core_clean_total > 0:
                 core_clean_acc = 100.0 * core_clean_correct / core_clean_total
-                logger.info(f"    核心干净样本准确率: {core_clean_acc:.2f}% ({core_clean_correct}/{core_clean_total})")
-            if noise_total > 0:
-                noise_acc = 100.0 * noise_correct / noise_total
-                logger.info(f"    噪声样本准确率: {noise_acc:.2f}% ({noise_correct}/{noise_total})")
+                logger.info(f"    核心数据分区准确率: {core_clean_acc:.2f}% ({core_clean_correct}/{core_clean_total})")
+            if clean_non_core_total > 0:
+                clean_non_core_acc = 100.0 * clean_non_core_correct / clean_non_core_total
+                logger.info(f"    干净非核心数据分区准确率: {clean_non_core_acc:.2f}% ({clean_non_core_correct}/{clean_non_core_total})")
+            if noise_suppression_total > 0:
+                noise_suppression_acc = 100.0 * noise_suppression_correct / noise_suppression_total
+                logger.info(f"    噪声区准确率: {noise_suppression_acc:.2f}% ({noise_suppression_correct}/{noise_suppression_total})")
         
         # 更新返回的KNN一致性和CL概率为阶段3的结果
         neighbor_consistency = neighbor_consistency_p3
@@ -596,7 +647,7 @@ def correct_labels_cl_aum(
         final_keep_count = n_samples - final_flip_count
         logger.info(f"  阶段1: Flip={flip_count} | 未翻转={keep_count}")
         logger.info(f"  阶段2: 新增翻转={phase2_flip_count}")
-        logger.info(f"  阶段3: 核心干净={core_clean_count} (权重1.0) | 噪声={noise_count} (权重0.5)")
+        logger.info(f"  阶段3: 核心数据={core_clean_count} (权重1.0) | 干净非核心={clean_non_core_count} (权重0.5) | 噪声区={noise_suppression_count} (权重0.1)")
         logger.info(f"  最终: Flip={final_flip_count} | 保持={final_keep_count}")
         
         return clean_labels, action_mask, confidence, correction_weight, aum_scores, neighbor_consistency, pred_probs
@@ -1076,16 +1127,25 @@ def correct_labels_cl_aum(
         logger.info(f"    KNN 一致性范围: [{neighbor_consistency_p3.min():.4f}, {neighbor_consistency_p3.max():.4f}]")
         logger.info(f"    KNN 一致性均值: {neighbor_consistency_p3.mean():.4f}")
         
-        # 阶段3：根据样本类型分配权重
+        # 阶段3：根据样本类型分配权重（精细化三层分区策略 - 高噪声方案）
         logger.info("")
-        logger.info("  执行阶段3权重分配...")
+        logger.info("  执行阶段3权重分配（精细化三层分区策略 - 基于指标判断）...")
+        logger.info("    策略说明:")
+        logger.info("      - 核心数据分区: CL≥0.7且KNN≥0.7且KNN支持 → 权重1.0（继承阶段2多重交叉验证）")
+        logger.info("      - 干净非核心数据分区: CL>0.25且KNN>0.55 → 权重0.5（指标恢复识别）")
+        logger.info("      - 噪声抑制区: CL≤0.25或KNN≤0.55 → 权重0.1（指标失序压制）")
+        
         core_clean_count = 0
-        noise_count = 0
+        clean_non_core_count = 0
+        noise_suppression_count = 0
         
         # 定义阈值
-        cl_high_threshold = 0.7  # CL高置信度阈值
-        knn_consistency_threshold = 0.7  # KNN一致性阈值
+        cl_high_threshold = 0.7  # CL高置信度阈值（核心区）
+        knn_consistency_threshold = 0.7  # KNN一致性阈值（核心区）
+        cl_recovery_threshold = 0.25  # CL恢复识别阈值（干净非核心区）
+        knn_recovery_threshold = 0.55  # KNN恢复识别阈值（干净非核心区）
         
+        # 分配权重（基于CL和KNN指标）
         for i in range(n_samples):
             cl_conf_p3 = float(cl_confidence_p3[i])
             knn_cons_p3 = float(neighbor_consistency_p3[i])
@@ -1093,43 +1153,57 @@ def correct_labels_cl_aum(
             current_label = int(clean_labels[i])
             knn_supports = (knn_vote_p3 == current_label)
             
-            # 核心干净样本：CL高置信度且KNN一致
+            # 核心数据分区：CL高置信度且KNN一致且KNN支持（继承阶段2多重交叉验证）
             if cl_conf_p3 >= cl_high_threshold and knn_cons_p3 >= knn_consistency_threshold and knn_supports:
                 correction_weight[i] = 1.0
                 core_clean_count += 1
-            else:
-                # 噪声样本：CL低置信度或KNN不一致
+            # 干净非核心数据分区：CL>0.25且KNN>0.55（指标恢复识别）
+            elif cl_conf_p3 > cl_recovery_threshold and knn_cons_p3 > knn_recovery_threshold:
                 correction_weight[i] = 0.5
-                noise_count += 1
+                clean_non_core_count += 1
+            # 噪声抑制区：CL≤0.25或KNN≤0.55（指标失序压制）
+            else:
+                correction_weight[i] = 0.1
+                noise_suppression_count += 1
         
         logger.info("")
-        logger.info("  📊 Phase3 权重分配统计:")
-        logger.info(f"    核心干净样本 (权重1.0): {core_clean_count:5d} ({100*core_clean_count/n_samples:.1f}%)")
-        logger.info(f"    噪声样本 (权重0.5): {noise_count:5d} ({100*noise_count/n_samples:.1f}%)")
+        logger.info("  📊 Phase3 权重分配统计（精细化三层分区）:")
+        logger.info(f"    核心数据分区 (权重1.0): {core_clean_count:5d} ({100*core_clean_count/n_samples:.1f}%)")
+        logger.info(f"    干净非核心数据分区 (权重0.5): {clean_non_core_count:5d} ({100*clean_non_core_count/n_samples:.1f}%)")
+        logger.info(f"    噪声抑制区 (权重0.1): {noise_suppression_count:5d} ({100*noise_suppression_count/n_samples:.1f}%)")
         
         if y_true is not None:
             # 验证权重分配的准确性
             core_clean_correct = 0
             core_clean_total = 0
-            noise_correct = 0
-            noise_total = 0
+            clean_non_core_correct = 0
+            clean_non_core_total = 0
+            noise_suppression_correct = 0
+            noise_suppression_total = 0
             
             for i in range(n_samples):
                 if correction_weight[i] == 1.0:
                     core_clean_total += 1
                     if int(clean_labels[i]) == int(y_true[i]):
                         core_clean_correct += 1
-                else:
-                    noise_total += 1
+                elif correction_weight[i] == 0.5:
+                    clean_non_core_total += 1
                     if int(clean_labels[i]) == int(y_true[i]):
-                        noise_correct += 1
+                        clean_non_core_correct += 1
+                elif correction_weight[i] == 0.1:
+                    noise_suppression_total += 1
+                    if int(clean_labels[i]) == int(y_true[i]):
+                        noise_suppression_correct += 1
             
             if core_clean_total > 0:
                 core_clean_acc = 100.0 * core_clean_correct / core_clean_total
-                logger.info(f"    核心干净样本准确率: {core_clean_acc:.2f}% ({core_clean_correct}/{core_clean_total})")
-            if noise_total > 0:
-                noise_acc = 100.0 * noise_correct / noise_total
-                logger.info(f"    噪声样本准确率: {noise_acc:.2f}% ({noise_correct}/{noise_total})")
+                logger.info(f"    核心数据分区准确率: {core_clean_acc:.2f}% ({core_clean_correct}/{core_clean_total})")
+            if clean_non_core_total > 0:
+                clean_non_core_acc = 100.0 * clean_non_core_correct / clean_non_core_total
+                logger.info(f"    干净非核心数据分区准确率: {clean_non_core_acc:.2f}% ({clean_non_core_correct}/{clean_non_core_total})")
+            if noise_suppression_total > 0:
+                noise_suppression_acc = 100.0 * noise_suppression_correct / noise_suppression_total
+                logger.info(f"    噪声抑制区准确率: {noise_suppression_acc:.2f}% ({noise_suppression_correct}/{noise_suppression_total})")
         
         # 更新返回的KNN一致性和CL概率为阶段3的结果
         neighbor_consistency = neighbor_consistency_p3
@@ -1146,7 +1220,7 @@ def correct_labels_cl_aum(
         final_keep_count = n_samples - final_flip_count
         logger.info(f"  阶段1: Flip={phase1_flip_count} | 未翻转={phase1_no_flip_count}")
         logger.info(f"  阶段2: UndoFlip={undo_flip_count} | LateFlip={late_flip_count}")
-        logger.info(f"  阶段3: 核心干净={core_clean_count} (权重1.0) | 噪声={noise_count} (权重0.5)")
+        logger.info(f"  阶段3: 核心数据={core_clean_count} (权重1.0) | 干净非核心={clean_non_core_count} (权重0.5) | 噪声抑制={noise_suppression_count} (权重0.1)")
         logger.info(f"  最终: Flip={final_flip_count} | 保持={final_keep_count}")
         
         return clean_labels, action_mask, confidence, correction_weight, aum_scores, neighbor_consistency, pred_probs

@@ -99,7 +99,7 @@ class Config:
     # ============================================================
     # 数据集基础配置
     # ============================================================
-    LABEL_NOISE_RATE = 0.40  # 标签噪声率（30%）
+    LABEL_NOISE_RATE = 0.30  # 标签噪声率（30%）
     LABEL_BENIGN = 0         # 正常流量标签
     LABEL_MALICIOUS = 1      # 恶意流量标签
     
@@ -418,7 +418,7 @@ class Config:
     CLASSIFIER_INPUT_IS_FEATURES = False    # 输入类型（False=序列，True=特征）
     
     # 3.2 训练基础参数
-    FINETUNE_EPOCHS = 1000                  # 最大训练轮数（恢复最优配置）
+    FINETUNE_EPOCHS = 500                  # 最大训练轮数（恢复最优配置）
     FINETUNE_BATCH_SIZE = 128               # 批次大小
     FINETUNE_LR = 2e-4                      # 学习率
     FINETUNE_MIN_LR = 1e-6                  # 最小学习率
@@ -427,7 +427,7 @@ class Config:
     # 3.3 早停机制（智能训练终止）
     FINETUNE_EARLY_STOPPING = True         # 启用早停
     FINETUNE_ES_WARMUP_EPOCHS = 100         # 预热轮数（前N轮不触发早停）- 增加预热
-    FINETUNE_ES_PATIENCE = 100               # 耐心值（连续N轮无改善则停止）- 增加耐心
+    FINETUNE_ES_PATIENCE = 30               # 耐心值（连续N轮无改善则停止）- 增加耐心
     FINETUNE_ES_MIN_DELTA = 0.0005           # F1改善阈值（需要明显改善）- 提高阈值
     FINETUNE_ES_METRIC = 'f1_optimal'       # 监控指标
     FINETUNE_ES_ALLOW_TRAIN_METRIC = True   # 允许使用训练集指标
@@ -484,17 +484,17 @@ class Config:
     # 损失函数配置（最优组合）
     # ============================================================
     
-    # 主损失：Focal Loss（关注困难样本）
-    USE_FOCAL_LOSS = True                   # 启用Focal Loss
-    FOCAL_ALPHA = 0.6                       # 恶意类权重（提高召回，提升F1）
-    FOCAL_GAMMA = 2.0                       # Gamma参数
+    # 主损失：BCE Loss（二分类交叉熵）
+    USE_FOCAL_LOSS = False                  # 禁用Focal Loss
+    FOCAL_ALPHA = 0.6                       # 恶意类权重（Focal Loss参数，已禁用）
+    FOCAL_GAMMA = 0                         # Gamma参数（Focal Loss参数，已禁用）
     
     # 辅助损失（全部关闭 - 最优配置）
     USE_SOFT_F1_LOSS = False
     SOFT_F1_WEIGHT = 0.1
-    USE_BCE_LOSS = False
-    BCE_POS_WEIGHT = 1.0
-    BCE_LABEL_SMOOTHING = 0.0
+    USE_BCE_LOSS = True                     # 启用BCE Loss
+    BCE_POS_WEIGHT = 1.0                    # 正类（恶意类）权重
+    BCE_LABEL_SMOOTHING = 0.0               # 标签平滑系数
     SUP_LOSS_SCALE = 1.0
     USE_MARGIN_LOSS = False
     MARGIN_M = 0.15

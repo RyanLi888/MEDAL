@@ -284,39 +284,51 @@ run_analysis() {
     echo "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
     echo "│                                    阶段3权重分配统计表                                                          │"
     echo "├──────────────────────────────────────────────────────────────────────────────────────────────────────────────┤"
-    printf "│  %-8s │ %-20s │ %-20s │ %-20s │\n" "噪声率" "核心干净(权重1.0)" "噪声样本(权重0.5)" "剩余数据(丢弃)"
+    printf "│  %-8s │ %-20s │ %-20s │ %-20s │\n" "噪声率" "核心干净(权重1.0)" "干净非核心(权重0.5)" "噪声抑制(权重0.1)"
     echo "├──────────────────────────────────────────────────────────────────────────────────────────────────────────────┤"
     
     for noise_rate in "${rates_array[@]}"; do
         local noise_pct=$(printf "%.0f" $(awk "BEGIN {printf \"%.0f\", $noise_rate * 100}"))
         local summary="${results_summary["${noise_pct}"]}"
         if [ -n "$summary" ]; then
-            # 解析阶段3信息
+            # 解析阶段3信息（支持精细化三层分区）
             local phase3_core_clean=$(echo "$summary" | sed -n 's/.*phase3_core_clean=\([0-9]*\).*/\1/p')
             local phase3_core_clean_acc=$(echo "$summary" | sed -n 's/.*phase3_core_clean_acc=\([0-9.]*\)%.*/\1/p')
-            local phase3_noise=$(echo "$summary" | sed -n 's/.*phase3_noise=\([0-9]*\).*/\1/p')
-            local phase3_noise_acc=$(echo "$summary" | sed -n 's/.*phase3_noise_acc=\([0-9.]*\)%.*/\1/p')
-            local phase3_remaining=$(echo "$summary" | sed -n 's/.*phase3_remaining=\([0-9]*\).*/\1/p')
-            local phase3_remaining_acc=$(echo "$summary" | sed -n 's/.*phase3_remaining_acc=\([0-9.]*\)%.*/\1/p')
+            local phase3_clean_non_core=$(echo "$summary" | sed -n 's/.*phase3_clean_non_core=\([0-9]*\).*/\1/p')
+            local phase3_clean_non_core_acc=$(echo "$summary" | sed -n 's/.*phase3_clean_non_core_acc=\([0-9.]*\)%.*/\1/p')
+            local phase3_noise_suppression=$(echo "$summary" | sed -n 's/.*phase3_noise_suppression=\([0-9]*\).*/\1/p')
+            local phase3_noise_suppression_acc=$(echo "$summary" | sed -n 's/.*phase3_noise_suppression_acc=\([0-9.]*\)%.*/\1/p')
+            
+            # 兼容旧版本：如果没有新字段，尝试从旧字段解析
+            if [ -z "$phase3_clean_non_core" ]; then
+                phase3_clean_non_core=$(echo "$summary" | sed -n 's/.*phase3_noise=\([0-9]*\).*/\1/p')
+                phase3_clean_non_core_acc=$(echo "$summary" | sed -n 's/.*phase3_noise_acc=\([0-9.]*\)%.*/\1/p')
+            fi
             
             # 格式化显示（数量 + 准确率百分比）
-            if [ -n "$phase3_core_clean" ] && [ -n "$phase3_noise" ] && [ -n "$phase3_remaining" ]; then
+            if [ -n "$phase3_core_clean" ]; then
                 local core_clean_str="${phase3_core_clean}"
-                local noise_str="${phase3_noise}"
-                local remaining_str="${phase3_remaining}"
+                local clean_non_core_str="0"
+                local noise_suppression_str="0"
                 
                 if [ -n "$phase3_core_clean_acc" ]; then
                     core_clean_str="${phase3_core_clean} (${phase3_core_clean_acc}%)"
                 fi
-                if [ -n "$phase3_noise_acc" ]; then
-                    noise_str="${phase3_noise} (${phase3_noise_acc}%)"
+                if [ -n "$phase3_clean_non_core" ] && [ "$phase3_clean_non_core" != "0" ]; then
+                    clean_non_core_str="${phase3_clean_non_core}"
+                    if [ -n "$phase3_clean_non_core_acc" ]; then
+                        clean_non_core_str="${phase3_clean_non_core} (${phase3_clean_non_core_acc}%)"
+                    fi
                 fi
-                if [ -n "$phase3_remaining_acc" ]; then
-                    remaining_str="${phase3_remaining} (${phase3_remaining_acc}%)"
+                if [ -n "$phase3_noise_suppression" ] && [ "$phase3_noise_suppression" != "0" ]; then
+                    noise_suppression_str="${phase3_noise_suppression}"
+                    if [ -n "$phase3_noise_suppression_acc" ]; then
+                        noise_suppression_str="${phase3_noise_suppression} (${phase3_noise_suppression_acc}%)"
+                    fi
                 fi
                 
                 printf "│  %-8s │ %-20s │ %-20s │ %-20s │\n" \
-                    "${noise_pct}%" "${core_clean_str}" "${noise_str}" "${remaining_str}"
+                    "${noise_pct}%" "${core_clean_str}" "${clean_non_core_str}" "${noise_suppression_str}"
             else
                 printf "│  %-8s │ %-20s │ %-20s │ %-20s │\n" \
                     "${noise_pct}%" "-" "-" "-"

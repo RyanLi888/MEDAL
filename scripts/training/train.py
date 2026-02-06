@@ -435,8 +435,8 @@ def stage2_label_correction(backbone, X_train, y_train_noisy, y_train_clean, con
             if batch_idx % 10 == 0 or batch_idx == total_batches:
                 progress = batch_idx / total_batches * 100
                 logger.info(f"│    Feature extraction progress: {batch_idx}/{total_batches} batches ({progress:.1f}%)")
-    
-    features = np.concatenate(features_list, axis=0)
+        
+        features = np.concatenate(features_list, axis=0)
     logger.info(f"│  ✓ Feature extraction complete: {features.shape}")
     
     # 保存特征
@@ -819,8 +819,16 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         logger.info(f"  - 输入类型: 原始序列 (3D)")
     logger.info("")
 
-    # 原始样本：权重>0.8 的做有标签监督训练（样本权重=2.0）；<=0.8 的进入无标签半监督训练
+    # 原始样本权重划分策略：
+    # - 权重 <= 0.3: 无标签无监督训练
+    # - 权重 > 0.3 且 <= 0.9: 低权重有标签训练
+    # - 权重 > 0.9: 高权重有标签训练
     sw = np.asarray(sample_weights, dtype=np.float32) if hasattr(sample_weights, '__len__') else None
+    unlabeled_thr = float(getattr(config, 'STAGE4_UNLABELED_WEIGHT_THRESHOLD', 0.3))
+    high_weight_thr = float(getattr(config, 'STAGE4_HIGH_WEIGHT_THRESHOLD', 0.9))
+    real_high_weight = float(getattr(config, 'STAGE4_REAL_HIGH_WEIGHT', 2.0))
+    real_low_weight = float(getattr(config, 'STAGE4_REAL_LOW_WEIGHT', 0.5))
+    # 兼容旧配置
     sup_thr = float(getattr(config, 'STAGE3_SUP_WEIGHT_THRESHOLD', 0.8))
     real_sup_weight = float(getattr(config, 'STAGE3_REAL_SUP_WEIGHT', 2.0))
     syn_weight = float(getattr(config, 'STAGE3_SYN_WEIGHT', 1.0))
@@ -836,9 +844,11 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     orig_sup_mask = None
     orig_unlab_mask = None
     if sw is not None and orig_n > 0:
-        orig_sup_mask = (sw[:orig_n] > sup_thr)
-        orig_unlab_mask = ~orig_sup_mask
-        logger.info(f"� Stage3 原始样本监督/无标签划分: supervised={int(orig_sup_mask.sum())}, unlabeled={int(orig_unlab_mask.sum())}, threshold={sup_thr}")
+        orig_unlab_mask = (sw[:orig_n] <= unlabeled_thr)
+        orig_high_weight_mask = (sw[:orig_n] > high_weight_thr)
+        orig_low_weight_mask = (~orig_unlab_mask) & (~orig_high_weight_mask)  # > 0.3 且 <= 0.9
+        orig_sup_mask = ~orig_unlab_mask  # 所有有标签的样本（包括高权重和低权重）
+        logger.info(f"� Stage4 原始样本权重划分: 无监督(≤{unlabeled_thr})={int(orig_unlab_mask.sum())}, 低权重({unlabeled_thr}<w≤{high_weight_thr})={int(orig_low_weight_mask.sum())}, 高权重(>{high_weight_thr})={int(orig_high_weight_mask.sum())}")
 
     # 混合训练模式检查
     if use_mixed_stream and not has_real_sequences:
@@ -987,17 +997,31 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     else:
         # 无 n_original 信息时：按权重阈值划分（保守）
         if sw is not None:
-            sup_mask = (sw_np > sup_thr)
-            unlab_mask = ~sup_mask
+            unlab_mask = (sw_np <= unlabeled_thr)
+            sup_mask = ~unlab_mask
 
-    # 监督样本权重：原始高权重=2.0，合成=1.0
+    # 监督样本权重：原始高权重=2.0，原始低权重=0.5，合成=1.0
     sw_sup = np.ones(int(sup_mask.sum()), dtype=np.float32) * syn_weight
     try:
-        if orig_n > 0 and orig_sup_mask is not None:
-            n_orig_sup = int(orig_sup_mask.sum())
-            if n_orig_sup > 0:
-                sw_sup[:n_orig_sup] = real_sup_weight
-    except Exception:
+        if orig_n > 0 and orig_sup_mask is not None and orig_high_weight_mask is not None and orig_low_weight_mask is not None:
+            # 获取原始样本在监督数据集中的位置
+            orig_sup_in_mask = orig_sup_mask[:orig_n]
+            orig_high_in_mask = orig_high_weight_mask[:orig_n]
+            orig_low_in_mask = orig_low_weight_mask[:orig_n]
+            
+            # 在sup_mask中找到原始样本的位置
+            sup_indices = np.where(sup_mask)[0]
+            orig_sup_positions = [i for i, idx in enumerate(sup_indices) if idx < orig_n]
+            
+            for pos in orig_sup_positions:
+                orig_idx = sup_indices[pos]
+                if orig_idx < orig_n:
+                    if orig_high_in_mask[orig_idx]:
+                        sw_sup[pos] = real_high_weight
+                    elif orig_low_in_mask[orig_idx]:
+                        sw_sup[pos] = real_low_weight
+    except Exception as e:
+        logger.warning(f"⚠️ 权重分配失败，使用默认权重: {e}")
         pass
 
     X_sup = X_np[sup_mask]
@@ -1055,7 +1079,14 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
 
         X_real_sup = X_train_real[:real_n][real_sup_sel]
         y_real_sup = y_real_all[real_sup_sel]
-        w_real_sup = np.ones(len(y_real_sup), dtype=np.float32) * real_sup_weight
+        # 根据权重分配：高权重=2.0，低权重=0.5
+        w_real_sup = np.ones(len(y_real_sup), dtype=np.float32) * real_low_weight
+        if orig_high_weight_mask is not None and orig_low_weight_mask is not None:
+            # 在real_sup_sel中选择的样本中，找出哪些是高权重，哪些是低权重
+            real_high_in_sup = orig_high_weight_mask[:real_n][real_sup_sel]
+            real_low_in_sup = orig_low_weight_mask[:real_n][real_sup_sel]
+            w_real_sup[real_high_in_sup] = real_high_weight
+            w_real_sup[real_low_in_sup] = real_low_weight
 
         real_dataset = TensorDataset(
             torch.FloatTensor(X_real_sup),

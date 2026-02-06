@@ -1,29 +1,29 @@
-# MEDAL-Lite Requirements
+# MEDAL-Lite requirements
 # Python 3.11+
 
-# Deep Learning Framework
-torch>=2.1.0
-torchvision>=0.16.0
-torchaudio>=2.1.0
+# Core deep learning
+torch>=2.1.0,<3
 
-# Scientific Computing
+# Numeric and scientific computing
 numpy>=1.23.0,<3
 scipy>=1.10.0,<2
 
-# Data Processing
+# Data analysis and ML
 pandas>=1.5.0,<3
 scikit-learn>=1.2.0,<2
+cleanlab>=2.6.0,<3
 
 # Visualization
 matplotlib>=3.7.0,<4
 seaborn>=0.12.0,<1
 
-# Network Traffic Analysis
-scapy>=2.5.0
-
-# Label noise correction
-cleanlab>=2.6.0
+# Traffic parsing
+scapy>=2.5.0,<3
 
 # Utilities
-tqdm>=4.65.0
+tqdm>=4.65.0,<5
+openpyxl>=3.1.0,<4
 
+# Optional (not required by current project imports):
+# torchvision>=0.16.0,<1
+# torchaudio>=2.1.0,<3

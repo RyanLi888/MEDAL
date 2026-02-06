@@ -122,6 +122,7 @@ class DualStreamLoss(nn.Module):
     
     Supports:
     - Focal Loss for both streams
+    - BCE Loss for both streams
     - Co-teaching: mutual sample selection between two streams
     - Dynamic sample selection rate
     """
@@ -129,9 +130,21 @@ class DualStreamLoss(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.ce_loss = nn.CrossEntropyLoss(reduction='none')
-        self.focal_alpha = float(getattr(config, 'FOCAL_ALPHA', 0.5))
-        self.focal_gamma = float(getattr(config, 'FOCAL_GAMMA', 2.0))
+        self.use_bce = bool(getattr(config, 'USE_BCE_LOSS', False))
+        
+        if self.use_bce:
+            # BCE Loss for binary classification
+            self.bce_pos_weight = float(getattr(config, 'BCE_POS_WEIGHT', 1.0))
+            self.bce_label_smoothing = float(getattr(config, 'BCE_LABEL_SMOOTHING', 0.0))
+            pos_weight_tensor = torch.tensor(self.bce_pos_weight) if self.bce_pos_weight != 1.0 else None
+            self.bce_criterion = nn.BCEWithLogitsLoss(reduction='none', pos_weight=pos_weight_tensor)
+            logger.info(f"✓ Using BCE Loss (pos_weight={self.bce_pos_weight}, label_smoothing={self.bce_label_smoothing})")
+        else:
+            # Focal Loss (default)
+            self.ce_loss = nn.CrossEntropyLoss(reduction='none')
+            self.focal_alpha = float(getattr(config, 'FOCAL_ALPHA', 0.5))
+            self.focal_gamma = float(getattr(config, 'FOCAL_GAMMA', 2.0))
+            logger.info(f"✓ Using Focal Loss (alpha={self.focal_alpha}, gamma={self.focal_gamma})")
         
         # Co-teaching parameters
         self.use_co_teaching = getattr(config, 'USE_CO_TEACHING', False)
@@ -158,6 +171,33 @@ class DualStreamLoss(nn.Module):
         alpha_t = self.focal_alpha * labels + (1 - self.focal_alpha) * (1 - labels)
         alpha_t = alpha_t.to(labels.device)
         return alpha_t * (1 - pt) ** self.focal_gamma * ce_loss
+    
+    def bce_loss(self, logits, labels):
+        """BCE Loss computation for binary classification"""
+        # logits shape: [B, 2], labels shape: [B] (0 or 1)
+        # Extract positive class logit (index 1 for malicious)
+        pos_logit = logits[:, 1]  # [B]
+        
+        # Convert labels to float for BCE
+        labels_float = labels.float()  # [B]
+        
+        # Apply label smoothing if enabled
+        if self.bce_label_smoothing > 0:
+            labels_float = labels_float * (1 - self.bce_label_smoothing) + 0.5 * self.bce_label_smoothing
+        
+        # Compute BCE loss using the criterion
+        # Ensure pos_weight is on the same device as logits
+        if self.bce_criterion.pos_weight is not None:
+            self.bce_criterion.pos_weight = self.bce_criterion.pos_weight.to(logits.device)
+        bce = self.bce_criterion(pos_logit, labels_float)
+        return bce
+    
+    def compute_loss(self, logits, labels):
+        """Compute loss based on configuration (BCE or Focal)"""
+        if self.use_bce:
+            return self.bce_loss(logits, labels)
+        else:
+            return self.focal_loss(logits, labels)
 
     def get_select_rate(self, epoch, total_epochs):
         """
@@ -208,8 +248,8 @@ class DualStreamLoss(nn.Module):
             sample_weights = sample_weights.to(device=z.device, dtype=torch.float32)
 
         # Compute per-sample losses
-        loss_a_per_sample = self.focal_loss(logits_a, labels)  # (B,)
-        loss_b_per_sample = self.focal_loss(logits_b, labels)  # (B,)
+        loss_a_per_sample = self.compute_loss(logits_a, labels)  # (B,)
+        loss_b_per_sample = self.compute_loss(logits_b, labels)  # (B,)
         
         # Co-teaching: mutual sample selection
         if self.use_co_teaching and epoch >= self.co_teaching_warmup:

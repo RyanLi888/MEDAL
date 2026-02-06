@@ -618,8 +618,17 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
             row['anchor_KNN一致性'] = anchor_cons
             row['anchor_KNN是否支持当前'] = '是' if anchor_vote == corrected_label else '否'
         
-        # 阶段3权重类型（基于最终权重判断）
-        weight_type = '核心干净样本' if correction_weight == 1.0 else ('噪声样本' if correction_weight == 0.5 else '其他')
+        # 阶段3权重类型（基于最终权重判断 - 支持精细化三层分区）
+        if correction_weight == 1.0:
+            weight_type = '核心数据分区'
+        elif correction_weight == 0.5:
+            weight_type = '干净非核心数据分区'
+        elif correction_weight == 0.1:
+            weight_type = '噪声抑制区'
+        elif correction_weight == 0.6:
+            weight_type = '噪声样本'  # 兼容旧版本（如果存在0.6权重）
+        else:
+            weight_type = '其他'
         
         # 最终决策详细信息
         row.update({
@@ -632,7 +641,7 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
             '样本权值': correction_weight,
             '阶段3权重类型': weight_type,
             'Tier分级': tier,
-            'Tier阶段': 'Dropped' if action == 2 else ('Phase 3' if correction_weight in (1.0, 0.5) else ('Phase 2' if action in (1, 3) else 'Phase 1')),
+            'Tier阶段': 'Dropped' if action == 2 else ('Phase 3' if correction_weight in (1.0, 0.5, 0.6, 0.1) else ('Phase 2' if action in (1, 3) else 'Phase 1')),
             '决策理由': decision_reason,
             
             # 矫正结果评估
@@ -992,25 +1001,48 @@ def generate_sample_analysis_document(results, y_true, noise_mask, save_path, lo
                 })
                 # 阶段3统计
                 if '阶段3权重类型' in df_reordered.columns:
-                    phase3_core_clean = len(df_reordered[df_reordered['阶段3权重类型'] == '核心干净样本'])
-                    phase3_noise = len(df_reordered[df_reordered['阶段3权重类型'] == '噪声样本'])
-                    phase3_core_clean_correct = len(df_reordered[(df_reordered['阶段3权重类型'] == '核心干净样本') & (df_reordered['矫正是否正确'] == '正确')])
+                    # 支持精细化三层分区统计
+                    phase3_core_clean = len(df_reordered[df_reordered['阶段3权重类型'] == '核心数据分区'])
+                    phase3_clean_non_core = len(df_reordered[df_reordered['阶段3权重类型'] == '干净非核心数据分区'])
+                    phase3_noise_suppression = len(df_reordered[df_reordered['阶段3权重类型'] == '噪声抑制区'])
+                    phase3_noise = len(df_reordered[df_reordered['阶段3权重类型'] == '噪声样本'])  # 兼容旧版本
+                    
+                    phase3_core_clean_correct = len(df_reordered[(df_reordered['阶段3权重类型'] == '核心数据分区') & (df_reordered['矫正是否正确'] == '正确')])
+                    phase3_clean_non_core_correct = len(df_reordered[(df_reordered['阶段3权重类型'] == '干净非核心数据分区') & (df_reordered['矫正是否正确'] == '正确')])
+                    phase3_noise_suppression_correct = len(df_reordered[(df_reordered['阶段3权重类型'] == '噪声抑制区') & (df_reordered['矫正是否正确'] == '正确')])
                     phase3_noise_correct = len(df_reordered[(df_reordered['阶段3权重类型'] == '噪声样本') & (df_reordered['矫正是否正确'] == '正确')])
                     phase3_core_clean_acc = (phase3_core_clean_correct / phase3_core_clean * 100) if phase3_core_clean > 0 else 0
+                    phase3_clean_non_core_acc = (phase3_clean_non_core_correct / phase3_clean_non_core * 100) if phase3_clean_non_core > 0 else 0
+                    phase3_noise_suppression_acc = (phase3_noise_suppression_correct / phase3_noise_suppression * 100) if phase3_noise_suppression > 0 else 0
                     phase3_noise_acc = (phase3_noise_correct / phase3_noise * 100) if phase3_noise > 0 else 0
                     
                     all_samples_stats.append({
-                        '统计项': '阶段3核心干净样本',
+                        '统计项': '阶段3核心数据分区',
                         '数值': f"{phase3_core_clean} ({phase3_core_clean_acc:.2f}%)",
                         '阶段1': '',
                         '阶段2': ''
                     })
-                    all_samples_stats.append({
-                        '统计项': '阶段3噪声样本',
-                        '数值': f"{phase3_noise} ({phase3_noise_acc:.2f}%)",
-                        '阶段1': '',
-                        '阶段2': ''
-                    })
+                    if phase3_clean_non_core > 0:
+                        all_samples_stats.append({
+                            '统计项': '阶段3干净非核心数据分区',
+                            '数值': f"{phase3_clean_non_core} ({phase3_clean_non_core_acc:.2f}%)",
+                            '阶段1': '',
+                            '阶段2': ''
+                        })
+                    if phase3_noise_suppression > 0:
+                        all_samples_stats.append({
+                            '统计项': '阶段3噪声抑制区',
+                            '数值': f"{phase3_noise_suppression} ({phase3_noise_suppression_acc:.2f}%)",
+                            '阶段1': '',
+                            '阶段2': ''
+                        })
+                    if phase3_noise > 0:  # 兼容旧版本（低噪声方案）
+                        all_samples_stats.append({
+                            '统计项': '阶段3噪声样本',
+                            '数值': f"{phase3_noise} ({phase3_noise_acc:.2f}%)",
+                            '阶段1': '',
+                            '阶段2': ''
+                        })
                 all_samples_stats.append({
                     '统计项': '阶段1提升',
                     '数值': f"{phase1_accuracy - original_accuracy:+.2f}%",
@@ -2098,39 +2130,55 @@ def main(args):
     # 计算阶段3统计信息
     correction_weight = results['correction_weight']
     clean_labels = results['clean_labels']
-    phase3_core_clean_count = int((correction_weight == 1.0).sum())  # 核心干净样本（权重1.0）
-    phase3_noise_count = int((correction_weight == 0.5).sum())  # 噪声样本（权重0.5）
-    phase3_remaining_count = int((action_mask == 2).sum())  # 丢弃的样本（剩余数据）
+    # 计算阶段3各类样本的数量（支持精细化三层分区）
+    phase3_core_clean_count = int((correction_weight == 1.0).sum())  # 核心数据分区（权重1.0）
+    phase3_clean_non_core_count = int((correction_weight == 0.5).sum())  # 干净非核心数据分区（权重0.5）
+    phase3_noise_suppression_count = int((correction_weight == 0.1).sum())  # 噪声抑制区（权重0.1）
+    phase3_noise_count = int((correction_weight == 0.6).sum())  # 兼容旧版本（权重0.6，如果存在）
+    phase3_remaining_count = 0  # 不再统计丢弃数据（已删除）
     
     # 计算阶段3各类样本的准确率（干净程度）
     phase3_core_clean_mask = (correction_weight == 1.0)
-    phase3_noise_mask = (correction_weight == 0.5)
-    phase3_remaining_mask = (action_mask == 2)
+    phase3_clean_non_core_mask = (correction_weight == 0.5)
+    phase3_noise_suppression_mask = (correction_weight == 0.1)
+    phase3_noise_mask = (correction_weight == 0.6)  # 兼容旧版本
+    phase3_remaining_mask = np.zeros_like(action_mask, dtype=bool)  # 不再统计丢弃数据
     
     phase3_core_clean_accuracy = 0.0
+    phase3_clean_non_core_accuracy = 0.0
+    phase3_noise_suppression_accuracy = 0.0
     phase3_noise_accuracy = 0.0
     phase3_remaining_accuracy = 0.0
     
     if phase3_core_clean_count > 0:
         phase3_core_clean_accuracy = (clean_labels[phase3_core_clean_mask] == y_train_clean[phase3_core_clean_mask]).mean() * 100.0
+    if phase3_clean_non_core_count > 0:
+        phase3_clean_non_core_accuracy = (clean_labels[phase3_clean_non_core_mask] == y_train_clean[phase3_clean_non_core_mask]).mean() * 100.0
+    if phase3_noise_suppression_count > 0:
+        phase3_noise_suppression_accuracy = (clean_labels[phase3_noise_suppression_mask] == y_train_clean[phase3_noise_suppression_mask]).mean() * 100.0
     if phase3_noise_count > 0:
         phase3_noise_accuracy = (clean_labels[phase3_noise_mask] == y_train_clean[phase3_noise_mask]).mean() * 100.0
     if phase3_remaining_count > 0:
         phase3_remaining_accuracy = (clean_labels[phase3_remaining_mask] == y_train_clean[phase3_remaining_mask]).mean() * 100.0
     
     logger.info("📊 阶段3统计:")
-    logger.info(f"   核心干净样本 (权重1.0): {phase3_core_clean_count} ({100*phase3_core_clean_count/n_samples:.1f}%) | 准确率: {phase3_core_clean_accuracy:.2f}%")
-    logger.info(f"   噪声样本 (权重0.5): {phase3_noise_count} ({100*phase3_noise_count/n_samples:.1f}%) | 准确率: {phase3_noise_accuracy:.2f}%")
-    logger.info(f"   剩余数据 (丢弃): {phase3_remaining_count} ({100*phase3_remaining_count/n_samples:.1f}%) | 准确率: {phase3_remaining_accuracy:.2f}%")
+    logger.info(f"   核心数据分区 (权重1.0): {phase3_core_clean_count} ({100*phase3_core_clean_count/n_samples:.1f}%) | 准确率: {phase3_core_clean_accuracy:.2f}%")
+    if phase3_clean_non_core_count > 0:
+        logger.info(f"   干净非核心数据分区 (权重0.5): {phase3_clean_non_core_count} ({100*phase3_clean_non_core_count/n_samples:.1f}%) | 准确率: {phase3_clean_non_core_accuracy:.2f}%")
+    if phase3_noise_suppression_count > 0:
+        logger.info(f"   噪声抑制区 (权重0.1): {phase3_noise_suppression_count} ({100*phase3_noise_suppression_count/n_samples:.1f}%) | 准确率: {phase3_noise_suppression_accuracy:.2f}%")
+    if phase3_noise_count > 0:  # 兼容旧版本（权重0.6）
+        logger.info(f"   噪声样本 (权重0.6): {phase3_noise_count} ({100*phase3_noise_count/n_samples:.1f}%) | 准确率: {phase3_noise_accuracy:.2f}%")
     logger.info("")
     
-    # 输出可解析的摘要行（供Shell脚本提取）
+    # 输出可解析的摘要行（供Shell脚本提取 - 支持精细化三层分区）
     logger.info(f"SUMMARY: noise_rate={noise_pct}% | original_purity={original_purity*100:.2f}% | "
                 f"final_purity={final_purity*100:.2f}% | improvement={improvement*100:.2f}% | "
                 f"flip_count={(action_mask==1).sum()} | keep_count={(action_mask==0).sum()} | "
                 f"phase3_core_clean={phase3_core_clean_count} | phase3_core_clean_acc={phase3_core_clean_accuracy:.2f}% | "
-                f"phase3_noise={phase3_noise_count} | phase3_noise_acc={phase3_noise_accuracy:.2f}% | "
-                f"phase3_remaining={phase3_remaining_count} | phase3_remaining_acc={phase3_remaining_accuracy:.2f}%")
+                f"phase3_clean_non_core={phase3_clean_non_core_count} | phase3_clean_non_core_acc={phase3_clean_non_core_accuracy:.2f}% | "
+                f"phase3_noise_suppression={phase3_noise_suppression_count} | phase3_noise_suppression_acc={phase3_noise_suppression_accuracy:.2f}% | "
+                f"phase3_noise={phase3_noise_count} | phase3_noise_acc={phase3_noise_accuracy:.2f}%")
     logger.info("")
     
     # 清理root logger的handlers

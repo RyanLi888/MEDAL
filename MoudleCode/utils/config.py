@@ -426,9 +426,9 @@ class Config:
     
     # 3.3 早停机制（智能训练终止）
     FINETUNE_EARLY_STOPPING = True         # 启用早停
-    FINETUNE_ES_WARMUP_EPOCHS = 100         # 预热轮数（前N轮不触发早停）- 增加预热
+    FINETUNE_ES_WARMUP_EPOCHS = 150         # 预热轮数（前N轮不触发早停）- 增加预热
     FINETUNE_ES_PATIENCE = 30               # 耐心值（连续N轮无改善则停止）- 增加耐心
-    FINETUNE_ES_MIN_DELTA = 0.0005           # F1改善阈值（需要明显改善）- 提高阈值
+    FINETUNE_ES_MIN_DELTA = 0.001         # F1改善阈值（需要明显改善）- 提高阈值
     FINETUNE_ES_METRIC = 'f1_optimal'       # 监控指标
     FINETUNE_ES_ALLOW_TRAIN_METRIC = True   # 允许使用训练集指标
     

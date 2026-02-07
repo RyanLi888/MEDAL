@@ -896,7 +896,10 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     classifier = MEDAL_Classifier(backbone, config).to(config.DEVICE)
     criterion = DualStreamLoss(config)
     logger.info("✓ 双流分类器创建完成")
-    logger.info(f"🔧 FocalLoss: alpha={config.FOCAL_ALPHA}, gamma={config.FOCAL_GAMMA}")
+    if getattr(config, 'USE_BCE_LOSS', False):
+        logger.info(f"🔧 BCE Loss: pos_weight={config.BCE_POS_WEIGHT}, label_smoothing={config.BCE_LABEL_SMOOTHING}")
+    else:
+        logger.info(f"🔧 FocalLoss: alpha={config.FOCAL_ALPHA}, gamma={config.FOCAL_GAMMA}")
 
     # 骨干网络微调策略
     backbone_param_candidates = []

@@ -185,7 +185,14 @@ def test_model(classifier, X_test, y_test, config, logger, save_prefix="test"):
             
             # 直接前向获得 logits 和特征，不在这里做阈值判决
             logits, z = classifier(X_batch, return_features=True, return_separate=False)
-            probs = torch.softmax(logits, dim=1)
+            
+            # Apply temperature scaling if enabled (makes predictions "softer")
+            temperature = getattr(config, 'TEMPERATURE_SCALING', 1.0)
+            if temperature != 1.0:
+                scaled_logits = logits / temperature
+                probs = torch.softmax(scaled_logits, dim=1)
+            else:
+                probs = torch.softmax(logits, dim=1)
             
             all_probs.append(probs.cpu().numpy())
             all_labels.append(y_batch.cpu().numpy())

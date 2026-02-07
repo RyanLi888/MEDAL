@@ -136,9 +136,13 @@ class DualStreamLoss(nn.Module):
             # BCE Loss for binary classification
             self.bce_pos_weight = float(getattr(config, 'BCE_POS_WEIGHT', 1.0))
             self.bce_label_smoothing = float(getattr(config, 'BCE_LABEL_SMOOTHING', 0.0))
+            self.bce_label_smoothing_mode = getattr(config, 'BCE_LABEL_SMOOTHING_MODE', 'symmetric')
             pos_weight_tensor = torch.tensor(self.bce_pos_weight) if self.bce_pos_weight != 1.0 else None
             self.bce_criterion = nn.BCEWithLogitsLoss(reduction='none', pos_weight=pos_weight_tensor)
-            logger.info(f"✓ Using BCE Loss (pos_weight={self.bce_pos_weight}, label_smoothing={self.bce_label_smoothing})")
+            if self.bce_label_smoothing > 0:
+                logger.info(f"✓ Using BCE Loss (pos_weight={self.bce_pos_weight}, label_smoothing={self.bce_label_smoothing}, mode={self.bce_label_smoothing_mode})")
+            else:
+                logger.info(f"✓ Using BCE Loss (pos_weight={self.bce_pos_weight}, label_smoothing={self.bce_label_smoothing})")
         else:
             # Focal Loss (default)
             self.ce_loss = nn.CrossEntropyLoss(reduction='none')
@@ -182,8 +186,29 @@ class DualStreamLoss(nn.Module):
         labels_float = labels.float()  # [B]
         
         # Apply label smoothing if enabled
+        # Two smoothing strategies:
+        # 1. SYMMETRIC (default): Smooth around 0.5 threshold
+        #    - Label 0 (benign) → 0.5 - ε (e.g., 0.5 - 0.1 = 0.4) [低于0.5，负类]
+        #    - Label 1 (malicious) → 0.5 + ε (e.g., 0.5 + 0.1 = 0.6) [高于0.5，正类]
+        #    This keeps labels on correct side of 0.5 threshold
+        # 2. TRADITIONAL: Smooth towards uniform distribution
+        #    - Label 0 → ε/2 (e.g., 0.05)
+        #    - Label 1 → 1 - ε/2 (e.g., 0.95)
         if self.bce_label_smoothing > 0:
-            labels_float = labels_float * (1 - self.bce_label_smoothing) + 0.5 * self.bce_label_smoothing
+            if self.bce_label_smoothing_mode == 'symmetric':
+                # Symmetric smoothing around 0.5: label 0 → 0.5 - ε, label 1 → 0.5 + ε
+                # This ensures labels stay on correct side of 0.5 threshold
+                # Formula: labels_float = 0.5 + (2*labels_float - 1) * smoothing
+                # For label 0: 0.5 + (2*0 - 1) * ε = 0.5 - ε [< 0.5, 负类]
+                # For label 1: 0.5 + (2*1 - 1) * ε = 0.5 + ε [> 0.5, 正类]
+                labels_float = 0.5 + (2.0 * labels_float - 1.0) * self.bce_label_smoothing
+            elif self.bce_label_smoothing_mode == 'traditional':
+                # Traditional label smoothing: mix with uniform distribution
+                # Label 0 → (1-ε)*0 + ε*0.5 = ε*0.5 = ε/2
+                # Label 1 → (1-ε)*1 + ε*0.5 = 1 - ε + ε*0.5 = 1 - ε/2
+                labels_float = labels_float * (1.0 - self.bce_label_smoothing) + 0.5 * self.bce_label_smoothing
+            else:
+                raise ValueError(f"Unknown smoothing mode: {self.bce_label_smoothing_mode}. Use 'symmetric' or 'traditional'")
         
         # Compute BCE loss using the criterion
         # Ensure pos_weight is on the same device as logits
@@ -373,7 +398,7 @@ class MEDAL_Classifier(nn.Module):
             else:
                 return logits
     
-    def predict(self, x, threshold=None):
+    def predict(self, x, threshold=None, temperature=None):
         """
         Predict labels and probabilities
         
@@ -381,6 +406,10 @@ class MEDAL_Classifier(nn.Module):
             x: (B, L, D) - input sequences
             threshold: float - decision threshold for malicious class (default: 0.5)
                        If None, uses config.MALICIOUS_THRESHOLD or 0.5
+            temperature: float - temperature scaling factor for softmax
+                        If None, uses config.TEMPERATURE_SCALING or 1.0
+                        > 1.0 makes predictions "softer" (more intermediate probabilities)
+                        < 1.0 makes predictions "harder" (more extreme probabilities)
             
         Returns:
             predictions: (B,) - predicted labels
@@ -389,7 +418,19 @@ class MEDAL_Classifier(nn.Module):
         self.eval()
         with torch.no_grad():
             logits = self(x, return_separate=False)
-            probs = F.softmax(logits, dim=1)
+            
+            # Apply temperature scaling if enabled
+            if temperature is None:
+                temperature = getattr(self.config, 'TEMPERATURE_SCALING', 1.0)
+            
+            if temperature != 1.0:
+                # Temperature scaling: divide logits by temperature before softmax
+                # Higher temperature (>1.0) → softer probabilities (more spread out)
+                # Lower temperature (<1.0) → harder probabilities (more confident)
+                scaled_logits = logits / temperature
+                probs = F.softmax(scaled_logits, dim=1)
+            else:
+                probs = F.softmax(logits, dim=1)
             
             # Use threshold for malicious class if provided
             if threshold is None:

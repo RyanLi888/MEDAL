@@ -172,7 +172,7 @@ class Config:
     # ============================================================
     
     # 1.1 基础训练参数
-    PRETRAIN_EPOCHS = 500                   # 最大训练轮数
+    PRETRAIN_EPOCHS = 1000                   # 最大训练轮数
     PRETRAIN_BATCH_SIZE = 64                # 批次大小（适配10.75GB显存）
     PRETRAIN_GRADIENT_ACCUMULATION_STEPS = 2  # 梯度累积（有效批次=64*2=128）
     PRETRAIN_LR = 1e-3                      # 学习率
@@ -184,7 +184,7 @@ class Config:
     PRETRAIN_EARLY_STOPPING = True          # 启用早停
     PRETRAIN_ES_WARMUP_EPOCHS = 50          # 预热轮数（前50轮不触发早停）
     PRETRAIN_ES_PATIENCE = 50               # 耐心值（30轮不改善则停止）
-    PRETRAIN_ES_MIN_DELTA = 0.005           # 改善阈值（0.5%）
+    PRETRAIN_ES_MIN_DELTA = 0.001           # 改善阈值（0.5%）
     
     # 1.3 SimMTM 参数（掩码重建任务）
     SIMMTM_MASK_RATE = 0.5                  # 掩码率（50%）

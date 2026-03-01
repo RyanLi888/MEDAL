@@ -111,8 +111,8 @@ def correct_labels_cl_aum(
     logger.info(f"  KNN 纯度阈值: {knn_purity_threshold}")
     if phase1_aggressive:
         logger.info(f"  Phase1 模式: Aggressive (优化版)")
-        logger.info(f"     恶意: AUM<{phase1_aggressive_malicious_aum_threshold} 且 ((KNN反对且KNN一致性>{phase1_aggressive_malicious_knn_cons_threshold}) 或 CL<{phase1_aggressive_malicious_cl_threshold})")
-        logger.info(f"     正常: AUM<{phase1_aggressive_benign_aum_threshold} 且 KNN反对 且 KNN一致性>{phase1_aggressive_benign_knn_threshold} (或CL<0.4且KNN反对)")
+        logger.info(f"    恶意: AUM<{phase1_aggressive_malicious_aum_threshold} 且 ((KNN反对且KNN一致性>{phase1_aggressive_malicious_knn_cons_threshold}) 或 CL<{phase1_aggressive_malicious_cl_threshold})")
+        logger.info(f"    正常: AUM<{phase1_aggressive_benign_aum_threshold} 且 KNN反对 且 KNN一致性>{phase1_aggressive_benign_knn_threshold} (或CL<0.4且KNN反对)")
     else:
         logger.info(f"  Phase1 模式: Conservative")
         logger.info(f"    恶意样本: AUM<{phase1_malicious_aum_threshold} 且KNN反对，强KNN>{phase1_malicious_knn_threshold} 或 CL<{phase1_malicious_cl_low}")

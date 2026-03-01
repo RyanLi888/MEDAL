@@ -99,7 +99,7 @@ class Config:
     # ============================================================
     # 数据集基础配置
     # ============================================================
-    LABEL_NOISE_RATE = 0.40  # 标签噪声率（30%）
+    LABEL_NOISE_RATE = 0.30  # 标签噪声率（30%）
     LABEL_BENIGN = 0         # 正常流量标签
     LABEL_MALICIOUS = 1      # 恶意流量标签
     
@@ -353,7 +353,7 @@ class Config:
     STAGE2_AUGMENT_MIN_WEIGHT = 0.8
     
     # TabDDPM 训练参数（优化版 v2.5 - 恢复旧参数以提高生成质量）
-    DDPM_EPOCHS = 1500                      # 训练轮数（保持1500）
+    DDPM_EPOCHS = 800                      # 训练轮数（保持1500）
     DDPM_LR = 5e-4                          # 初始学习率（恢复旧值：3e-4→5e-4，加快收敛）
     DDPM_LR_SCHEDULER = 'cosine'            # 学习率调度器
     DDPM_MIN_LR = 1e-5                      # 最小学习率（恢复旧值：5e-6→1e-5）
@@ -428,7 +428,7 @@ class Config:
     FINETUNE_EARLY_STOPPING = True         # 启用早停
     FINETUNE_ES_WARMUP_EPOCHS = 150         # 预热轮数（前N轮不触发早停）- 增加预热
     FINETUNE_ES_PATIENCE = 50               # 耐心值（连续N轮无改善则停止）- 增加耐心
-    FINETUNE_ES_MIN_DELTA = 0.001         # F1改善阈值（需要明显改善）- 提高阈值
+    FINETUNE_ES_MIN_DELTA = 0.002         # F1改善阈值（需要明显改善）- 提高阈值
     FINETUNE_ES_METRIC = 'f1_optimal'       # 监控指标
     FINETUNE_ES_ALLOW_TRAIN_METRIC = True   # 允许使用训练集指标
     

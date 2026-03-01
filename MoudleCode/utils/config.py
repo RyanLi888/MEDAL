@@ -99,7 +99,7 @@ class Config:
     # ============================================================
     # 数据集基础配置
     # ============================================================
-    LABEL_NOISE_RATE = 0.30  # 标签噪声率（30%）
+    LABEL_NOISE_RATE = 0.40  # 标签噪声率（30%）
     LABEL_BENIGN = 0         # 正常流量标签
     LABEL_MALICIOUS = 1      # 恶意流量标签
     
@@ -353,7 +353,7 @@ class Config:
     STAGE2_AUGMENT_MIN_WEIGHT = 0.8
     
     # TabDDPM 训练参数（优化版 v2.5 - 恢复旧参数以提高生成质量）
-    DDPM_EPOCHS = 800                      # 训练轮数（保持1500）
+    DDPM_EPOCHS =1500                      # 训练轮数（保持1500）
     DDPM_LR = 5e-4                          # 初始学习率（恢复旧值：3e-4→5e-4，加快收敛）
     DDPM_LR_SCHEDULER = 'cosine'            # 学习率调度器
     DDPM_MIN_LR = 1e-5                      # 最小学习率（恢复旧值：5e-6→1e-5）
@@ -364,7 +364,7 @@ class Config:
     # TabDDPM 早停机制（v2.5：减少平滑窗口，更敏感）
     DDPM_EARLY_STOPPING = True              # 启用早停
     DDPM_ES_WARMUP_EPOCHS = 150             # 预热轮数（保持150）
-    DDPM_ES_PATIENCE = 150                  # 耐心值（保持150）
+    DDPM_ES_PATIENCE = 120                  # 耐心值（保持150）
     DDPM_ES_MIN_DELTA = 0.0003              # 改善阈值（保持0.0003）
     DDPM_ES_SMOOTH_WINDOW = 3               # 平滑窗口（优化：5→3，更敏感）
     

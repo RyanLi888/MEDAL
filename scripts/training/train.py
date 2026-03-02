@@ -318,7 +318,7 @@ def stage1_pretrain_backbone(backbone, train_loader, config, logger):
 
 def stage2_label_correction(backbone, X_train, y_train_noisy, y_train_clean, config, logger, stage2_mode='standard', backbone_path=None):
     """
-    Stage 2: 标签矫正（完全复现标签矫正分析流程）
+    Stage 2: 标签矫正（可独立重跑，也可复用主流程状态）
     
     Args:
         backbone: 预训练的骨干网络（可选，如果为None则重新加载）
@@ -396,21 +396,24 @@ def stage2_label_correction(backbone, X_train, y_train_noisy, y_train_clean, con
     # ========================
     logger.info("┌─ Step 3: 提取特征")
     
-    # 确定backbone路径（完全复现标签矫正分析流程，总是重新加载backbone以确保状态一致）
+    # 确定backbone路径（当未传入backbone时用于加载）
     if backbone_path is None:
         backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
     
-    # 为了确保指纹一致，总是重新加载backbone（即使传入了backbone）
-    # 这样可以确保backbone的状态与标签矫正分析完全一致
-    logger.info(f"│  加载预训练backbone: {os.path.basename(backbone_path)}")
-    from MoudleCode.utils.model_loader import load_backbone_safely
-    backbone = load_backbone_safely(
-        backbone_path=backbone_path,
-        config=config,
-        device=config.DEVICE,
-        logger=logger
-    )
-    logger.info("│  ✓ Backbone加载完成")
+    if backbone is None:
+        logger.info(f"│  加载预训练backbone: {os.path.basename(backbone_path)}")
+        from MoudleCode.utils.model_loader import load_backbone_safely
+        backbone = load_backbone_safely(
+            backbone_path=backbone_path,
+            config=config,
+            device=config.DEVICE,
+            logger=logger
+        )
+        logger.info("│  ✓ Backbone加载完成")
+    else:
+        logger.info("│  复用主流程中的backbone实例")
+        backbone = backbone.to(config.DEVICE)
+        logger.info("│  ✓ Backbone复用完成")
     
     # 提取特征（使用与标签矫正分析相同的函数逻辑）
     logger.info("│  Extracting features using backbone...")
@@ -1664,9 +1667,9 @@ def main(args):
     if start_stage <= 2 and end_stage >= 2:
         logger.info(f"🔧 RNG指纹(Stage2调用前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         
-        # Stage 2会完全复现标签矫正分析的流程，包括重新加载数据和注入噪声
-        # 因此传递None，让Stage 2自己重新加载以确保流程一致
+        # Stage 2 默认独立重跑（可通过 config.STAGE2_FORCE_INDEPENDENT 控制）
         stage2_mode = getattr(args, 'stage2_mode', 'standard')
+        stage2_force_independent = bool(getattr(config, 'STAGE2_FORCE_INDEPENDENT', True))
         
         # 确定backbone路径
         backbone_path = None
@@ -1675,12 +1678,24 @@ def main(args):
         else:
             backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
         
-        # Stage 2完全独立运行，不依赖主流程传入的任何状态，确保与标签矫正分析完全一致
+        if stage2_force_independent:
+            logger.info("🔁 Stage2执行策略: 独立重跑（重载数据/噪声/backbone）")
+            stage2_backbone = None
+            stage2_x_train = None
+            stage2_y_train_noisy = None
+            stage2_y_train_clean = None
+        else:
+            logger.info("⚡ Stage2执行策略: 复用主流程已加载状态")
+            stage2_backbone = backbone
+            stage2_x_train = X_train
+            stage2_y_train_noisy = y_train_noisy
+            stage2_y_train_clean = y_train_clean
+
         features, y_corrected, correction_weight, correction_stats, n_original = stage2_label_correction(
-            backbone=None,  # 传递None，让Stage 2重新加载以确保状态一致
-            X_train=None,  # 传递None，让Stage 2重新加载以确保流程一致
-            y_train_noisy=None,  # 传递None，让Stage 2重新注入噪声以确保流程一致
-            y_train_clean=None,  # 传递None，让Stage 2重新加载以确保流程一致
+            backbone=stage2_backbone,
+            X_train=stage2_x_train,
+            y_train_noisy=stage2_y_train_noisy,
+            y_train_clean=stage2_y_train_clean,
             config=config,
             logger=logger,
             stage2_mode=stage2_mode,

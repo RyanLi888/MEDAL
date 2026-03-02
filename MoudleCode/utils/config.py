@@ -1,12 +1,18 @@
 """
 MEDAL-Lite 统一配置文件 (重构版 v2.6)
 =================================
-按照训练流程 Stage 1/2/3 组织，使用最优训练结果的配置
+按核心训练流程组织，使用最优训练结果的配置
 
-训练流程：
+训练流程（逻辑三阶段）：
 - Stage 1: 自监督预训练 (SimMTM + InfoNCE)
 - Stage 2: 标签矫正 + 数据增强 (Hybrid Court + TabDDPM)
 - Stage 3: 分类器微调 (Dual-Stream MLP + Mixed Training)
+
+脚本实现（train.py）为四阶段编排：
+- Stage 1: 预训练
+- Stage 2: 标签矫正
+- Stage 3: 数据增强
+- Stage 4: 分类器微调
 
 最优配置来源（ablation_data_augmentation_20260110_214253）：
 - F1 Score (pos=1): 0.9026
@@ -99,7 +105,7 @@ class Config:
     # ============================================================
     # 数据集基础配置
     # ============================================================
-    LABEL_NOISE_RATE = 0.40  # 标签噪声率（30%）
+    LABEL_NOISE_RATE = 0.20  # 标签噪声率（30%）
     LABEL_BENIGN = 0         # 正常流量标签
     LABEL_MALICIOUS = 1      # 恶意流量标签
     
@@ -245,7 +251,11 @@ class Config:
     # ============================================================
     # STAGE 2: 标签矫正 + 数据增强 - 最优配置
     # ============================================================
-    
+    # train.py 在进入 Stage 2 时的执行策略：
+    # - True: Stage 2 独立重跑（重新加载训练集/噪声/backbone），与分析脚本严格对齐
+    # - False: 优先复用主流程已加载的数据与骨干，减少重复 I/O
+    STAGE2_FORCE_INDEPENDENT = True
+
     # 2.1 标签矫正策略（两阶段CL+KNN，去除MADE）
     # KNN一致性等级阈值（用于判断KNN一致性等级：low < medium < high）
     KNN_CONSISTENCY_MEDIUM_THRESHOLD = 0.5    # Medium等级阈值（>=此值为medium或high）

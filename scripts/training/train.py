@@ -59,6 +59,11 @@ except ImportError:
 from MoudleCode.label_correction.hybrid_court import HybridCourt
 from MoudleCode.data_augmentation.tabddpm import TabDDPM
 from MoudleCode.classification.dual_stream import MEDAL_Classifier, DualStreamLoss
+from scripts.training.common import (
+    add_finetune_backbone_cli_args,
+    apply_finetune_backbone_override,
+    load_stage4_real_sequences,
+)
 
 
 def _rng_fingerprint_short() -> str:
@@ -1806,14 +1811,7 @@ def main(args):
         else:
             actual_backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
         
-        X_train_real = None
-        try:
-            real_kept_path = os.path.join(config.DATA_AUGMENTATION_DIR, "models", "real_kept_data.npz")
-            if os.path.exists(real_kept_path):
-                real_pack = np.load(real_kept_path)
-                X_train_real = real_pack.get('X_real', None)
-        except Exception:
-            X_train_real = None
+        X_train_real, _ = load_stage4_real_sequences(config.DATA_AUGMENTATION_DIR, logger=logger)
 
         classifier, finetune_history, optimal_threshold = stage4_finetune_classifier(
             backbone, Z_augmented, y_augmented, sample_weights, config, logger,
@@ -1853,15 +1851,15 @@ if __name__ == "__main__":
     parser.add_argument("--backbone_path", type=str, default=None, help="骨干网络路径")
     parser.add_argument("--retrain_backbone", action="store_true", help="重新训练骨干网络")
     parser.add_argument("--stage2_mode", type=str, default="standard", choices=["standard", "clean_augment_only"], help="Stage 2模式")
-    finetune_group = parser.add_mutually_exclusive_group()
-    finetune_group.add_argument("--finetune_backbone", dest="finetune_backbone", action="store_true", help="启用骨干微调（需原始序列参与）")
-    finetune_group.add_argument("--no_finetune_backbone", dest="finetune_backbone", action="store_false", help="禁用骨干微调")
-    parser.set_defaults(finetune_backbone=None)
+    add_finetune_backbone_cli_args(
+        parser,
+        enable_help="启用骨干微调（训练过程自动适配）",
+        disable_help="禁用骨干微调",
+    )
     
     args = parser.parse_args()
     if args.noise_rate is not None:
         config.LABEL_NOISE_RATE = args.noise_rate
-    if args.finetune_backbone is not None:
-        config.FINETUNE_BACKBONE = bool(args.finetune_backbone)
+    apply_finetune_backbone_override(args, config)
     
     main(args)

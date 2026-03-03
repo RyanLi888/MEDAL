@@ -12,20 +12,22 @@ sys.path.insert(0, str(project_root))
 
 import argparse
 from datetime import datetime
-import hashlib
-import random
 import json
 
 from MoudleCode.utils.config import config
 from MoudleCode.utils.helpers import set_seed, setup_logger
 from MoudleCode.utils.logging_utils import (
-    log_section_header, log_data_stats, log_final_summary, log_output_paths
+    log_section_header, log_final_summary
 )
 
-import numpy as np
-import torch
-
 from scripts.training.train import main as train_main
+from scripts.training.common import (
+    safe_makedirs,
+    rng_fingerprint_short,
+    seed_snapshot,
+    add_finetune_backbone_cli_args,
+    apply_finetune_backbone_override,
+)
 from scripts.testing.test import main as test_main
 
 try:
@@ -34,50 +36,16 @@ try:
 except ImportError:
     PREPROCESS_AVAILABLE = False
 
-
-def _safe_makedirs(path: str) -> None:
-    """安全创建目录"""
-    os.makedirs(path, exist_ok=True)
-
-
 def main(args):
     """主函数：运行训练和测试"""
 
-    def _rng_fingerprint_short() -> str:
-        h = hashlib.sha256()
-        try:
-            h.update(repr(random.getstate()).encode('utf-8'))
-        except Exception:
-            h.update(b'py_random_error')
-        try:
-            ns = np.random.get_state()
-            h.update(str(ns[0]).encode('utf-8'))
-            h.update(np.asarray(ns[1], dtype=np.uint32).tobytes())
-            h.update(str(ns[2]).encode('utf-8'))
-            h.update(str(ns[3]).encode('utf-8'))
-            h.update(str(ns[4]).encode('utf-8'))
-        except Exception:
-            h.update(b'numpy_random_error')
-        try:
-            h.update(torch.get_rng_state().detach().cpu().numpy().tobytes())
-        except Exception:
-            h.update(b'torch_cpu_rng_error')
-        try:
-            if torch.cuda.is_available():
-                for s in torch.cuda.get_rng_state_all():
-                    h.update(s.detach().cpu().numpy().tobytes())
-            else:
-                h.update(b'no_cuda')
-        except Exception:
-            h.update(b'torch_cuda_rng_error')
-        return h.hexdigest()[:16]
-
     seed = getattr(args, 'seed', None) or getattr(config, 'SEED', None) or 42
     config.SEED = seed
-    rng_fp_before_seed = _rng_fingerprint_short()
+    rng_fp_before_seed = rng_fingerprint_short()
     set_seed(seed)
-    rng_fp_after_seed = _rng_fingerprint_short()
+    rng_fp_after_seed = rng_fingerprint_short()
     config.create_dirs()
+    startup_warnings = []
     
     # 如果指定了实验目录（用于测试），加载实验元数据并设置输出目录
     if getattr(args, 'experiment_dir', None):
@@ -94,14 +62,14 @@ def main(args):
             config.RESULT_DIR = dirs.get('result', config.RESULT_DIR)
             run_tag = experiment_metadata.get('run_tag', os.path.basename(experiment_dir))
         else:
-            logger.warning(f"⚠ 实验元数据不存在: {metadata_path}")
-            logger.warning("  使用默认输出目录")
+            startup_warnings.append(f"⚠ 实验元数据不存在: {metadata_path}")
+            startup_warnings.append("  使用默认输出目录")
             run_tag = os.path.basename(experiment_dir)
     else:
         # 创建新的实验文件夹（基于时间戳）
         run_tag = getattr(args, 'run_tag', None) or datetime.now().strftime('%Y%m%d_%H%M%S')
         experiment_dir = os.path.join(config.OUTPUT_ROOT, 'experiments', run_tag)
-        _safe_makedirs(experiment_dir)
+        safe_makedirs(experiment_dir)
         
         # 保存原始输出目录
         original_feature_extraction_dir = config.FEATURE_EXTRACTION_DIR
@@ -120,10 +88,10 @@ def main(args):
         # 创建实验文件夹下的子目录
         for module_dir in [config.FEATURE_EXTRACTION_DIR, config.LABEL_CORRECTION_DIR,
                           config.DATA_AUGMENTATION_DIR, config.CLASSIFICATION_DIR, config.RESULT_DIR]:
-            _safe_makedirs(module_dir)
-            _safe_makedirs(os.path.join(module_dir, 'models'))
-            _safe_makedirs(os.path.join(module_dir, 'figures'))
-            _safe_makedirs(os.path.join(module_dir, 'logs'))
+            safe_makedirs(module_dir)
+            safe_makedirs(os.path.join(module_dir, 'models'))
+            safe_makedirs(os.path.join(module_dir, 'figures'))
+            safe_makedirs(os.path.join(module_dir, 'logs'))
         
         # 保存实验元数据
         experiment_metadata = {
@@ -148,11 +116,13 @@ def main(args):
     
     # 创建日志目录
     log_dir = os.path.join(experiment_dir, 'logs')
-    _safe_makedirs(log_dir)
+    safe_makedirs(log_dir)
     logger = setup_logger(log_dir, name='all_train_test')
+    for msg in startup_warnings:
+        logger.warning(msg)
 
     logger.info(f"🔧 RNG指纹(seed前): {rng_fp_before_seed}")
-    logger.info(f"🔧 RNG指纹(seed后): {rng_fp_after_seed} (args.seed={seed} | config.SEED={int(getattr(config, 'SEED', -1))} | torch.initial_seed={int(torch.initial_seed()) if hasattr(torch, 'initial_seed') else 'N/A'})")
+    logger.info(f"🔧 RNG指纹(seed后): {rng_fp_after_seed} ({seed_snapshot(config, seed)})")
     
     log_section_header(logger, "🚀 MEDAL-Lite 完整流程: 训练 + 测试")
     logger.info(f"设备: {config.DEVICE}")
@@ -263,10 +233,11 @@ if __name__ == "__main__":
     parser.add_argument("--start_stage", type=str, default="1", 
                        choices=["1", "2", "3", "test"], help="起始阶段")
     parser.add_argument("--backbone_path", type=str, default=None, help="骨干网络路径")
-    finetune_group = parser.add_mutually_exclusive_group()
-    finetune_group.add_argument("--finetune_backbone", dest="finetune_backbone", action="store_true", help="启用骨干微调（需原始序列参与）")
-    finetune_group.add_argument("--no_finetune_backbone", dest="finetune_backbone", action="store_false", help="禁用骨干微调")
-    parser.set_defaults(finetune_backbone=None)
+    add_finetune_backbone_cli_args(
+        parser,
+        enable_help="启用骨干微调（训练过程自动适配）",
+        disable_help="禁用骨干微调",
+    )
     parser.add_argument("--seed", type=int, default=None, help="随机种子（覆盖config.SEED）")
     parser.add_argument("--run_tag", type=str, default=None, help="实验标签（默认使用时间戳）")
     parser.add_argument("--experiment_dir", type=str, default=None, help="实验目录路径（用于测试时指定）")
@@ -275,7 +246,6 @@ if __name__ == "__main__":
     if args.noise_rate is not None:
         config.LABEL_NOISE_RATE = args.noise_rate
     
-    if args.finetune_backbone is not None:
-        config.FINETUNE_BACKBONE = bool(args.finetune_backbone)
+    apply_finetune_backbone_override(args, config)
     
     main(args)

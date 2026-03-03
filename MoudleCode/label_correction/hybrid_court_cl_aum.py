@@ -149,6 +149,7 @@ def correct_labels_cl_aum(
     logger.info(f"    CL 置信度范围: [{cl_confidence.min():.4f}, {cl_confidence.max():.4f}]")
     logger.info(f"    CL 置信度均值: {cl_confidence.mean():.4f}")
     logger.info(f"    CL 识别噪声: {suspected_noise.sum()} 个")
+    cl_pred_noise = (cl_confidence < cl_threshold)
     
     # 分析 CL 与真实噪声的相关性
     if y_true is not None:
@@ -157,7 +158,6 @@ def correct_labels_cl_aum(
         logger.info(f"    CL 与噪声相关性: {cl_correlation:.4f} (期望负相关)")
         
         # CL 简单阈值的性能
-        cl_pred_noise = (cl_confidence < cl_threshold)
         if cl_pred_noise.sum() > 0:
             cl_precision = (cl_pred_noise & is_noise).sum() / cl_pred_noise.sum()
             cl_recall = (cl_pred_noise & is_noise).sum() / is_noise.sum() if is_noise.sum() > 0 else 0
@@ -190,6 +190,20 @@ def correct_labels_cl_aum(
     logger.info("")
     logger.info("  📊 噪声率诊断 (Diagnosis):")
     logger.info(f"    R_neg (AUM < 0 占比): {r_neg:.2f}%")
+    aum_pred_noise = (aum_scores < 0)
+    joint_pred_noise = aum_pred_noise & cl_pred_noise
+    joint_pred_noise_count = int(joint_pred_noise.sum())
+    joint_pred_noise_rate = joint_pred_noise_count / len(aum_scores) * 100.0
+    logger.info(f"    R_joint (AUM < 0 且 CL < {cl_threshold} 占比): {joint_pred_noise_rate:.2f}%")
+    logger.info(f"    联合预测噪声样本数: {joint_pred_noise_count}/{len(aum_scores)}")
+    if y_true is not None:
+        true_noise_mask = (y_true != noisy_labels)
+        true_noise_in_joint = int((joint_pred_noise & true_noise_mask).sum())
+        if joint_pred_noise_count > 0:
+            joint_precision = true_noise_in_joint / joint_pred_noise_count
+            logger.info(f"    联合预测噪声中的真实噪声: {true_noise_in_joint}/{joint_pred_noise_count} (Precision={joint_precision:.3f})")
+        else:
+            logger.info("    联合预测噪声中的真实噪声: 0/0 (Precision=N/A)")
     logger.info(f"    判定阈值: {noise_diagnosis_threshold}%")
     if is_low_noise:
         logger.info(f"    → 方案选择: 低噪声方案 (R_neg < {noise_diagnosis_threshold}%)")

@@ -105,6 +105,10 @@ def main():
     parser.add_argument('--use_ground_truth', action='store_true', help='使用真实标签')
     parser.add_argument('--retrain_backbone', action='store_true', help='重新训练骨干网络')
     parser.add_argument('--backbone_path', type=str, default='', help='骨干网络路径')
+    finetune_group = parser.add_mutually_exclusive_group()
+    finetune_group.add_argument('--finetune_backbone', dest='finetune_backbone', action='store_true', help='启用骨干微调')
+    finetune_group.add_argument('--no_finetune_backbone', dest='finetune_backbone', action='store_false', help='禁用骨干微调')
+    parser.set_defaults(finetune_backbone=None)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--run_tag', type=str, default='')
     args = parser.parse_args()
@@ -124,10 +128,11 @@ def main():
     config.USE_SOFT_F1_LOSS = False
     config.STAGE3_ONLINE_AUGMENTATION = False
     config.STAGE3_USE_ST_MIXUP = False
-    config.FINETUNE_BACKBONE = True  # 启用骨干微调
+    if args.finetune_backbone is not None:
+        config.FINETUNE_BACKBONE = bool(args.finetune_backbone)
     config.FINETUNE_VAL_SPLIT = 0.0
     config.FINETUNE_ES_ALLOW_TRAIN_METRIC = True
-    config.STAGE3_MIXED_STREAM = False  # 干净数据模式不使用混合训练
+    config.STAGE3_MIXED_STREAM = False  # 原始序列输入下无需混合训练
     config.CLASSIFIER_INPUT_IS_FEATURES = False  # 输入是原始序列，不是特征
 
     run_tag = args.run_tag.strip() or datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -156,7 +161,7 @@ def main():
         logger.info('  - 标签: 真实标签（无噪声）')
         logger.info('  - 标签矫正: 跳过')
         logger.info('  - 数据增强: 跳过')
-        logger.info('  - 骨干微调: 启用（使用原始序列）')
+        logger.info(f"  - 骨干微调: {'启用' if config.FINETUNE_BACKBONE else '关闭'}")
         logger.info('')
         
         # 输出配置
@@ -204,7 +209,8 @@ def main():
         logger.info(f"🔧 RNG指纹(Stage4调用前): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
         stage4_finetune_classifier(
             backbone, X_train, y_corrected, correction_weight,
-            config, logger, n_original=len(X_train), backbone_path=backbone_path
+            config, logger, n_original=len(X_train), backbone_path=backbone_path,
+            X_train_real=X_train
         )
         logger.info(f"🔧 RNG指纹(Stage4返回后): {_rng_fingerprint_short()} ({_seed_snapshot(args.seed)})")
 

@@ -105,7 +105,7 @@ class Config:
     # ============================================================
     # 数据集基础配置
     # ============================================================
-    LABEL_NOISE_RATE = 0.20  # 标签噪声率（30%）
+    LABEL_NOISE_RATE = 0.30  # 标签噪声率（30%）
     LABEL_BENIGN = 0         # 正常流量标签
     LABEL_MALICIOUS = 1      # 恶意流量标签
     
@@ -436,9 +436,9 @@ class Config:
     
     # 3.3 早停机制（智能训练终止）
     FINETUNE_EARLY_STOPPING = True         # 启用早停
-    FINETUNE_ES_WARMUP_EPOCHS = 150         # 预热轮数（前N轮不触发早停）- 增加预热
+    FINETUNE_ES_WARMUP_EPOCHS = 100         # 预热轮数（前N轮不触发早停）- 增加预热
     FINETUNE_ES_PATIENCE = 50               # 耐心值（连续N轮无改善则停止）- 增加耐心
-    FINETUNE_ES_MIN_DELTA = 0.002         # F1改善阈值（需要明显改善）- 提高阈值
+    FINETUNE_ES_MIN_DELTA = 0.005         # F1改善阈值（需要明显改善）- 提高阈值
     FINETUNE_ES_METRIC = 'f1_optimal'       # 监控指标
     FINETUNE_ES_ALLOW_TRAIN_METRIC = True   # 允许使用训练集指标
     
@@ -453,11 +453,11 @@ class Config:
     BALANCED_SAMPLING_RATIO = 1.0           # 目标比例（正常:恶意=1:1）
     
     # 3.6 骨干网络微调（最优配置）
-    # 注意：如果Stage 3输入是特征向量（2D），骨干微调会被自动禁用
-    # 原因：特征向量无法反向传播到骨干网络
-    # 解决方案：启用混合训练（STAGE3_MIXED_STREAM = True）以支持骨干微调
-    # 当前配置：混合训练已启用，因此骨干微调可以正常工作
-    FINETUNE_BACKBONE = True               # 启用骨干微调（混合训练模式下有效）
+    # 规则：分类器训练会自动适配 FINETUNE_BACKBONE 的选择
+    # - FINETUNE_BACKBONE=True 且主输入为特征（2D）时：若有原始序列则自动启用混合训练
+    # - FINETUNE_BACKBONE=True 但无原始序列时：自动降级为仅训练分类器（骨干冻结）
+    # - FINETUNE_BACKBONE=False 时：始终只训练分类器
+    FINETUNE_BACKBONE = True               # 启用骨干微调（训练流程会自动适配）
     FINETUNE_BACKBONE_SCOPE = 'all'  # 微调范围
     FINETUNE_BACKBONE_LR = 2e-5             # 骨干网络学习率
     FINETUNE_BACKBONE_WARMUP_EPOCHS = 50    # 预热轮数

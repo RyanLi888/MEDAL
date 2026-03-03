@@ -853,25 +853,37 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         orig_sup_mask = ~orig_unlab_mask  # 所有有标签的样本（包括高权重和低权重）
         logger.info(f"� Stage4 原始样本权重划分: 无监督(≤{unlabeled_thr})={int(orig_unlab_mask.sum())}, 低权重({unlabeled_thr}<w≤{high_weight_thr})={int(orig_low_weight_mask.sum())}, 高权重(>{high_weight_thr})={int(orig_high_weight_mask.sum())}")
 
-    # 混合训练模式检查
+    finetune_backbone_requested = bool(getattr(config, 'FINETUNE_BACKBONE', False))
+
+    # FINETUNE_BACKBONE 与分类器训练自动适配策略：
+    # - 输入为特征且有原始序列: 自动启用 mixed-stream 以支持骨干微调
+    # - 输入为特征但无原始序列: 自动降级为仅训练分类器（骨干冻结）
+    # - 输入为原始序列: 直接按序列模式进行骨干微调（无需 mixed-stream）
+    if finetune_backbone_requested:
+        if input_is_features:
+            if not has_real_sequences:
+                logger.warning("⚠️ FINETUNE_BACKBONE=True 但未提供原始序列 X_train_real，自动关闭骨干微调，仅训练分类器")
+                finetune_backbone_requested = False
+                use_mixed_stream = False
+            elif not use_mixed_stream:
+                logger.info("🔀 FINETUNE_BACKBONE=True 且输入为特征，自动启用混合训练以接入原始序列")
+                use_mixed_stream = True
+        else:
+            # 主输入本身就是原始序列，已经满足骨干微调要求；无需 mixed-stream
+            if use_mixed_stream:
+                logger.info("ℹ️ 输入为原始序列，禁用混合训练并按序列模式进行骨干微调")
+            use_mixed_stream = False
+
+    # 混合训练模式检查（仅在仍请求混合训练时执行）
     if use_mixed_stream and not has_real_sequences:
-        logger.info("⚠️ 混合训练需要额外的原始序列(X_train_real)，当前未提供")
-        use_mixed_stream = False
-    
-    if use_mixed_stream and not input_is_features:
-        logger.info("⚠️ 混合训练需要增强特征作为主输入，当前输入是原始序列")
+        logger.info("⚠️ 混合训练需要额外的原始序列(X_train_real)，当前未提供，已自动禁用混合训练")
         use_mixed_stream = False
 
-    finetune_backbone_requested = bool(getattr(config, 'FINETUNE_BACKBONE', False))
-    
-    # 特征输入时不能微调骨干网络
-    if input_is_features and not use_mixed_stream:
-        if finetune_backbone_requested:
-            logger.info("⚠️ 输入为特征向量，骨干微调将被禁用（无法反向传播到骨干网络）")
-        finetune_backbone_requested = False
-    
+    if use_mixed_stream and not input_is_features:
+        logger.info("⚠️ 混合训练需要增强特征作为主输入，当前输入是原始序列，已自动禁用混合训练")
+        use_mixed_stream = False
+
     if use_mixed_stream:
-        finetune_backbone_requested = True
         logger.info("🔀 混合训练模式已启用")
         log_data_stats(logger, {
             "原始序列": f"{len(X_train_real)} 个样本",
@@ -1805,8 +1817,7 @@ def main(args):
 
         classifier, finetune_history, optimal_threshold = stage4_finetune_classifier(
             backbone, Z_augmented, y_augmented, sample_weights, config, logger,
-            n_original=n_original, backbone_path=actual_backbone_path, X_train_real=X_train_real,
-            use_mixed_stream=bool(getattr(config, 'STAGE3_MIXED_STREAM', True))  # 默认启用混合训练
+            n_original=n_original, backbone_path=actual_backbone_path, X_train_real=X_train_real
         )
         logger.info(f"🔧 RNG指纹(Stage4返回后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
     else:
@@ -1842,9 +1853,15 @@ if __name__ == "__main__":
     parser.add_argument("--backbone_path", type=str, default=None, help="骨干网络路径")
     parser.add_argument("--retrain_backbone", action="store_true", help="重新训练骨干网络")
     parser.add_argument("--stage2_mode", type=str, default="standard", choices=["standard", "clean_augment_only"], help="Stage 2模式")
+    finetune_group = parser.add_mutually_exclusive_group()
+    finetune_group.add_argument("--finetune_backbone", dest="finetune_backbone", action="store_true", help="启用骨干微调（需原始序列参与）")
+    finetune_group.add_argument("--no_finetune_backbone", dest="finetune_backbone", action="store_false", help="禁用骨干微调")
+    parser.set_defaults(finetune_backbone=None)
     
     args = parser.parse_args()
     if args.noise_rate is not None:
         config.LABEL_NOISE_RATE = args.noise_rate
+    if args.finetune_backbone is not None:
+        config.FINETUNE_BACKBONE = bool(args.finetune_backbone)
     
     main(args)

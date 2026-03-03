@@ -263,7 +263,10 @@ if __name__ == "__main__":
     parser.add_argument("--start_stage", type=str, default="1", 
                        choices=["1", "2", "3", "test"], help="起始阶段")
     parser.add_argument("--backbone_path", type=str, default=None, help="骨干网络路径")
-    parser.add_argument("--finetune_backbone", action="store_true", help="启用骨干微调")
+    finetune_group = parser.add_mutually_exclusive_group()
+    finetune_group.add_argument("--finetune_backbone", dest="finetune_backbone", action="store_true", help="启用骨干微调（需原始序列参与）")
+    finetune_group.add_argument("--no_finetune_backbone", dest="finetune_backbone", action="store_false", help="禁用骨干微调")
+    parser.set_defaults(finetune_backbone=None)
     parser.add_argument("--seed", type=int, default=None, help="随机种子（覆盖config.SEED）")
     parser.add_argument("--run_tag", type=str, default=None, help="实验标签（默认使用时间戳）")
     parser.add_argument("--experiment_dir", type=str, default=None, help="实验目录路径（用于测试时指定）")
@@ -272,7 +275,7 @@ if __name__ == "__main__":
     if args.noise_rate is not None:
         config.LABEL_NOISE_RATE = args.noise_rate
     
-    if args.finetune_backbone:
-        config.FINETUNE_BACKBONE = True
+    if args.finetune_backbone is not None:
+        config.FINETUNE_BACKBONE = bool(args.finetune_backbone)
     
     main(args)

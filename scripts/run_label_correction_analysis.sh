@@ -93,7 +93,7 @@ select_noise_rates() {
     echo "请选择噪声率:"
     echo "1) 单个噪声率 30%"
     echo "2) 单个噪声率 (自定义)"
-    echo "3) 批量噪声率 (10%, 20%, 30%, 40%)"
+    echo "3) 批量噪声率 (20%, 25%, 30%, 35%, 40%, 45%)"
     echo "4) 批量噪声率 (自定义)"
     echo ""
     echo -n "请选择 (1-4, 默认3): "
@@ -110,15 +110,15 @@ select_noise_rates() {
             NOISE_RATES="${custom_rate:-0.3}"
             ;;
         3)
-            NOISE_RATES="0.1 0.2 0.3 0.4"
+            NOISE_RATES="0.2 0.25 0.3 0.35 0.4 0.45"
             ;;
         4)
-            echo -n "请输入噪声率列表 (空格分隔, 例如 0.1 0.2 0.3): "
+            echo -n "请输入噪声率列表 (空格分隔, 例如 0.2 0.25 0.3): "
             read -r custom_rates
-            NOISE_RATES="${custom_rates:-0.3}"
+            NOISE_RATES="${custom_rates:-0.2 0.25 0.3 0.35 0.4 0.45}"
             ;;
         *)
-            NOISE_RATES="0.1 0.2 0.3 0.4"
+            NOISE_RATES="0.2 0.25 0.3 0.35 0.4 0.45"
             ;;
     esac
     

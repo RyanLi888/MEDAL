@@ -494,9 +494,13 @@ def main(args):
     logger.info(f"  ✓ 测试数据: {config.BENIGN_TEST} (正常), {config.MALICIOUS_TEST} (恶意)")
     logger.info("")
     
-    # Try to load model metadata to get the backbone path used during training
+    # Try to load model metadata to get backbone-classifier pairing
     metadata_path = os.path.join(config.CLASSIFICATION_DIR, "models", "model_metadata.json")
+    metadata = {}
     backbone_path_from_metadata = None
+    backbone_best_f1_from_metadata = None
+    backbone_final_from_metadata = None
+    model_backbone_pairs = {}
     
     if os.path.exists(metadata_path):
         try:
@@ -504,12 +508,23 @@ def main(args):
             with open(metadata_path, 'r') as f:
                 metadata = json.load(f)
             backbone_path_from_metadata = metadata.get('backbone_path')
+            backbone_best_f1_from_metadata = metadata.get('backbone_best_f1_path')
+            backbone_final_from_metadata = metadata.get('backbone_final_path')
+            raw_pairs = metadata.get('model_backbone_pairs', {})
+            if isinstance(raw_pairs, dict):
+                model_backbone_pairs = raw_pairs
             input_is_features_from_metadata = metadata.get('input_is_features', False)
             feature_dim_from_metadata = metadata.get('feature_dim', None)
             
             if backbone_path_from_metadata:
                 logger.info(f"✓ 从模型元数据中读取到训练时使用的骨干网络:")
                 logger.info(f"  {backbone_path_from_metadata}")
+                if backbone_best_f1_from_metadata:
+                    logger.info(f"  - Best F1 配对骨干: {backbone_best_f1_from_metadata}")
+                if backbone_final_from_metadata:
+                    logger.info(f"  - Final 配对骨干: {backbone_final_from_metadata}")
+                if len(model_backbone_pairs) > 0:
+                    logger.info(f"  - 分类器-骨干配对数: {len(model_backbone_pairs)}")
                 if input_is_features_from_metadata:
                     logger.info(f"✓ 训练时输入类型: 特征向量 (维度={feature_dim_from_metadata})")
                     logger.info(f"  测试时将自动从序列提取特征")
@@ -517,23 +532,22 @@ def main(args):
         except Exception as e:
             logger.warning(f"⚠ 无法读取模型元数据: {e}")
     
-    # 确定骨干网络路径
-    # 优先级：1. 元数据（训练时保存的骨干，如微调后的） 2. 命令行参数 3. 默认路径
-    # 这样在 all_train_test 流程中，测试会使用本次训练产出的 backbone_finetuned.pth，而不是启动时的 --backbone_path
-    backbone_path = None
+    # 默认骨干网络路径（当找不到精确配对时回退）
+    # 优先级：1. 元数据默认路径 2. 命令行参数 3. 默认预训练路径
+    default_backbone_path = None
     
-    # 1. 若元数据中存在且文件存在，优先使用训练时保存的骨干（与分类器一致）
+    # 1. 若元数据中存在且文件存在，优先使用训练时保存的骨干
     if backbone_path_from_metadata and os.path.exists(backbone_path_from_metadata):
-        backbone_path = backbone_path_from_metadata
-        logger.info("✓ 使用训练时的骨干网络（从元数据）")
-        logger.info(f"  {backbone_path}")
+        default_backbone_path = backbone_path_from_metadata
+        logger.info("✓ 使用元数据默认骨干网络路径")
+        logger.info(f"  {default_backbone_path}")
         logger.info("")
     # 2. 否则使用命令行参数
     elif hasattr(args, 'backbone_path') and args.backbone_path:
-        backbone_path = args.backbone_path
+        default_backbone_path = args.backbone_path
         logger.info(f"✓ 使用命令行指定的骨干网络:")
-        logger.info(f"  {backbone_path}")
-        if backbone_path_from_metadata and backbone_path_from_metadata != backbone_path:
+        logger.info(f"  {default_backbone_path}")
+        if backbone_path_from_metadata and backbone_path_from_metadata != default_backbone_path:
             logger.warning("⚠ 注意：未使用元数据中的骨干路径，测试与训练可能不一致")
             logger.warning(f"  元数据中: {backbone_path_from_metadata}")
         logger.info("")
@@ -555,31 +569,68 @@ def main(args):
         return
     # 4. 使用默认路径（无元数据且未指定命令行时）
     else:
-        backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
-        logger.info(f"使用默认骨干网络路径: {backbone_path}")
+        default_backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+        logger.info(f"使用默认骨干网络路径: {default_backbone_path}")
         logger.warning("⚠ 注意：未找到模型元数据，使用默认路径可能不是训练时使用的模型!")
         logger.warning("  建议：确保训练脚本已正确保存模型元数据")
     
-    if not os.path.exists(backbone_path):
-        logger.error(f"❌ 骨干网络检查点未找到: {backbone_path}")
+    if not os.path.exists(default_backbone_path):
+        logger.error(f"❌ 骨干网络检查点未找到: {default_backbone_path}")
         logger.error("请先运行训练脚本!")
         return
-    
-    logger.info("正在加载骨干网络...")
-    logger.info(f"  📥 输入模型: {backbone_path}")
-    logger.info(f"🔧 RNG指纹(加载backbone权重前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
-    
-    # 使用安全的模型加载函数（自动处理兼容性）
+
+    # 使用安全的模型加载函数（自动处理兼容性），并按路径缓存骨干
     from MoudleCode.utils.model_loader import load_backbone_safely
-    backbone = load_backbone_safely(
-        backbone_path=backbone_path,
-        config=config,
-        device=config.DEVICE,
-        logger=logger
-    )
-    logger.info(f"🔧 RNG指纹(加载backbone权重后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
-    backbone.freeze()
-    logger.info(f"✓ 骨干网络加载完成")
+    backbone_cache = {}
+
+    def _get_backbone(backbone_ckpt_path: str):
+        if backbone_ckpt_path in backbone_cache:
+            return backbone_cache[backbone_ckpt_path]
+        logger.info("正在加载骨干网络...")
+        logger.info(f"  📥 输入模型: {backbone_ckpt_path}")
+        logger.info(f"🔧 RNG指纹(加载backbone权重前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
+        bb = load_backbone_safely(
+            backbone_path=backbone_ckpt_path,
+            config=config,
+            device=config.DEVICE,
+            logger=logger
+        )
+        logger.info(f"🔧 RNG指纹(加载backbone权重后): {_rng_fingerprint_short()} ({_seed_snapshot()})")
+        bb.freeze()
+        logger.info("✓ 骨干网络加载完成")
+        backbone_cache[backbone_ckpt_path] = bb
+        return bb
+
+    def _resolve_backbone_for_classifier(classifier_ckpt_path: str, model_name: str = ""):
+        ckpt_name = os.path.basename(classifier_ckpt_path) if classifier_ckpt_path else ""
+
+        # 1) 元数据显式配对（最优）
+        pair_path = model_backbone_pairs.get(ckpt_name) if isinstance(model_backbone_pairs, dict) else None
+        if pair_path:
+            if os.path.exists(pair_path):
+                logger.info(f"✓ {model_name or ckpt_name} 使用元数据配对骨干: {pair_path}")
+                return pair_path
+            logger.error(f"❌ 配对骨干不存在: classifier={ckpt_name}, backbone={pair_path}")
+            return None
+
+        # 2) 按模型类型使用元数据中的best/final路径
+        if model_name == "Best F1" and backbone_best_f1_from_metadata:
+            if os.path.exists(backbone_best_f1_from_metadata):
+                logger.info(f"✓ Best F1 使用best配对骨干: {backbone_best_f1_from_metadata}")
+                return backbone_best_f1_from_metadata
+            logger.error(f"❌ best配对骨干不存在: {backbone_best_f1_from_metadata}")
+            return None
+
+        if model_name in ("Final", "Last10-MinLoss") and backbone_final_from_metadata:
+            if os.path.exists(backbone_final_from_metadata):
+                logger.info(f"✓ {model_name} 使用final配对骨干: {backbone_final_from_metadata}")
+                return backbone_final_from_metadata
+            logger.error(f"❌ final配对骨干不存在: {backbone_final_from_metadata}")
+            return None
+
+        # 3) 回退到默认骨干路径
+        logger.warning(f"⚠ {model_name or ckpt_name} 未找到显式配对，回退默认骨干: {default_backbone_path}")
+        return default_backbone_path
     
     # ========================
     # Load classifiers (both best and final)
@@ -620,6 +671,10 @@ def main(args):
     if hasattr(args, 'classifier_path') and args.classifier_path:
         logger.info("正在加载指定的分类器...")
         logger.info(f"  📥 输入模型: {args.classifier_path}")
+        resolved_backbone_path = _resolve_backbone_for_classifier(args.classifier_path, model_name="指定模型")
+        if not resolved_backbone_path:
+            return
+        backbone = _get_backbone(resolved_backbone_path)
         
         logger.info(f"🔧 RNG指纹(构建classifier前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         classifier = MEDAL_Classifier(backbone, config)
@@ -696,6 +751,11 @@ def main(args):
         logger.info("="*70)
         logger.info(f"正在加载分类器...")
         logger.info(f"  📥 输入模型: {model_path}")
+        resolved_backbone_path = _resolve_backbone_for_classifier(model_path, model_name=model_name)
+        if not resolved_backbone_path:
+            logger.error(f"❌ 跳过模型 {model_name}：无法解析可用骨干路径")
+            continue
+        backbone = _get_backbone(resolved_backbone_path)
         
         logger.info(f"🔧 RNG指纹(构建classifier前): {_rng_fingerprint_short()} ({_seed_snapshot()})")
         classifier = MEDAL_Classifier(backbone, config)
@@ -741,6 +801,10 @@ def main(args):
         all_metrics[model_name] = metrics
         
         logger.info("")
+
+    if len(all_metrics) == 0:
+        logger.error("❌ 所有候选分类器均未完成测试（骨干配对缺失或模型加载失败）")
+        return
     
     # ========================
     # Compare Results
@@ -835,4 +899,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     main(args)
-

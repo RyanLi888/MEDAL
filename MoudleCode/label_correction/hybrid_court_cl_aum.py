@@ -149,7 +149,9 @@ def correct_labels_cl_aum(
     logger.info(f"    CL 置信度范围: [{cl_confidence.min():.4f}, {cl_confidence.max():.4f}]")
     logger.info(f"    CL 置信度均值: {cl_confidence.mean():.4f}")
     logger.info(f"    CL 识别噪声: {suspected_noise.sum()} 个")
-    cl_pred_noise = (cl_confidence < cl_threshold)
+    # CL 的最终噪声判定以 fit_predict 输出为准；cl_threshold 仅用于辅助分析
+    cl_pred_noise_final = np.asarray(suspected_noise, dtype=bool)
+    cl_pred_noise_by_threshold = (cl_confidence < cl_threshold)
     
     # 分析 CL 与真实噪声的相关性
     if y_true is not None:
@@ -158,10 +160,10 @@ def correct_labels_cl_aum(
         logger.info(f"    CL 与噪声相关性: {cl_correlation:.4f} (期望负相关)")
         
         # CL 简单阈值的性能
-        if cl_pred_noise.sum() > 0:
-            cl_precision = (cl_pred_noise & is_noise).sum() / cl_pred_noise.sum()
-            cl_recall = (cl_pred_noise & is_noise).sum() / is_noise.sum() if is_noise.sum() > 0 else 0
-            logger.info(f"    CL 阈值 {cl_threshold} 性能: Precision={cl_precision:.3f}, Recall={cl_recall:.3f}")
+        if cl_pred_noise_by_threshold.sum() > 0:
+            cl_precision = (cl_pred_noise_by_threshold & is_noise).sum() / cl_pred_noise_by_threshold.sum()
+            cl_recall = (cl_pred_noise_by_threshold & is_noise).sum() / is_noise.sum() if is_noise.sum() > 0 else 0
+            logger.info(f"    CL 阈值 {cl_threshold} 性能(仅参考): Precision={cl_precision:.3f}, Recall={cl_recall:.3f}")
     
     # ========== 步骤3: 计算 AUM 分数 ==========
     logger.info("")
@@ -183,22 +185,29 @@ def correct_labels_cl_aum(
     # 计算 R_neg: AUM < 0 的样本占比
     r_neg = (aum_scores < 0).sum() / len(aum_scores) * 100.0
     noise_diagnosis_threshold = 35.0  # 判定阈值：35%
-    high_aggressive_threshold = 40.0  # 超限方案阈值：40%（对应真实噪声≥40%）
+    cl_pred_noise_count = int(cl_pred_noise_final.sum())
+    cl_pred_noise_rate = cl_pred_noise_count / len(aum_scores) * 100.0
     is_low_noise = r_neg < noise_diagnosis_threshold
-    is_high_aggressive = r_neg >= high_aggressive_threshold  # 超限方案
+    is_high_noise = not is_low_noise
     
     logger.info("")
     logger.info("  📊 噪声率诊断 (Diagnosis):")
     logger.info(f"    R_neg (AUM < 0 占比): {r_neg:.2f}%")
+    logger.info(f"    CL预测噪声率: {cl_pred_noise_rate:.2f}% (CL最终判定)")
     aum_pred_noise = (aum_scores < 0)
-    joint_pred_noise = aum_pred_noise & cl_pred_noise
+    joint_pred_noise = aum_pred_noise & cl_pred_noise_final
     joint_pred_noise_count = int(joint_pred_noise.sum())
     joint_pred_noise_rate = joint_pred_noise_count / len(aum_scores) * 100.0
-    logger.info(f"    R_joint (AUM < 0 且 CL < {cl_threshold} 占比): {joint_pred_noise_rate:.2f}%")
-    logger.info(f"    联合预测噪声样本数: {joint_pred_noise_count}/{len(aum_scores)}")
+    logger.info(f"    CL+AUM联合预测噪声率: {joint_pred_noise_rate:.2f}% (AUM < 0 且 CL最终判定噪声)")
     if y_true is not None:
         true_noise_mask = (y_true != noisy_labels)
+        true_noise_in_cl = int((cl_pred_noise_final & true_noise_mask).sum())
         true_noise_in_joint = int((joint_pred_noise & true_noise_mask).sum())
+        if cl_pred_noise_count > 0:
+            cl_precision = true_noise_in_cl / cl_pred_noise_count
+            logger.info(f"    CL预测噪声中的真实噪声: {true_noise_in_cl}/{cl_pred_noise_count} (Precision={cl_precision:.3f})")
+        else:
+            logger.info("    CL预测噪声中的真实噪声: 0/0 (Precision=N/A)")
         if joint_pred_noise_count > 0:
             joint_precision = true_noise_in_joint / joint_pred_noise_count
             logger.info(f"    联合预测噪声中的真实噪声: {true_noise_in_joint}/{joint_pred_noise_count} (Precision={joint_precision:.3f})")
@@ -208,11 +217,8 @@ def correct_labels_cl_aum(
     if is_low_noise:
         logger.info(f"    → 方案选择: 低噪声方案 (R_neg < {noise_diagnosis_threshold}%)")
         logger.info(f"    策略: 防守反击 - 高精度优先，稳健清洗")
-    elif is_high_aggressive:
-        logger.info(f"    → 方案选择: 高噪声超限方案 (R_neg >= {high_aggressive_threshold}%, 真实噪声 ≥ 40%)")
-        logger.info(f"    策略: 自适应级联决策策略（基于决策树Depth 5优化，准确率90.0%）")
-    else:
-        logger.info(f"    → 方案选择: 高噪声方案 ({noise_diagnosis_threshold}% <= R_neg < {high_aggressive_threshold}%)")
+    elif is_high_noise:
+        logger.info(f"    → 方案选择: 高噪声方案 (R_neg >= {noise_diagnosis_threshold}%)")
         logger.info(f"    策略: 自适应级联决策策略（基于决策树Depth 5优化，准确率90.0%）")
     logger.info("")
     
@@ -667,29 +673,17 @@ def correct_labels_cl_aum(
         return clean_labels, action_mask, confidence, correction_weight, aum_scores, neighbor_consistency, pred_probs
     
     else:
-        # ========== 高噪声方案：完整的两阶段方案（包括普通高噪声和超限方案） ==========
-        if is_high_aggressive:
-            logger.info("")
-            logger.info("="*70)
-            logger.info("高噪声超限方案: 自适应级联决策策略 (基于决策树Depth 5优化)")
-            logger.info("="*70)
-            logger.info("  Phase1参数（激进策略 - 准确率90.0%）:")
-            logger.info("    决策树深度: 5 (理论最高准确率90.0%)")
-            logger.info("    区域1 (CL_Diff <= 0.11): 多级判断，结合Neg_AUM和KNN_Flip")
-            logger.info("    区域2 (0.11 < CL_Diff <= 0.42): KNN裁决 + AUM阈值分层")
-            logger.info("    区域3 (CL_Diff > 0.42): AUM历史信任机制 + 异常值保护")
-            logger.info("    特征: CL_Diff, Neg_AUM, KNN_Flip_Score (深度非线性组合)")
-        else:
-            logger.info("")
-            logger.info("="*70)
-            logger.info("高噪声方案: 自适应级联决策策略 (基于决策树Depth 5优化)")
-            logger.info("="*70)
-            logger.info("  Phase1参数（激进策略 - 准确率90.0%）:")
-            logger.info("    决策树深度: 5 (理论最高准确率90.0%)")
-            logger.info("    区域1 (CL_Diff <= 0.11): 多级判断，结合Neg_AUM和KNN_Flip")
-            logger.info("    区域2 (0.11 < CL_Diff <= 0.42): KNN裁决 + AUM阈值分层")
-            logger.info("    区域3 (CL_Diff > 0.42): AUM历史信任机制 + 异常值保护")
-            logger.info("    特征: CL_Diff, Neg_AUM, KNN_Flip_Score (深度非线性组合)")
+        # ========== 高噪声方案：完整的两阶段方案 ==========
+        logger.info("")
+        logger.info("="*70)
+        logger.info("高噪声方案: 自适应级联决策策略 (基于决策树Depth 5优化)")
+        logger.info("="*70)
+        logger.info("  Phase1参数（激进策略 - 准确率90.0%）:")
+        logger.info("    决策树深度: 5 (理论最高准确率90.0%)")
+        logger.info("    区域1 (CL_Diff <= 0.11): 多级判断，结合Neg_AUM和KNN_Flip")
+        logger.info("    区域2 (0.11 < CL_Diff <= 0.42): KNN裁决 + AUM阈值分层")
+        logger.info("    区域3 (CL_Diff > 0.42): AUM历史信任机制 + 异常值保护")
+        logger.info("    特征: CL_Diff, Neg_AUM, KNN_Flip_Score (深度非线性组合)")
         logger.info("")
         
         # Phase1 决策
@@ -970,11 +964,16 @@ def correct_labels_cl_aum(
         logger.info("      优化后的LateFlip阈值，提升净收益")
         logger.info("")
         
-        # 阶段2参数
-        phase2_late_flip_cl_threshold = 0.55  # CL当前标签置信度阈值（优化后）
-        phase2_late_flip_knn_threshold = 0.65  # KNN一致性阈值（优化后，低一致性表示可能是噪声）
-        phase2_undo_flip_cl_threshold = 0.35
-        phase2_undo_flip_knn_oppose_threshold = 0.5
+        # 阶段2参数（统一为89.8%准确率实验规则）
+        phase2_late_flip_cl_threshold = 0.48
+        phase2_late_flip_knn_threshold = 0.58
+        phase2_undo_flip_cl_threshold = 0.40
+        phase2_undo_flip_knn_oppose_threshold = 0.55
+        logger.info(
+            "  阶段2阈值: "
+            f"LateFlip(CL<{phase2_late_flip_cl_threshold:.2f},KNN<{phase2_late_flip_knn_threshold:.2f}), "
+            f"UndoFlip(CL<{phase2_undo_flip_cl_threshold:.2f} 或 KNN反对且KNN<{phase2_undo_flip_knn_oppose_threshold:.2f})"
+        )
         
         late_flip_count = 0
         undo_flip_count = 0
@@ -1153,11 +1152,16 @@ def correct_labels_cl_aum(
         clean_non_core_count = 0
         noise_suppression_count = 0
         
-        # 定义阈值
-        cl_high_threshold = 0.7  # CL高置信度阈值（核心区）
-        knn_consistency_threshold = 0.7  # KNN一致性阈值（核心区）
-        cl_recovery_threshold = 0.25  # CL恢复识别阈值（干净非核心区）
-        knn_recovery_threshold = 0.55  # KNN恢复识别阈值（干净非核心区）
+        # 定义阈值（统一为89.8%准确率实验规则）
+        cl_high_threshold = 0.75
+        knn_consistency_threshold = 0.75
+        cl_recovery_threshold = 0.35
+        knn_recovery_threshold = 0.60
+        logger.info(
+            "    阈值设置: "
+            f"核心(CL>={cl_high_threshold:.2f},KNN>={knn_consistency_threshold:.2f}) | "
+            f"恢复(CL>{cl_recovery_threshold:.2f},KNN>{knn_recovery_threshold:.2f})"
+        )
         
         # 分配权重（基于CL和KNN指标）
         for i in range(n_samples):

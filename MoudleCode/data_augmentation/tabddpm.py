@@ -554,6 +554,12 @@ class TabDDPM(nn.Module):
         logger.info(f"Augmenting feature dataset: {len(Z_keep)} clean samples retained")
 
         augmentation_mode = getattr(self.config, 'AUGMENTATION_MODE', 'weighted')
+        min_syn_per_class = max(0, int(getattr(self.config, 'AUGMENT_MIN_SYN_PER_CLASS', 0)))
+        min_syn_benign = max(0, int(getattr(self.config, 'AUGMENT_MIN_SYN_BENIGN', min_syn_per_class)))
+        min_syn_malicious = max(0, int(getattr(self.config, 'AUGMENT_MIN_SYN_MALICIOUS', min_syn_per_class)))
+        logger.info(
+            f"Synthetic minimum per class: benign={min_syn_benign}, malicious={min_syn_malicious}"
+        )
         
         # v2.5: 支持类别特定增强倍数
         if augmentation_mode == 'class_specific':
@@ -602,7 +608,13 @@ class TabDDPM(nn.Module):
         use_weighted_sampling = bool(getattr(self.config, 'AUGMENT_USE_WEIGHTED_SAMPLING', True))
         enable_quality_check = bool(getattr(self.config, 'AUGMENT_QUALITY_CHECK', True))
 
-        for class_label in np.unique(y_keep):
+        classes_to_generate = np.unique(y_keep).astype(int).tolist()
+        if min_syn_benign > 0 and 0 not in classes_to_generate:
+            logger.warning(f"Class 0 has no templates; cannot enforce benign minimum synthetic samples={min_syn_benign}")
+        if min_syn_malicious > 0 and 1 not in classes_to_generate:
+            logger.warning(f"Class 1 has no templates; cannot enforce malicious minimum synthetic samples={min_syn_malicious}")
+
+        for class_label in classes_to_generate:
             class_mask = y_keep == class_label
             Z_class = Z_keep[class_mask]
             mult_class = multipliers[class_mask]
@@ -622,11 +634,22 @@ class TabDDPM(nn.Module):
             Z_templates_pool = Z_class[template_mask]
             w_templates_pool = w_class[template_mask]
             mult_templates_pool = mult_class[template_mask]
-            n_generate = int(mult_templates_pool.sum())
+            n_generate_base = int(mult_templates_pool.sum())
+            if int(class_label) == 0:
+                class_min_generate = min_syn_benign
+            elif int(class_label) == 1:
+                class_min_generate = min_syn_malicious
+            else:
+                class_min_generate = min_syn_per_class
+            n_generate = max(n_generate_base, class_min_generate)
             if n_generate <= 0:
                 continue
 
             logger.info(f"Class {class_label}: {len(Z_templates_pool)} templates (avg weight: {w_templates_pool.mean():.3f})")
+            if n_generate > n_generate_base:
+                logger.info(
+                    f"Class {class_label}: enforce synthetic minimum {class_min_generate} (base={n_generate_base} -> target={n_generate})"
+                )
 
             if use_weighted_sampling:
                 p = w_templates_pool.astype(np.float64)
@@ -636,10 +659,16 @@ class TabDDPM(nn.Module):
                 else:
                     p = p / p_sum
                 idx = np.random.choice(len(Z_templates_pool), size=n_generate, replace=True, p=p)
-                w_templates = w_templates_pool[idx]
             else:
-                w_templates = np.repeat(w_templates_pool, repeats=mult_templates_pool, axis=0)
-            n_generate = int(w_templates.shape[0])
+                repeats = np.repeat(np.arange(len(Z_templates_pool)), repeats=mult_templates_pool, axis=0)
+                if len(repeats) > 0 and len(repeats) < n_generate:
+                    extra_idx = np.random.choice(len(Z_templates_pool), size=(n_generate - len(repeats)), replace=True)
+                    idx = np.concatenate([repeats, extra_idx], axis=0)
+                elif len(repeats) >= n_generate:
+                    idx = repeats[:n_generate]
+                else:
+                    idx = np.random.choice(len(Z_templates_pool), size=n_generate, replace=True)
+            n_generate = int(len(idx))
 
             guidance_scale = self.config.GUIDANCE_MALICIOUS if int(class_label) == 1 else self.config.GUIDANCE_BENIGN
             logger.info(f"Generating {n_generate} synthetic feature samples for class {class_label} (guidance={guidance_scale})")
@@ -675,9 +704,46 @@ class TabDDPM(nn.Module):
                 
                 Z_generated = self._mixup_augmentation(Z_templates_pool, Z_generated, alpha=mixup_alpha)
 
+            if class_min_generate > 0 and len(Z_generated) < class_min_generate:
+                n_deficit = int(class_min_generate - len(Z_generated))
+                logger.warning(
+                    f"Class {class_label}: generated {len(Z_generated)} < minimum {class_min_generate}, topping up {n_deficit} samples"
+                )
+                y_tensor_extra = torch.full((n_deficit,), int(class_label), dtype=torch.long, device=device)
+                Z_extra = []
+                batch_size = 4096
+                for i in range(0, n_deficit, batch_size):
+                    end_i = min(i + batch_size, n_deficit)
+                    batch_y = y_tensor_extra[i:end_i]
+                    batch_generated = self.sample(
+                        n_samples=len(batch_y),
+                        y=batch_y,
+                        x_cond=None,
+                        guidance_scale=guidance_scale,
+                        device=device
+                    )
+                    Z_extra.append(batch_generated.detach().cpu().numpy().astype(np.float32))
+                if len(Z_extra) > 0:
+                    Z_extra = np.concatenate(Z_extra, axis=0)
+                    if len(Z_generated) == 0:
+                        Z_generated = Z_extra
+                    else:
+                        Z_generated = np.concatenate([Z_generated, Z_extra], axis=0)
+
+            if use_weighted_sampling:
+                p_w = w_templates_pool.astype(np.float64)
+                p_w_sum = float(p_w.sum())
+                if p_w_sum <= 0:
+                    p_w = np.ones_like(p_w, dtype=np.float64) / max(len(p_w), 1)
+                else:
+                    p_w = p_w / p_w_sum
+                w_generated = np.random.choice(w_templates_pool, size=len(Z_generated), replace=True, p=p_w).astype(np.float32)
+            else:
+                w_generated = np.random.choice(w_templates_pool, size=len(Z_generated), replace=True).astype(np.float32)
+
             Z_synthetic_list.append(Z_generated)
             y_synthetic_list.append(np.full(len(Z_generated), int(class_label), dtype=int))
-            w_synthetic_list.append(w_templates[:len(Z_generated)].astype(np.float32))
+            w_synthetic_list.append(w_generated)
 
         if len(Z_synthetic_list) == 0:
             logger.info("No synthetic feature samples generated; returning original features")

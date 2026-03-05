@@ -827,20 +827,22 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         logger.info(f"  - 输入类型: 原始序列 (3D)")
     logger.info("")
 
-    # 原始样本权重划分策略：
-    # - 权重 <= 0.3: 无标签无监督训练
-    # - 权重 > 0.3 且 <= 0.9: 低权重有标签训练
-    # - 权重 > 0.9: 高权重有标签训练
+    # 原始样本权重划分策略（全部有监督，无无监督分支）：
+    # - 权重 <= 0.3: 低置信度有标签训练（原drop类），权重=0.3
+    # - 权重 > 0.3 且 <= 0.9: 中等置信度有标签训练，权重=1.0
+    # - 权重 > 0.9: 高置信度有标签训练，权重=STAGE4_REAL_HIGH_WEIGHT
+    # - 合成数据: 权重=0.8
     sw = np.asarray(sample_weights, dtype=np.float32) if hasattr(sample_weights, '__len__') else None
     unlabeled_thr = float(getattr(config, 'STAGE4_UNLABELED_WEIGHT_THRESHOLD', 0.3))
     high_weight_thr = float(getattr(config, 'STAGE4_HIGH_WEIGHT_THRESHOLD', 0.9))
-    real_high_weight = float(getattr(config, 'STAGE4_REAL_HIGH_WEIGHT', 2.0))
-    real_low_weight = float(getattr(config, 'STAGE4_REAL_LOW_WEIGHT', 0.5))
+    real_high_weight = float(getattr(config, 'STAGE4_REAL_HIGH_WEIGHT', 2.0))   # 原w>0.9 → STAGE4_REAL_HIGH_WEIGHT
+    real_low_weight = float(getattr(config, 'STAGE4_REAL_LOW_WEIGHT', 1.0))     # 原0.3<w≤0.9 → 1.0
+    real_drop_weight = float(getattr(config, 'STAGE4_REAL_DROP_WEIGHT', 0.3))   # 原w≤0.3 (drop类) → 0.3
     # 兼容旧配置
     sup_thr = float(getattr(config, 'STAGE3_SUP_WEIGHT_THRESHOLD', 0.8))
-    real_sup_weight = float(getattr(config, 'STAGE3_REAL_SUP_WEIGHT', 2.0))
-    syn_weight = float(getattr(config, 'STAGE3_SYN_WEIGHT', 1.0))
-    unlabeled_scale = float(getattr(config, 'STAGE3_UNLABELED_LOSS_SCALE', 1.0))
+    real_sup_weight = float(getattr(config, 'STAGE3_REAL_SUP_WEIGHT', 3.0))
+    syn_weight = float(getattr(config, 'STAGE3_SYN_WEIGHT', 0.8))               # 合成数据 → 0.8
+    unlabeled_scale = 0.0  # 强制禁用无监督 KL 损失
 
     orig_n = 0
     if n_original is not None:
@@ -851,12 +853,16 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
 
     orig_sup_mask = None
     orig_unlab_mask = None
+    orig_high_weight_mask = None
+    orig_low_weight_mask = None
     if sw is not None and orig_n > 0:
-        orig_unlab_mask = (sw[:orig_n] <= unlabeled_thr)
-        orig_high_weight_mask = (sw[:orig_n] > high_weight_thr)
-        orig_low_weight_mask = (~orig_unlab_mask) & (~orig_high_weight_mask)  # > 0.3 且 <= 0.9
-        orig_sup_mask = ~orig_unlab_mask  # 所有有标签的样本（包括高权重和低权重）
-        logger.info(f"� Stage4 原始样本权重划分: 无监督(≤{unlabeled_thr})={int(orig_unlab_mask.sum())}, 低权重({unlabeled_thr}<w≤{high_weight_thr})={int(orig_low_weight_mask.sum())}, 高权重(>{high_weight_thr})={int(orig_high_weight_mask.sum())}")
+        orig_drop_mask = (sw[:orig_n] <= unlabeled_thr)          # 原低置信度（≤0.3）
+        orig_high_weight_mask = (sw[:orig_n] > high_weight_thr)  # 高置信度（>0.9）
+        orig_low_weight_mask = (~orig_drop_mask) & (~orig_high_weight_mask)  # 中等置信度
+        orig_unlab_mask = np.zeros(orig_n, dtype=bool)  # 全部改为有监督，无无监督样本
+        orig_sup_mask = np.ones(orig_n, dtype=bool)     # 所有原始样本均参与有监督训练
+        logger.info(f"📊 Stage4 原始样本权重划分(全监督): drop类(≤{unlabeled_thr},w={real_drop_weight})={int(orig_drop_mask.sum())}, 中权重({unlabeled_thr}<w≤{high_weight_thr},w={real_low_weight})={int(orig_low_weight_mask.sum())}, 高权重(>{high_weight_thr},w={real_high_weight})={int(orig_high_weight_mask.sum())}")
+        logger.info(f"🎯 骨干梯度约束: 仅高权重原始样本(>{high_weight_thr})参与骨干微调，其余样本仅训练分类器")
 
     finetune_backbone_requested = bool(getattr(config, 'FINETUNE_BACKBONE', False))
 
@@ -897,12 +903,30 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             "增强特征批次": config.STAGE3_MIXED_SYN_BATCH_SIZE
         }, "混合训练配置")
     
+    classifier_epochs = int(getattr(config, 'FINETUNE_CLASSIFIER_EPOCHS', getattr(config, 'FINETUNE_EPOCHS', 500)))
+    if classifier_epochs <= 0:
+        logger.warning(
+            f"⚠️ FINETUNE_CLASSIFIER_EPOCHS={classifier_epochs} 非法，回退到 FINETUNE_EPOCHS={getattr(config, 'FINETUNE_EPOCHS', 500)}"
+        )
+        classifier_epochs = int(getattr(config, 'FINETUNE_EPOCHS', 500))
+    if classifier_epochs <= 0:
+        logger.warning("⚠️ 分类器训练轮数仍非法，强制设为1轮")
+        classifier_epochs = 1
+
     finetune_scope = str(getattr(config, 'FINETUNE_BACKBONE_SCOPE', 'projection')).lower()
     finetune_backbone_lr = float(getattr(config, 'FINETUNE_BACKBONE_LR', 1e-5))
     finetune_backbone_warmup_epochs = int(getattr(config, 'FINETUNE_BACKBONE_WARMUP_EPOCHS', 0))
+    finetune_three_stage = bool(getattr(config, 'FINETUNE_BACKBONE_THREE_STAGE', True))
+    finetune_stage1_epochs = int(getattr(config, 'FINETUNE_BACKBONE_STAGE1_EPOCHS', finetune_backbone_warmup_epochs))
+    finetune_stage2_epochs = int(getattr(config, 'FINETUNE_BACKBONE_STAGE2_EPOCHS', 0))
+    finetune_stage3_epochs_cfg = int(getattr(config, 'FINETUNE_BACKBONE_STAGE3_EPOCHS', -1))
+    backbone_max_train_epochs_cfg = int(getattr(config, 'FINETUNE_BACKBONE_MAX_EPOCHS', -1))
+    finetune_stage2_lr = float(getattr(config, 'FINETUNE_BACKBONE_STAGE2_LR', finetune_backbone_lr))
+    finetune_stage3_lr = float(getattr(config, 'FINETUNE_BACKBONE_STAGE3_LR', max(finetune_backbone_lr * 0.5, 1e-6)))
     
     if backbone_path is None:
         backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    initial_backbone_path = backbone_path
     
     log_input_paths(logger, {
         "增强特征": os.path.join(config.DATA_AUGMENTATION_DIR, "models", "augmented_features.npz"),
@@ -921,57 +945,152 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     else:
         logger.info(f"🔧 FocalLoss: alpha={config.FOCAL_ALPHA}, gamma={config.FOCAL_GAMMA}")
 
-    # 骨干网络微调策略
-    backbone_param_candidates = []
+    # 骨干网络微调策略（三阶段：head-only -> projection -> all）
+    projection_params = []
+    backbone_non_projection_params = []
+    has_projection = hasattr(backbone, 'projection')
+    if has_projection:
+        projection_params = list(backbone.projection.parameters())
+
     if finetune_backbone_requested:
-        if finetune_scope == 'all':
-            backbone_param_candidates = list(backbone.parameters())
-        elif finetune_scope == 'projection':
-            if hasattr(backbone, 'projection'):
-                backbone_param_candidates = list(backbone.projection.parameters())
-            else:
+        all_backbone_params = list(backbone.parameters())
+        if finetune_scope == 'projection':
+            if not has_projection or len(projection_params) == 0:
                 logger.warning("⚠️ backbone没有projection层，回退到冻结模式")
                 finetune_backbone_requested = False
+            else:
+                finetune_three_stage = False
+        elif finetune_scope == 'all':
+            if has_projection and len(projection_params) > 0:
+                proj_ids = {id(p) for p in projection_params}
+                backbone_non_projection_params = [p for p in all_backbone_params if id(p) not in proj_ids]
+            else:
+                backbone_non_projection_params = all_backbone_params
+        else:
+            logger.warning(f"⚠️ 未知FINETUNE_BACKBONE_SCOPE={finetune_scope}，回退到all")
+            finetune_scope = 'all'
+            if has_projection and len(projection_params) > 0:
+                proj_ids = {id(p) for p in projection_params}
+                backbone_non_projection_params = [p for p in all_backbone_params if id(p) not in proj_ids]
+            else:
+                backbone_non_projection_params = all_backbone_params
 
     backbone_finetune_active = False
     backbone_finetune_started = False
+    current_backbone_phase = 'head'
+    projection_group_idx = None
+    non_projection_group_idx = None
 
-    def _set_backbone_trainable(enable: bool) -> None:
-        nonlocal backbone_finetune_active, backbone_finetune_started, finetune_backbone_requested
+    stage1_epochs = max(0, min(int(finetune_stage1_epochs), int(classifier_epochs)))
+    stage2_epochs = max(0, min(int(finetune_stage2_epochs), max(int(classifier_epochs - stage1_epochs), 0)))
+    stage3_epochs = None
+    if finetune_three_stage and finetune_scope == 'all' and finetune_stage3_epochs_cfg >= 0:
+        stage3_epochs = max(0, int(finetune_stage3_epochs_cfg))
+        stage3_epochs = min(stage3_epochs, max(int(classifier_epochs - stage1_epochs - stage2_epochs), 0))
+
+    backbone_train_end_epoch = None
+    if finetune_backbone_requested:
+        trainable_end_candidates = []
+        if finetune_three_stage and finetune_scope == 'all' and stage3_epochs is not None:
+            trainable_end_candidates.append(stage1_epochs + stage2_epochs + stage3_epochs)
+        if backbone_max_train_epochs_cfg >= 0:
+            trainable_end_candidates.append(backbone_max_train_epochs_cfg)
+        if len(trainable_end_candidates) > 0:
+            backbone_train_end_epoch = int(min(trainable_end_candidates))
+            backbone_train_end_epoch = max(0, min(backbone_train_end_epoch, int(classifier_epochs)))
+
+    if finetune_backbone_requested and finetune_three_stage and finetune_scope == 'all':
+        phase3_desc = "其余轮" if stage3_epochs is None else f"{stage3_epochs}轮"
+        logger.info(
+            f"🧭 三阶段微调启用: "
+            f"Phase1(head)={stage1_epochs}轮, "
+            f"Phase2(projection)={stage2_epochs}轮(lr={finetune_stage2_lr}), "
+            f"Phase3(all)={phase3_desc}(lr={finetune_stage3_lr})"
+        )
+    elif finetune_backbone_requested:
+        logger.info(f"🧭 骨干微调启用: scope={finetune_scope}, lr={finetune_backbone_lr}")
+    if finetune_backbone_requested and backbone_train_end_epoch is not None:
+        logger.info(
+            f"🧩 骨干可训练轮数上限: 前{backbone_train_end_epoch}轮；达到后自动冻结骨干，仅训练分类器"
+        )
+
+    def _set_backbone_trainable(mode: str) -> None:
+        nonlocal backbone_finetune_active, backbone_finetune_started
         backbone.freeze()
-        if not enable or not finetune_backbone_requested:
+        if (not finetune_backbone_requested) or mode == 'head':
             backbone.eval()
             backbone_finetune_active = False
             return
 
-        if finetune_scope == 'all':
-            backbone.unfreeze()
-        elif finetune_scope == 'projection':
+        if mode == 'projection':
             if hasattr(backbone, 'projection'):
                 for p in backbone.projection.parameters():
                     p.requires_grad = True
+        elif mode == 'all':
+            backbone.unfreeze()
 
         backbone.train()
         backbone_finetune_active = True
         backbone_finetune_started = True
 
-    if finetune_backbone_requested and finetune_backbone_warmup_epochs > 0:
-        _set_backbone_trainable(False)
-        logger.info(f"🧊 骨干网络前{finetune_backbone_warmup_epochs}轮冻结，之后微调(scope={finetune_scope})")
-    elif finetune_backbone_requested:
-        _set_backbone_trainable(True)
-        logger.info(f"🔥 骨干网络微调已启用 (scope={finetune_scope})")
-    else:
-        _set_backbone_trainable(False)
+    def _resolve_backbone_phase(epoch_idx: int) -> str:
+        if not finetune_backbone_requested:
+            return 'head'
+        if backbone_train_end_epoch is not None and epoch_idx >= backbone_train_end_epoch:
+            return 'head'
+        if finetune_scope == 'projection':
+            if epoch_idx < stage1_epochs:
+                return 'head'
+            return 'projection'
+        if not finetune_three_stage:
+            if epoch_idx < finetune_backbone_warmup_epochs:
+                return 'head'
+            return 'all'
+        if epoch_idx < stage1_epochs:
+            return 'head'
+        if epoch_idx < (stage1_epochs + stage2_epochs) and has_projection and len(projection_params) > 0:
+            return 'projection'
+        return 'all'
 
-    # 优化器
+    # 优化器（参数组按阶段动态开关）
     param_groups = [{'params': classifier.dual_mlp.parameters(), 'lr': float(config.FINETUNE_LR)}]
-    if finetune_backbone_requested and len(backbone_param_candidates) > 0:
-        param_groups.append({'params': backbone_param_candidates, 'lr': finetune_backbone_lr})
-        logger.info(f"✓ 优化器包含骨干网络参数: {len(backbone_param_candidates)} | lr={finetune_backbone_lr}")
+    if finetune_backbone_requested and has_projection and len(projection_params) > 0:
+        projection_group_idx = len(param_groups)
+        param_groups.append({'params': projection_params, 'lr': 0.0})
+    if finetune_backbone_requested and finetune_scope == 'all' and len(backbone_non_projection_params) > 0:
+        non_projection_group_idx = len(param_groups)
+        param_groups.append({'params': backbone_non_projection_params, 'lr': 0.0})
 
     optimizer = optim.AdamW(param_groups, weight_decay=config.PRETRAIN_WEIGHT_DECAY)
     logger.info("✓ 优化器初始化完成")
+
+    def _apply_backbone_phase(phase: str, epoch_idx: int) -> None:
+        _set_backbone_trainable(phase)
+        if projection_group_idx is not None:
+            optimizer.param_groups[projection_group_idx]['lr'] = finetune_stage2_lr if phase in ('projection', 'all') else 0.0
+        if non_projection_group_idx is not None:
+            optimizer.param_groups[non_projection_group_idx]['lr'] = finetune_stage3_lr if phase == 'all' else 0.0
+
+        phase_name = {
+            'head': 'Phase1-HeadOnly',
+            'projection': 'Phase2-Projection',
+            'all': 'Phase3-AllBackbone',
+        }.get(phase, phase)
+        if (
+            phase == 'head'
+            and finetune_backbone_requested
+            and backbone_train_end_epoch is not None
+            and epoch_idx >= backbone_train_end_epoch
+        ):
+            phase_name = 'BackboneFrozen-ClassifierOnly'
+        logger.info(
+            f"🔁 切换微调阶段: {phase_name} (epoch={epoch_idx+1}) | "
+            f"proj_lr={optimizer.param_groups[projection_group_idx]['lr'] if projection_group_idx is not None else 0.0} | "
+            f"backbone_lr={optimizer.param_groups[non_projection_group_idx]['lr'] if non_projection_group_idx is not None else 0.0}"
+        )
+
+    current_backbone_phase = _resolve_backbone_phase(0)
+    _apply_backbone_phase(current_backbone_phase, 0)
     
     # 验证集划分
     val_split = float(getattr(config, 'FINETUNE_VAL_SPLIT', 0.0))
@@ -1012,37 +1131,33 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     if syn_idx_start < len(sw_np):
         syn_mask[syn_idx_start:] = True
 
+    # 全监督模式：所有样本（含原来的drop类）统一纳入有监督训练
     sup_mask = syn_mask.copy()
-    unlab_mask = np.zeros(len(sw_np), dtype=bool)
+    unlab_mask = np.zeros(len(sw_np), dtype=bool)  # 无无监督样本
     if orig_n > 0 and orig_sup_mask is not None:
-        sup_mask[:orig_n] = orig_sup_mask
-        unlab_mask[:orig_n] = orig_unlab_mask
+        sup_mask[:orig_n] = orig_sup_mask  # orig_sup_mask 已全为 True
     else:
-        # 无 n_original 信息时：按权重阈值划分（保守）
-        if sw is not None:
-            unlab_mask = (sw_np <= unlabeled_thr)
-            sup_mask = ~unlab_mask
+        # 无 n_original 信息时：全部作为有监督
+        sup_mask = np.ones(len(sw_np), dtype=bool)
 
-    # 监督样本权重：原始高权重=2.0，原始低权重=0.5，合成=1.0
+    # 监督样本权重：高权重=STAGE4_REAL_HIGH_WEIGHT，中权重=1.0，drop类=0.3，合成=0.8
     sw_sup = np.ones(int(sup_mask.sum()), dtype=np.float32) * syn_weight
     try:
         if orig_n > 0 and orig_sup_mask is not None and orig_high_weight_mask is not None and orig_low_weight_mask is not None:
-            # 获取原始样本在监督数据集中的位置
-            orig_sup_in_mask = orig_sup_mask[:orig_n]
-            orig_high_in_mask = orig_high_weight_mask[:orig_n]
-            orig_low_in_mask = orig_low_weight_mask[:orig_n]
-            
+            orig_drop_mask_full = (sw[:orig_n] <= unlabeled_thr) if sw is not None else np.zeros(orig_n, dtype=bool)
             # 在sup_mask中找到原始样本的位置
             sup_indices = np.where(sup_mask)[0]
             orig_sup_positions = [i for i, idx in enumerate(sup_indices) if idx < orig_n]
-            
+
             for pos in orig_sup_positions:
                 orig_idx = sup_indices[pos]
                 if orig_idx < orig_n:
-                    if orig_high_in_mask[orig_idx]:
-                        sw_sup[pos] = real_high_weight
-                    elif orig_low_in_mask[orig_idx]:
-                        sw_sup[pos] = real_low_weight
+                    if orig_high_weight_mask[orig_idx]:
+                        sw_sup[pos] = real_high_weight   # 高置信度 → STAGE4_REAL_HIGH_WEIGHT
+                    elif orig_low_weight_mask[orig_idx]:
+                        sw_sup[pos] = real_low_weight    # 中置信度 → 1.0
+                    else:
+                        sw_sup[pos] = real_drop_weight   # drop类（原≤0.3）→ 0.3
     except Exception as e:
         logger.warning(f"⚠️ 权重分配失败，使用默认权重: {e}")
         pass
@@ -1085,44 +1200,42 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     else:
         train_loader = DataLoader(train_dataset, batch_size=config.FINETUNE_BATCH_SIZE, shuffle=True)
     
-    # 混合训练数据加载器（原始序列分为 supervised / unlabeled）
+    # 混合训练数据加载器（原始序列全部为有监督，无无标签分支）
     real_loader = None
-    unlab_real_loader = None
+    unlab_real_loader = None  # 无监督分支已禁用
     if use_mixed_stream and has_real_sequences:
         n_real = len(X_train_real)
         real_n = min(int(orig_n), int(n_real)) if orig_n > 0 else min(len(y_train_split), int(n_real))
 
         y_real_all = y_np[:real_n]
-        if orig_sup_mask is None or orig_unlab_mask is None or real_n == 0:
-            real_sup_sel = np.ones(real_n, dtype=bool)
-            real_unlab_sel = np.zeros(real_n, dtype=bool)
-        else:
-            real_sup_sel = orig_sup_mask[:real_n]
-            real_unlab_sel = orig_unlab_mask[:real_n]
+        # 全监督：所有原始序列均参与有监督训练
+        real_sup_sel = np.ones(real_n, dtype=bool)
 
         X_real_sup = X_train_real[:real_n][real_sup_sel]
         y_real_sup = y_real_all[real_sup_sel]
-        # 根据权重分配：高权重=2.0，低权重=0.5
-        w_real_sup = np.ones(len(y_real_sup), dtype=np.float32) * real_low_weight
+        # 权重分配：高置信度=STAGE4_REAL_HIGH_WEIGHT，中置信度=1.0，drop类=0.3
+        w_real_sup = np.ones(len(y_real_sup), dtype=np.float32) * real_drop_weight  # 默认drop类权重
+        high_real_sup = np.zeros(len(y_real_sup), dtype=np.float32)
         if orig_high_weight_mask is not None and orig_low_weight_mask is not None:
-            # 在real_sup_sel中选择的样本中，找出哪些是高权重，哪些是低权重
+            orig_drop_mask_real = (sw[:real_n] <= unlabeled_thr) if sw is not None else np.zeros(real_n, dtype=bool)
             real_high_in_sup = orig_high_weight_mask[:real_n][real_sup_sel]
             real_low_in_sup = orig_low_weight_mask[:real_n][real_sup_sel]
-            w_real_sup[real_high_in_sup] = real_high_weight
-            w_real_sup[real_low_in_sup] = real_low_weight
+            real_drop_in_sup = orig_drop_mask_real[real_sup_sel]
+            w_real_sup[real_high_in_sup] = real_high_weight   # 高置信度 → STAGE4_REAL_HIGH_WEIGHT
+            w_real_sup[real_low_in_sup] = real_low_weight     # 中置信度 → 1.0
+            w_real_sup[real_drop_in_sup] = real_drop_weight   # drop类 → 0.3
+            high_real_sup[real_high_in_sup] = 1.0
 
         real_dataset = TensorDataset(
             torch.FloatTensor(X_real_sup),
             torch.LongTensor(y_real_sup),
-            torch.FloatTensor(w_real_sup)
+            torch.FloatTensor(w_real_sup),
+            torch.FloatTensor(high_real_sup)
         )
         real_batch_size = int(getattr(config, 'STAGE3_MIXED_REAL_BATCH_SIZE', 32))
         real_loader = DataLoader(real_dataset, batch_size=real_batch_size, shuffle=True)
 
-        if int(real_unlab_sel.sum()) > 0:
-            X_real_unlab = X_train_real[:real_n][real_unlab_sel]
-            unlab_real_dataset = TensorDataset(torch.FloatTensor(X_real_unlab))
-            unlab_real_loader = DataLoader(unlab_real_dataset, batch_size=real_batch_size, shuffle=True)
+        # 无标签分支已禁用，unlab_real_loader 保持 None
 
         syn_batch_size = int(getattr(config, 'STAGE3_MIXED_SYN_BATCH_SIZE', 96))
         train_loader = DataLoader(train_dataset, batch_size=syn_batch_size, shuffle=True)
@@ -1146,6 +1259,7 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     best_f1 = -1.0
     best_epoch = -1
     best_state = None
+    best_backbone_state = None
     best_threshold = float(getattr(config, 'MALICIOUS_THRESHOLD', 0.5))
     finetuned_backbone_path = None
 
@@ -1156,7 +1270,8 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     use_early_stopping = bool(getattr(config, 'FINETUNE_EARLY_STOPPING', False))
     es_warmup_epochs = int(getattr(config, 'FINETUNE_ES_WARMUP_EPOCHS', 30))
     es_patience = int(getattr(config, 'FINETUNE_ES_PATIENCE', 25))
-    es_min_delta = float(getattr(config, 'FINETUNE_ES_MIN_DELTA', 0.0))  # 改为0.0，使用纯耐心值策略
+    # 统一“最佳模型更新”和“早停计数重置”的改善阈值，避免两套标准导致日志/行为不一致
+    es_min_delta = float(getattr(config, 'FINETUNE_ES_MIN_DELTA', 0.0))
     no_improve_count = 0
     best_es_metric = -1.0
     allow_train_metric_es = bool(getattr(config, 'FINETUNE_ES_ALLOW_TRAIN_METRIC', False))
@@ -1170,11 +1285,12 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     
     log_subsection_header(logger, "开始训练")
     
-    for epoch in range(config.FINETUNE_EPOCHS):
-        # 骨干网络微调激活
-        if finetune_backbone_requested and (not backbone_finetune_active) and (epoch >= finetune_backbone_warmup_epochs):
-            _set_backbone_trainable(True)
-            logger.info(f"🔥 骨干网络微调在epoch {epoch+1}激活 (scope={finetune_scope})")
+    for epoch in range(classifier_epochs):
+        # 三阶段微调状态机
+        next_backbone_phase = _resolve_backbone_phase(epoch)
+        if next_backbone_phase != current_backbone_phase:
+            current_backbone_phase = next_backbone_phase
+            _apply_backbone_phase(current_backbone_phase, epoch)
         
         epoch_loss = 0.0
         epoch_losses = {'total': 0.0, 'supervision': 0.0, 'stream_a': 0.0, 'stream_b': 0.0}
@@ -1189,10 +1305,11 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             unlab_iter = itertools.cycle(unlab_real_loader) if unlab_real_loader is not None else None
             
             for batch_idx in range(max_batches):
-                X_real, y_real, w_real = next(real_iter)
+                X_real, y_real, w_real, high_real = next(real_iter)
                 X_real = X_real.to(config.DEVICE)
                 y_real = y_real.to(config.DEVICE)
                 w_real = w_real.to(config.DEVICE)
+                high_real = (high_real.to(config.DEVICE) > 0.5)
                 
                 Z_syn, y_syn, w_syn = next(syn_iter)
                 Z_syn = Z_syn.to(config.DEVICE)
@@ -1203,28 +1320,20 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
                 
                 if backbone_finetune_active:
                     z_real = backbone(X_real, return_sequence=False)
+                    # 骨干仅由高权重样本更新；其余样本仍用于分类器监督
+                    if torch.any(high_real):
+                        z_real = torch.where(high_real.unsqueeze(1), z_real, z_real.detach())
+                    else:
+                        z_real = z_real.detach()
                 else:
                     with torch.no_grad():
                         z_real = backbone(X_real, return_sequence=False)
                 
-                loss_real, loss_dict_real = criterion(classifier.dual_mlp, z_real, y_real, w_real, epoch, config.FINETUNE_EPOCHS)
-                loss_syn, loss_dict_syn = criterion(classifier.dual_mlp, Z_syn, y_syn, w_syn, epoch, config.FINETUNE_EPOCHS)
+                loss_real, loss_dict_real = criterion(classifier.dual_mlp, z_real, y_real, w_real, epoch, classifier_epochs)
+                loss_syn, loss_dict_syn = criterion(classifier.dual_mlp, Z_syn, y_syn, w_syn, epoch, classifier_epochs)
 
-                loss_unlab = 0.0
-                if unlab_iter is not None and unlabeled_scale > 0:
-                    (X_unlab_real,) = next(unlab_iter)
-                    X_unlab_real = X_unlab_real.to(config.DEVICE)
-                    if backbone_finetune_active:
-                        z_unlab = backbone(X_unlab_real, return_sequence=False)
-                    else:
-                        with torch.no_grad():
-                            z_unlab = backbone(X_unlab_real, return_sequence=False)
-                    logits_a, logits_b = classifier.dual_mlp(z_unlab, return_separate=True)
-                    p_a = torch.softmax(logits_a, dim=1)
-                    p_b = torch.softmax(logits_b, dim=1)
-                    loss_unlab = _sym_kl(p_a, p_b).mean()
-
-                loss = real_loss_scale * loss_real + syn_loss_scale * loss_syn + unlabeled_scale * loss_unlab
+                # 无监督 KL 损失已禁用（unlabeled_scale=0.0），直接跳过
+                loss = real_loss_scale * loss_real + syn_loss_scale * loss_syn
                 loss.backward()
                 optimizer.step()
                 
@@ -1255,27 +1364,20 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
                 else:
                     if backbone_finetune_active:
                         z = backbone(X_batch, return_sequence=False)
+                        # 序列直训时同样仅高权重样本更新骨干，其余样本仅训练分类器头
+                        high_batch = (w_batch >= (real_high_weight - 1e-6))
+                        if torch.any(high_batch):
+                            z = torch.where(high_batch.unsqueeze(1), z, z.detach())
+                        else:
+                            z = z.detach()
                     else:
                         with torch.no_grad():
                             z = backbone(X_batch, return_sequence=False)
 
-                loss, loss_dict = criterion(classifier.dual_mlp, z, y_batch, w_batch, epoch, config.FINETUNE_EPOCHS)
+                loss, loss_dict = criterion(classifier.dual_mlp, z, y_batch, w_batch, epoch, classifier_epochs)
 
-                # 无标签半监督：对低权重原始样本做双头一致性（仅特征模式有效）
-                loss_unlab = 0.0
-                if unlab_dataset is not None and unlabeled_scale > 0:
-                    try:
-                        (X_unlab_feat,) = next(unlab_iter)
-                    except Exception:
-                        unlab_iter = iter(DataLoader(unlab_dataset, batch_size=config.FINETUNE_BATCH_SIZE, shuffle=True))
-                        (X_unlab_feat,) = next(unlab_iter)
-                    X_unlab_feat = X_unlab_feat.to(config.DEVICE)
-                    logits_a, logits_b = classifier.dual_mlp(X_unlab_feat, return_separate=True)
-                    p_a = torch.softmax(logits_a, dim=1)
-                    p_b = torch.softmax(logits_b, dim=1)
-                    loss_unlab = _sym_kl(p_a, p_b).mean()
-
-                (loss + unlabeled_scale * loss_unlab).backward()
+                # 无监督 KL 损失已禁用（unlabeled_scale=0.0），直接进行有监督反向传播
+                loss.backward()
                 optimizer.step()
 
                 epoch_loss += float(loss_dict['total'])
@@ -1300,7 +1402,10 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         # 记录最后K轮的loss最小模型（仅用于训练结束后选取一个保存）
         if keep_last_k_minloss > 0:
             current_state = {k: v.detach().cpu().clone() for k, v in classifier.state_dict().items()}
-            last_k_loss_states.append((int(epoch + 1), float(epoch_loss), current_state))
+            current_backbone_state = None
+            if backbone_finetune_started:
+                current_backbone_state = {k: v.detach().cpu().clone() for k, v in backbone.state_dict().items()}
+            last_k_loss_states.append((int(epoch + 1), float(epoch_loss), current_state, current_backbone_state))
             if len(last_k_loss_states) > keep_last_k_minloss:
                 last_k_loss_states = last_k_loss_states[-keep_last_k_minloss:]
         
@@ -1365,17 +1470,25 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             val_preds = (val_probs[:, 1] >= float(val_threshold)).astype(int)
             val_f1 = f1_score(val_labels, val_preds, pos_label=1, zero_division=0)
 
-            if val_f1 > best_f1:
+            if (float(val_f1) - float(best_f1)) > es_min_delta:
                 best_f1 = float(val_f1)
                 best_epoch = int(epoch + 1)
                 best_threshold = float(val_threshold)
                 best_state = {k: v.detach().cpu().clone() for k, v in classifier.state_dict().items()}
+                if backbone_finetune_started:
+                    best_backbone_state = {k: v.detach().cpu().clone() for k, v in backbone.state_dict().items()}
+                else:
+                    best_backbone_state = None
         else:
-            if train_f1_star is not None and train_f1_star > best_f1:
+            if train_f1_star is not None and (float(train_f1_star) - float(best_f1)) > es_min_delta:
                 best_f1 = float(train_f1_star)
                 best_epoch = int(epoch + 1)
                 best_threshold = float(train_threshold_star)
                 best_state = {k: v.detach().cpu().clone() for k, v in classifier.state_dict().items()}
+                if backbone_finetune_started:
+                    best_backbone_state = {k: v.detach().cpu().clone() for k, v in backbone.state_dict().items()}
+                else:
+                    best_backbone_state = None
         
         classifier.train()
         
@@ -1396,10 +1509,10 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             history['val_ap'].append(val_ap if val_ap is not None else np.nan)
         
         # 输出日志（先输出再早停，保证触发早停的最后一轮也有epoch日志）
-        progress = (epoch + 1) / config.FINETUNE_EPOCHS * 100
+        progress = (epoch + 1) / classifier_epochs * 100
         if val_f1 is not None:
             msg = (
-                f"[Stage 4] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
+                f"[Stage 4] Epoch [{epoch+1}/{classifier_epochs}] ({progress:.1f}%) | "
                 f"Loss: {epoch_loss:.4f} | "
                 f"L(total={epoch_losses['total']:.4f}, sup={epoch_losses['supervision']:.4f}, a={epoch_losses['stream_a']:.4f}, b={epoch_losses['stream_b']:.4f}) | "
                 f"TrF1: {train_f1:.4f} | ValF1*: {val_f1:.4f} | Th: {val_threshold:.4f}"
@@ -1411,7 +1524,7 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
             train_f1_star_disp = float(train_f1_star) if train_f1_star is not None else float('nan')
             train_th_star_disp = float(train_threshold_star) if train_threshold_star is not None else float('nan')
             msg = (
-                f"[Stage 4] Epoch [{epoch+1}/{config.FINETUNE_EPOCHS}] ({progress:.1f}%) | "
+                f"[Stage 4] Epoch [{epoch+1}/{classifier_epochs}] ({progress:.1f}%) | "
                 f"Loss: {epoch_loss:.4f} | "
                 f"L(total={epoch_losses['total']:.4f}, sup={epoch_losses['supervision']:.4f}, a={epoch_losses['stream_a']:.4f}, b={epoch_losses['stream_b']:.4f}) | "
                 f"TrF1: {train_f1:.4f} | TrF1*: {train_f1_star_disp:.4f} | Th: {train_th_star_disp:.4f}"
@@ -1440,7 +1553,7 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
         "最终损失": f"{history['train_loss'][-1]:.4f}",
         "最终F1": f"{history['train_f1'][-1]:.4f}",
         "最佳F1": f"{best_f1:.4f} (epoch {best_epoch})" if best_epoch > 0 else "N/A",
-        "实际训练轮数": f"{actual_epochs}/{config.FINETUNE_EPOCHS}"
+        "实际训练轮数": f"{actual_epochs}/{classifier_epochs}"
     })
     
     # 生成特征可视化
@@ -1467,9 +1580,17 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     optimal_threshold = float(best_threshold)
     
     # 保存模型
+    backbone_best_f1_path = initial_backbone_path
+    backbone_final_path = initial_backbone_path
+
     if backbone_finetune_started:
         finetuned_backbone_path = os.path.join(config.CLASSIFICATION_DIR, "models", "backbone_finetuned.pth")
         torch.save(backbone.state_dict(), finetuned_backbone_path)
+        backbone_final_path = finetuned_backbone_path
+
+    if best_backbone_state is not None:
+        backbone_best_f1_path = os.path.join(config.CLASSIFICATION_DIR, "models", "backbone_best_f1.pth")
+        torch.save(best_backbone_state, backbone_best_f1_path)
 
     if best_state is not None:
         best_path = os.path.join(config.CLASSIFICATION_DIR, "models", "classifier_best_f1.pth")
@@ -1477,15 +1598,23 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
 
     # 保存最后10轮(默认)中loss最小的模型
     minloss_path = None
+    minloss_backbone_path = None
     if keep_last_k_minloss > 0 and len(last_k_loss_states) > 0:
         try:
-            min_epoch, min_loss, min_state = min(last_k_loss_states, key=lambda t: float(t[1]))
+            min_epoch, min_loss, min_state, min_backbone_state = min(last_k_loss_states, key=lambda t: float(t[1]))
             minloss_path = os.path.join(
                 config.CLASSIFICATION_DIR,
                 "models",
                 f"classifier_last{int(keep_last_k_minloss)}_minloss_epoch{int(min_epoch)}.pth"
             )
             torch.save(min_state, minloss_path)
+            if min_backbone_state is not None:
+                minloss_backbone_path = os.path.join(
+                    config.CLASSIFICATION_DIR,
+                    "models",
+                    f"backbone_last{int(keep_last_k_minloss)}_minloss_epoch{int(min_epoch)}.pth"
+                )
+                torch.save(min_backbone_state, minloss_backbone_path)
             logger.info(f"✓ 已保存最后{int(keep_last_k_minloss)}轮中loss最小模型: epoch={int(min_epoch)} loss={float(min_loss):.6f}")
         except Exception as e:
             logger.warning(f"⚠ 保存最后{int(keep_last_k_minloss)}轮loss最小模型失败: {e}")
@@ -1497,19 +1626,30 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     history_path = os.path.join(config.CLASSIFICATION_DIR, "models", "training_history.npz")
     np.savez(history_path, **{k: np.array(v) for k, v in history.items()})
     
-    # 保存元数据
-    if finetuned_backbone_path is not None:
-        backbone_path = finetuned_backbone_path
-    elif backbone_path is None:
-        backbone_path = os.path.join(config.FEATURE_EXTRACTION_DIR, "models", "backbone_pretrained.pth")
+    # 保存元数据（默认 backbone_path 指向 best_f1 配对骨干，兼容旧测试逻辑）
+    if backbone_best_f1_path is None:
+        backbone_best_f1_path = initial_backbone_path
+    if backbone_final_path is None:
+        backbone_final_path = initial_backbone_path
+
+    model_backbone_pairs = {
+        "classifier_best_f1.pth": backbone_best_f1_path,
+        "classifier_final.pth": backbone_final_path,
+    }
+    if minloss_path is not None:
+        model_backbone_pairs[os.path.basename(minloss_path)] = minloss_backbone_path if minloss_backbone_path is not None else backbone_final_path
     
     metadata_path = os.path.join(config.CLASSIFICATION_DIR, "models", "model_metadata.json")
     metadata = {
-        'backbone_path': backbone_path,
+        'backbone_path': backbone_best_f1_path,
+        'backbone_best_f1_path': backbone_best_f1_path,
+        'backbone_final_path': backbone_final_path,
+        'model_backbone_pairs': model_backbone_pairs,
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'n_samples': len(X_train),
         'n_original': n_original if n_original is not None else len(X_train),
-        'finetune_epochs': config.FINETUNE_EPOCHS,
+        'finetune_epochs': classifier_epochs,
+        'backbone_trainable_epochs': backbone_train_end_epoch if backbone_train_end_epoch is not None else (classifier_epochs if finetune_backbone_requested else 0),
         'input_is_features': input_is_features,
         'feature_dim': int(getattr(config, 'OUTPUT_DIM', config.MODEL_DIM)),
     }
@@ -1525,8 +1665,12 @@ def stage4_finetune_classifier(backbone, X_train, y_train, sample_weights, confi
     }
     if minloss_path is not None:
         output_files[f"最后{int(keep_last_k_minloss)}轮loss最小模型"] = minloss_path
+    if minloss_backbone_path is not None:
+        output_files[f"最后{int(keep_last_k_minloss)}轮loss最小配对骨干"] = minloss_backbone_path
+    if best_backbone_state is not None:
+        output_files["最佳配对骨干网络"] = backbone_best_f1_path
     if finetuned_backbone_path:
-        output_files["微调骨干网络"] = finetuned_backbone_path
+        output_files["微调骨干网络(最终)"] = finetuned_backbone_path
     
     log_output_paths(logger, output_files)
     
@@ -1827,11 +1971,12 @@ def main(args):
     plot_training_history(finetune_history, history_fig_path)
     
     # 最终总结
+    classifier_epochs_for_log = int(getattr(config, 'FINETUNE_CLASSIFIER_EPOCHS', getattr(config, 'FINETUNE_EPOCHS', 0)))
     log_final_summary(logger, "训练完成", {
         "Stage 1": f"骨干网络预训练 - {config.PRETRAIN_EPOCHS} epochs",
         "Stage 2": "标签矫正 - 完成",
         "Stage 3": "数据增强 - 完成",
-        "Stage 4": f"分类器微调 - {config.FINETUNE_EPOCHS} epochs"
+        "Stage 4": f"分类器微调 - {classifier_epochs_for_log} epochs"
     }, {
         "特征提取": config.FEATURE_EXTRACTION_DIR,
         "标签矫正": config.LABEL_CORRECTION_DIR,

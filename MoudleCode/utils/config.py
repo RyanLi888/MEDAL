@@ -22,13 +22,17 @@ MEDAL-Lite 统一配置文件 (重构版 v2.6)
 - Accuracy: 0.9822
 - 最优阈值: 0.7579
 
-关键配置：
+关键配置（v3-clean）：
 - TabDDPM: 5x增强（特征空间）
 - 混合训练: 32 real + 96 synthetic batches
 - 骨干微调: 关闭（冻结骨干网络）
 - 损失权重: real=2.0, synthetic=1.0
 - Co-teaching: 禁用（数据无标签噪声）
 - 训练轮数: 1000 epochs
+
+说明（v3-clean）：
+- 已删除项目代码中未引用的遗留配置项，保留当前训练/评估主链路必需配置
+- 若后续恢复旧实验分支，请按需重新引入对应参数
 
 更新日志（v2.6 - 2026-01-11）：
 - 数据增强策略优化：
@@ -105,21 +109,15 @@ class Config:
     # ============================================================
     # 数据集基础配置
     # ============================================================
-    LABEL_NOISE_RATE = 0.30  # 标签噪声率（30%）
-    LABEL_BENIGN = 0         # 正常流量标签
-    LABEL_MALICIOUS = 1      # 恶意流量标签
+    LABEL_NOISE_RATE = 0.35   # 标签噪声率（30%）
     
     # ============================================================
     # PCAP 预处理参数
     # ============================================================
-    SESSION_TIMEOUT = 60                    # 会话超时时间(秒)
-    TCP_FAST_RECONNECT_THRESHOLD = 5        # TCP快速重连阈值(秒)
-    ONE_FLOW_PER_5TUPLE = True              # 每个5元组一个流
     
     # 序列长度和特征配置
     SEQUENCE_LENGTH = 1024                  # 每个流最多1024个包
     MTU = 1500.0                            # 最大传输单元
-    TCP_WINDOW_MAX = 65535.0                # TCP窗口最大值
     
     # 特征定义 (MEDAL-Lite5: Length, Direction, BurstSize, LogIAT, ValidMask)
     FEATURE_NAMES = ['Length', 'Direction', 'BurstSize', 'LogIAT', 'ValidMask']
@@ -142,17 +140,14 @@ class Config:
     # 全局统计令牌（可选）
     USE_GLOBAL_STATS_TOKEN = False          # 是否启用第1025行全局统计
     EFFECTIVE_SEQUENCE_LENGTH = SEQUENCE_LENGTH + (1 if USE_GLOBAL_STATS_TOKEN else 0)
-    GLOBAL_STATS_MIN_PACKETS = 5            # 最少包数阈值
 
     # ============================================================
     # 骨干网络架构 (Dual-Stream Bi-Mamba)
     # ============================================================
-    BACKBONE_ARCH = 'dual_stream'           # 双流架构
     MODEL_DIM = 32                          # 嵌入维度
     OUTPUT_DIM = 32                         # 骨干网络输出维度
     FEATURE_DIM = OUTPUT_DIM                # 特征维度（用于下游任务）
     EMBEDDING_DROPOUT = 0.1                 # 嵌入层Dropout
-    POSITIONAL_ENCODING = "sinusoidal"      # 位置编码类型
     
     # ============================================================
     # 优化建议配置
@@ -219,7 +214,6 @@ class Config:
     
     # SupCon 参数（Legacy，保留兼容性）
     SUPCON_TEMPERATURE = 0.1
-    SUPCON_LAMBDA = 1.0
     
     # 1.5 流量数据增强（针对预训练）
     AUG_CROP_PROB = 0.8                     # 时序裁剪概率
@@ -244,9 +238,6 @@ class Config:
     TRAFFIC_AUG_BURST_JITTER_STD = 0.05     # Burst抖动标准差（±5%）
     
     # 日志配置
-    FEATURE_EXTRACTION_VERBOSE = True       # 显示详细日志
-    FEATURE_EXTRACTION_PROGRESS_BAR = True  # 显示进度条
-    FEATURE_EXTRACTION_VALIDATE = True      # 验证特征质量
 
     # ============================================================
     # STAGE 2: 标签矫正 + 数据增强 - 最优配置
@@ -257,10 +248,6 @@ class Config:
     STAGE2_FORCE_INDEPENDENT = True
 
     # 2.1 标签矫正策略（两阶段CL+KNN，去除MADE）
-    # KNN一致性等级阈值（用于判断KNN一致性等级：low < medium < high）
-    KNN_CONSISTENCY_MEDIUM_THRESHOLD = 0.5    # Medium等级阈值（>=此值为medium或high）
-    KNN_CONSISTENCY_HIGH_THRESHOLD = 0.7      # High等级阈值（>=此值为high）
-    
     # 2.1 Hybrid Court 标签矫正（三阶段策略）
     # 策略配置对应日志: label_correction_batch_20260121_005513.log
     # 启用 Phase2 保守补刀/救援策略（LateFlip 和 UndoFlip）
@@ -285,8 +272,6 @@ class Config:
     HC_PHASE1_KNN_MALICIOUS = 0.70          # 恶意样本KNN一致性阈值
     
     # Phase 2: 分级挽救阈值
-    HC_PHASE2_REWEIGHT_BASE_CL = 0.35       # 重加权基础准入线
-    HC_PHASE2_SYS_CONF_SPLIT = 0.30         # 系统置信度分界线
     # Phase 2 参数（旧设计：Conservative Fix/Rescue - 依赖Phase1动作）
     # 对应日志: Phase2: 保守优化策略 (旧设计)
     PHASE2_INDEPENDENT = False             # 使用保守补刀/救援策略（依赖Phase1动作）
@@ -312,22 +297,6 @@ class Config:
     PHASE2_UNDO_FLIP_P1_AUM_STRONG = -0.5   # P1翻转时AUM阈值（低于此值认为P1很坚决，给免死金牌）
     PHASE2_UNDO_FLIP_P2_AUM_WEAK = 1.5      # P2环境下AUM阈值（低于此值认为P2不认可）
     
-    # Phase 3: 锚点拯救阈值
-    HC_PHASE3_MIN_ANCHORS = 20              # 最少锚点样本数
-    HC_PHASE3_KNN_K = 15                    # 锚点KNN的K值
-    HC_PHASE3_RESCUE_KEEP_CONS = 0.70       # 拯救为Keep的最低一致性
-    HC_PHASE3_RESCUE_FLIP_CONS = 0.75       # 拯救为Flip的最低一致性
-    HC_PHASE3_RESCUE_KEEP_WEIGHT = 0.85     # 拯救Keep的权重
-    HC_PHASE3_RESCUE_FLIP_WEIGHT = 0.75     # 拯救Flip的权重
-    
-    # 权重分配（分层策略）
-    HC_WEIGHT_TIER1_CORE = 1.0              # Tier 1: 核心样本
-    HC_WEIGHT_TIER2_FLIP = 1.0              # Tier 2: 翻转样本
-    HC_WEIGHT_TIER3A_KEEP_HI = 1.0          # Tier 3a: 优质保持
-    HC_WEIGHT_TIER3B_KEEP_LO = 0.4          # Tier 3b: 存疑保持
-    HC_WEIGHT_TIER4A_REW_HI = 0.6           # Tier 4a: 优质重加权
-    HC_WEIGHT_TIER4B_REW_LO = 0.1           # Tier 4b: 噪声重加权
-    
     # CL (Confident Learning) 参数
     CL_K_FOLD = 5                           # K折交叉验证
     
@@ -349,8 +318,6 @@ class Config:
     # 预期结果: 750正常 + 500恶意 = 1250 (60%正常, 40%恶意)
     
     # 向后兼容：固定倍数模式
-    AUGMENTATION_RATIO_MIN = 1              # 最小倍数
-    AUGMENTATION_RATIO_MAX = 1              # 最大倍数
     
     # 分层增强策略（基于样本质量）
     STAGE2_FEATURE_TIER1_MIN_WEIGHT = 0.9   # Tier1最低权重
@@ -393,20 +360,18 @@ class Config:
     DEP_FEATURE_INDICES = [LENGTH_INDEX, BURST_SIZE_INDEX, LOG_IAT_INDEX]
     
     # 高级选项
-    ENABLE_COVARIANCE_MATCHING = False      # 协方差匹配
-    ENABLE_DISCRETE_QUANTIZATION = False    # 离散量化
-    DISCRETE_QUANTIZE_INDICES = []
-    DISCRETE_QUANTIZE_MAX_VALUES = 4096
     AUGMENT_USE_WEIGHTED_SAMPLING = True    # 加权采样
     
     # 增强模板质量门槛（v2.5：提高质量要求）
     AUGMENT_TEMPLATE_MIN_WEIGHT = 0.8       # 模板最低权重（0.7→0.8，更严格）
     AUGMENT_TEMPLATE_MIN_WEIGHT_HARD = 0.6  # 硬门槛（0.5→0.6，提高底线）
+    AUGMENT_MIN_SYN_PER_CLASS = 0           # 通用每类最少合成样本（0=不启用）
+    AUGMENT_MIN_SYN_BENIGN = 500            # 正常类最少合成样本数
+    AUGMENT_MIN_SYN_MALICIOUS = 500         # 恶意类最少合成样本数
     
     # 数据质量控制（新增 v2.5）
     AUGMENT_QUALITY_CHECK = True            # 启用质量检查
     AUGMENT_MAX_OUTLIER_RATIO = 0.05        # 最大离群点比例（5%）
-    AUGMENT_MIN_DIVERSITY_SCORE = 0.3       # 最小多样性分数
     
     # Mixup增强（新增 v2.6 - 提升样本多样性）
     AUGMENT_MIXUP_ENABLED = True            # 启用Mixup增强
@@ -414,9 +379,6 @@ class Config:
     AUGMENT_MIXUP_ALPHA_MALICIOUS = 0.3     # 恶意类Mixup强度（强混合，增加多样性）
     
     # 困难样本挖掘（新增 v2.6 - 针对性增强）
-    AUGMENT_HARD_MINING_ENABLED = False     # 启用困难样本挖掘（需要预训练模型）
-    AUGMENT_HARD_MINING_RATIO = 0.3         # Top 30%不确定性样本
-    AUGMENT_HARD_MINING_MULTIPLIER = 3      # 困难样本3倍增强
 
     # ============================================================
     # STAGE 3: 分类器微调 - 最优配置
@@ -428,29 +390,28 @@ class Config:
     CLASSIFIER_INPUT_IS_FEATURES = False    # 输入类型（False=序列，True=特征）
     
     # 3.2 训练基础参数
-    FINETUNE_EPOCHS = 500                  # 最大训练轮数（恢复最优配置）
+    # 兼容说明：
+    # - FINETUNE_CLASSIFIER_EPOCHS: Stage4 分类器训练总轮数（新参数，优先使用）
+    # - FINETUNE_EPOCHS: 兼容旧参数，未显式设置新参数时作为回退
+    FINETUNE_EPOCHS = 500                  # 兼容旧参数（建议改用 FINETUNE_CLASSIFIER_EPOCHS）
+    FINETUNE_CLASSIFIER_EPOCHS = 500       # 分类器训练总轮数（Stage4 主循环上限）
     FINETUNE_BATCH_SIZE = 128               # 批次大小
     FINETUNE_LR = 2e-4                      # 学习率
-    FINETUNE_MIN_LR = 1e-6                  # 最小学习率
     TEST_BATCH_SIZE = 256                   # 测试批次大小
     
     # 3.3 早停机制（智能训练终止）
-    FINETUNE_EARLY_STOPPING = True         # 启用早停
-    FINETUNE_ES_WARMUP_EPOCHS = 100         # 预热轮数（前N轮不触发早停）- 增加预热
-    FINETUNE_ES_PATIENCE = 50               # 耐心值（连续N轮无改善则停止）- 增加耐心
-    FINETUNE_ES_MIN_DELTA = 0.005         # F1改善阈值（需要明显改善）- 提高阈值
-    FINETUNE_ES_METRIC = 'f1_optimal'       # 监控指标
-    FINETUNE_ES_ALLOW_TRAIN_METRIC = True   # 允许使用训练集指标
+    FINETUNE_EARLY_STOPPING = True    # 启用早停
+    FINETUNE_ES_WARMUP_EPOCHS = 200         # 预热轮数（前N轮不触发早停）- 增加预热
+    FINETUNE_ES_PATIENCE = 80               # 耐心值（连续N轮无改善则停止）
+    FINETUNE_ES_MIN_DELTA = 0.005        # F1改善阈值（F1优先：允许更细粒度改进）
+    FINETUNE_ES_ALLOW_TRAIN_METRIC = True   # F1优先：禁用训练集指标早停，避免过拟合训练分布
     
     # 3.4 验证集配置（可选）
-    FINETUNE_VAL_SPLIT = 0               # 验证集比例（15%）- 启用验证集监控
-    FINETUNE_VAL_PER_CLASS = 0              # 每类固定验证样本数
-    VALIDATION_SIZE_ORIGINAL = 0.2          # 原始数据验证比例
-    VALIDATION_SIZE_SYNTHETIC = 0.1         # 合成数据验证比例
+    FINETUNE_VAL_SPLIT = 0               # 验证集比例（F1优先：启用验证集监控）
     
-    # 3.5 温室训练策略（强制1:1平衡采样）
+    # 3.5 温室训练策略（可配置类间采样比例）
     USE_BALANCED_SAMPLING = True            # 启用平衡采样
-    BALANCED_SAMPLING_RATIO = 1.0           # 目标比例（正常:恶意=1:1）
+    BALANCED_SAMPLING_RATIO = 1.0           # 目标比例（正常:恶意=1:2）
     
     # 3.6 骨干网络微调（最优配置）
     # 规则：分类器训练会自动适配 FINETUNE_BACKBONE 的选择
@@ -461,35 +422,40 @@ class Config:
     FINETUNE_BACKBONE_SCOPE = 'all'  # 微调范围
     FINETUNE_BACKBONE_LR = 2e-5             # 骨干网络学习率
     FINETUNE_BACKBONE_WARMUP_EPOCHS = 50    # 预热轮数
+    FINETUNE_BACKBONE_THREE_STAGE = True    # 三阶段微调：head-only -> projection -> all
+    FINETUNE_BACKBONE_STAGE1_EPOCHS = 50    # Phase1: 仅训练分类头
+    FINETUNE_BACKBONE_STAGE2_EPOCHS = 100   # Phase2: 仅微调projection
+    FINETUNE_BACKBONE_STAGE3_EPOCHS = -1    # Phase3: 全骨干轮数（-1=其余轮数）
+    FINETUNE_BACKBONE_MAX_EPOCHS = -1       # 骨干可训练总轮数上限（-1=不限制）
+    FINETUNE_BACKBONE_STAGE2_LR = 2e-5      # Phase2学习率（projection）
+    FINETUNE_BACKBONE_STAGE3_LR = 1e-5      # Phase3学习率（全骨干）
     
     # 3.7 混合训练模式（原始序列 + 增强特征）- 优化版 v2.4
     STAGE3_MIXED_STREAM = True              # 启用混合训练
     STAGE3_MIXED_REAL_BATCH_SIZE = 64       # 原始序列批次（提高真实数据占比）
     STAGE3_MIXED_SYN_BATCH_SIZE = 64        # 增强特征批次（降低synthetic主导）
-    STAGE3_MIXED_REAL_LOSS_SCALE = 3.0      # 原始数据损失权重（进一步强调真实序列）
-    STAGE3_MIXED_SYN_LOSS_SCALE = 0.8       # 增强数据损失权重（略降，抑制FP）
+    STAGE3_MIXED_REAL_LOSS_SCALE = 2.0      # 原始数据损失权重（进一步强调真实序列）
+    STAGE3_MIXED_SYN_LOSS_SCALE = 0.8       # 增强数据损失权重（进一步下调，抑制FP）
+
+    # 3.7.1 Stage4 样本权重映射（分类器训练）
+    # 原始样本：w>0.9 -> 2.0, 0.3<w<=0.9 -> 1.0, w<=0.3 -> 0.3
+    # 合成样本：0.8
+    STAGE4_REAL_HIGH_WEIGHT = 2.0
+    STAGE4_REAL_LOW_WEIGHT = 0.8
+    STAGE4_REAL_DROP_WEIGHT = 0.1
+    STAGE3_SYN_WEIGHT = 1.0
     
     # 3.8 在线数据增强（可选）
     STAGE3_ONLINE_AUGMENTATION = False      # 关闭在线增强
     
     # 3.9 ST-Mixup 增强（可选，默认关闭）
     STAGE3_USE_ST_MIXUP = False             # 关闭ST-Mixup
-    STAGE3_ST_MIXUP_MODE = 'intra_class'
     STAGE3_ST_MIXUP_ALPHA = 0.2
     STAGE3_ST_MIXUP_WARMUP_EPOCHS = 100
     STAGE3_ST_MIXUP_MAX_PROB = 0.3
     STAGE3_ST_MIXUP_TIME_SHIFT_RATIO = 0.15
     STAGE3_ST_MIXUP_UNCERTAINTY_THRESHOLD = 0.3
     
-    # 3.10 困难样本挖掘（可选，默认关闭）
-    STAGE3_HARD_MINING = False
-    STAGE3_HARD_MINING_WARMUP_EPOCHS = 5
-    STAGE3_HARD_MINING_FREQ_EPOCHS = 3
-    STAGE3_HARD_MINING_TOPK_RATIO = 0.2
-    STAGE3_HARD_MINING_MULTIPLIER = 3.0
-    STAGE3_HARD_MINING_POS_PROB_MAX = 0.70
-    STAGE3_HARD_MINING_NEG_PROB_MIN = 0.60
-
     # ============================================================
     # 损失函数配置（最优组合）
     # ============================================================
@@ -501,29 +467,16 @@ class Config:
     
     # 辅助损失（全部关闭 - 最优配置）
     USE_SOFT_F1_LOSS = False
-    SOFT_F1_WEIGHT = 0.1
     USE_BCE_LOSS = True                     # 启用BCE Loss
     BCE_POS_WEIGHT = 1.0                    # 正类（恶意类）权重
     BCE_LABEL_SMOOTHING = 0.1               # 标签平滑系数
     BCE_LABEL_SMOOTHING_MODE = 'traditional'  # 标签平滑模式: 'symmetric'(围绕0.5对称) 或 'traditional'(传统方式，接近硬标签)
     TEMPERATURE_SCALING = 1.5               # 温度缩放系数，>1.0使预测更"软"（更多中间概率），<1.0使预测更"硬"
-    SUP_LOSS_SCALE = 1.0
     USE_MARGIN_LOSS = False
-    MARGIN_M = 0.15
-    MARGIN_S = 1.0
-    MARGIN_LOSS_WEIGHT = 0.15
-    MARGIN_LOSS_WEIGHT_START = 0.0
-    MARGIN_LOSS_WEIGHT_END = 0.2
     USE_LOGIT_MARGIN = False
-    LOGIT_MARGIN_M = 0.25
-    LOGIT_MARGIN_WARMUP_EPOCHS = 30
     
     # Label Smoothing（减少过拟合）
     LABEL_SMOOTHING = 0.05
-    
-    # 类别权重（1:1平衡）
-    CLASS_WEIGHT_BENIGN = 1.0
-    CLASS_WEIGHT_MALICIOUS = 1.0
     
     # 决策阈值（最优配置）
     MALICIOUS_THRESHOLD = 0.5           # 最优阈值（基于测试集F1优化）
@@ -533,14 +486,11 @@ class Config:
     SOFT_ORTH_WEIGHT_END = 0.0
     CONSISTENCY_WEIGHT_START = 0.0
     CONSISTENCY_WEIGHT_END = 0.0
-    CONSISTENCY_TEMPERATURE = 2.0
-    CONSISTENCY_WARMUP_EPOCHS = 5
     
     # Co-teaching（协同教学，禁用 - 数据无噪声）
     USE_CO_TEACHING = False                 # 禁用Co-teaching（数据使用真实标签，无噪声）
-    CO_TEACHING_SELECT_RATE = 0.7           # 选择率（70%样本）
-    CO_TEACHING_WARMUP_EPOCHS = 10          # 预热轮数（前N轮不启用）
-    CO_TEACHING_MIN_SAMPLE_WEIGHT = 0.5     # 最小样本权重
+    CO_TEACHING_SELECT_RATE = 0.85           # 选择率（70%样本）
+    CO_TEACHING_WARMUP_EPOCHS = 50          # 预热轮数（前N轮不启用）
     CO_TEACHING_DYNAMIC_RATE = True         # 动态调整选择率
     CO_TEACHING_NOISE_RATE = 0.0            # 假设噪声率（0.0 = 无噪声）
 
@@ -555,16 +505,7 @@ class Config:
     else:
         DEVICE = torch.device("cpu")
     
-    NUM_WORKERS = 4
     SEED = 42
-    SAVE_EVERY_N_EPOCHS = 10
-    
-    # ============================================================
-    # 可视化配置
-    # ============================================================
-    VIS_FEATURE_DIM_REDUCTION = "tsne"
-    VIS_PERPLEXITY = 30
-    VIS_N_ITER = 1000
     
     # ============================================================
     # 输出目录结构
@@ -575,7 +516,6 @@ class Config:
     DATA_AUGMENTATION_DIR = os.path.join(OUTPUT_ROOT, "data_augmentation")
     CLASSIFICATION_DIR = os.path.join(OUTPUT_ROOT, "classification")
     RESULT_DIR = os.path.join(OUTPUT_ROOT, "result")
-    CHECKPOINT_DIR = CLASSIFICATION_DIR
     
     # ============================================================
     # 工具方法
@@ -661,6 +601,7 @@ class Config:
                 logger.info(f"  - 扩散步数: {self.DDPM_TIMESTEPS}")
                 logger.info(f"  - 采样步数: {self.DDPM_SAMPLING_STEPS}")
                 logger.info(f"  - 最小权重阈值: {getattr(self, 'STAGE2_AUGMENT_MIN_WEIGHT', 0.8)}")
+                logger.info(f"  - 合成下限(正常/恶意): {getattr(self, 'AUGMENT_MIN_SYN_BENIGN', 0)}/{getattr(self, 'AUGMENT_MIN_SYN_MALICIOUS', 0)}")
                 logger.info("")
                 logger.info("⏹️ TabDDPM 早停:")
                 logger.info(f"  - 启用: {self.DDPM_EARLY_STOPPING}")
@@ -682,6 +623,7 @@ class Config:
             logger.info(f"  - 扩散步数: {self.DDPM_TIMESTEPS}")
             logger.info(f"  - 采样步数: {self.DDPM_SAMPLING_STEPS}")
             logger.info(f"  - 最小权重阈值: {getattr(self, 'STAGE3_AUGMENT_MIN_WEIGHT', getattr(self, 'STAGE2_AUGMENT_MIN_WEIGHT', 0.8))}")
+            logger.info(f"  - 合成下限(正常/恶意): {getattr(self, 'AUGMENT_MIN_SYN_BENIGN', 0)}/{getattr(self, 'AUGMENT_MIN_SYN_MALICIOUS', 0)}")
             logger.info("")
             logger.info("⏹️ TabDDPM 早停:")
             logger.info(f"  - 启用: {self.DDPM_EARLY_STOPPING}")
@@ -693,8 +635,9 @@ class Config:
         elif stage == "Stage 4" or stage == "finetune":
             logger.info("🎯 目标: 分类器微调")
             logger.info("")
+            classifier_epochs = int(getattr(self, 'FINETUNE_CLASSIFIER_EPOCHS', self.FINETUNE_EPOCHS))
             logger.info("📊 训练参数:")
-            logger.info(f"  - 最大轮数: {self.FINETUNE_EPOCHS}")
+            logger.info(f"  - 分类器最大轮数: {classifier_epochs}")
             logger.info(f"  - 批次大小: {self.FINETUNE_BATCH_SIZE}")
             logger.info(f"  - 学习率: {self.FINETUNE_LR}")
             logger.info("")
@@ -703,6 +646,15 @@ class Config:
             logger.info(f"  - 范围: {self.FINETUNE_BACKBONE_SCOPE}")
             logger.info(f"  - 学习率: {self.FINETUNE_BACKBONE_LR}")
             logger.info(f"  - 预热轮数: {self.FINETUNE_BACKBONE_WARMUP_EPOCHS}")
+            logger.info(f"  - 三阶段微调: {getattr(self, 'FINETUNE_BACKBONE_THREE_STAGE', False)}")
+            logger.info(f"    * Phase1(head): {getattr(self, 'FINETUNE_BACKBONE_STAGE1_EPOCHS', 0)} 轮")
+            logger.info(f"    * Phase2(proj): {getattr(self, 'FINETUNE_BACKBONE_STAGE2_EPOCHS', 0)} 轮 | lr={getattr(self, 'FINETUNE_BACKBONE_STAGE2_LR', self.FINETUNE_BACKBONE_LR)}")
+            stage3_epochs = int(getattr(self, 'FINETUNE_BACKBONE_STAGE3_EPOCHS', -1))
+            stage3_desc = "剩余轮" if stage3_epochs < 0 else f"{stage3_epochs} 轮"
+            logger.info(f"    * Phase3(all): {stage3_desc} | lr={getattr(self, 'FINETUNE_BACKBONE_STAGE3_LR', self.FINETUNE_BACKBONE_LR)}")
+            backbone_cap = int(getattr(self, 'FINETUNE_BACKBONE_MAX_EPOCHS', -1))
+            if backbone_cap >= 0:
+                logger.info(f"  - 骨干可训练总轮上限: {backbone_cap}")
             logger.info("")
             logger.info("🔧 损失函数配置:")
             logger.info(f"  - Focal Loss: alpha={self.FOCAL_ALPHA}, gamma={self.FOCAL_GAMMA}")
@@ -790,7 +742,7 @@ if __name__ == "__main__":
     print(f"  - Stage 3: Mixed Training (real={config.STAGE3_MIXED_REAL_BATCH_SIZE}, syn={config.STAGE3_MIXED_SYN_BATCH_SIZE})")
     print(f"  - 骨干微调: {'启用' if config.FINETUNE_BACKBONE else '关闭'}")
     print(f"  - Co-teaching: {'启用' if config.USE_CO_TEACHING else '禁用'} (noise_rate={config.CO_TEACHING_NOISE_RATE})")
-    print(f"  - 训练轮数: {config.FINETUNE_EPOCHS} epochs")
+    print(f"  - 分类器训练轮数: {getattr(config, 'FINETUNE_CLASSIFIER_EPOCHS', config.FINETUNE_EPOCHS)} epochs")
     print(f"  - 最优阈值: {config.MALICIOUS_THRESHOLD}")
     print(f"\n最优性能:")
     print(f"  - F1 Score: 0.9026")

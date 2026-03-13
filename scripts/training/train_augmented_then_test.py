@@ -71,15 +71,8 @@ def main():
     logger.info(f"🔧 RNG指纹(seed前): {rng_fp_before_seed}")
     logger.info(f"🔧 RNG指纹(seed后): {rng_fp_after_seed} ({seed_snapshot(config, args.seed)})")
 
-    # 配置：使用最优参数
-    config.USE_FOCAL_LOSS = True
-    config.USE_BCE_LOSS = False
-    config.USE_SOFT_F1_LOSS = False
-    config.STAGE3_ONLINE_AUGMENTATION = False
-    config.STAGE3_USE_ST_MIXUP = False
+    # 配置：仅保留与消融相关的差异，其余沿用主配置
     apply_finetune_backbone_override(args, config)
-    config.FINETUNE_VAL_SPLIT = 0.0
-    config.FINETUNE_ES_ALLOW_TRAIN_METRIC = True
 
     run_tag = args.run_tag.strip() or datetime.now().strftime('%Y%m%d_%H%M%S')
     run_dir = os.path.join(config.LABEL_CORRECTION_DIR, 'analysis', 'augmented_runs', run_tag)
